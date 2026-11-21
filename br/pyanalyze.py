@@ -138,7 +138,24 @@ def analyze(old_source: str, new_source: str, filename: str) -> FileAnalysis:
 
     walk(old_module, new_module, [], [])
     result.noop = not result.changes and not result.structural
+    if not result.noop and all(c.kind == "function" for c in result.changes) and not result.structural:
+        # Function docstrings are not behavior (class docstrings are: sqlglot reads them).
+        if _without_function_docstrings(old_source) == _without_function_docstrings(new_source):
+            result.noop = True
+            result.changes = []
     return result
+
+
+def _without_function_docstrings(source: str) -> str:
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(
+                first.value.value, str
+            ):
+                node.body = node.body[1:] or [ast.Pass()]
+    return ast.dump(tree)
 
 
 def code_lines(code: types.CodeType, nested: bool = False) -> set[int]:

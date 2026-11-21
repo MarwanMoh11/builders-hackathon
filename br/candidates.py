@@ -39,6 +39,7 @@ class Plan:
     py_files: dict = field(default_factory=dict)  # path -> (old_text, new_text, analysis)
     reimport: bool = False  # an import-time change: modules must be re-executed
     overlays: dict = field(default_factory=dict)  # data file path -> new text
+    new_sources: dict = field(default_factory=dict)  # .py path -> new text (no analysis)
     data_only: bool = True  # only data files (fixtures) changed
     notes: list[str] = field(default_factory=list)
 
@@ -83,13 +84,23 @@ def _plan_file(plan, fd: FileDiff, root, cov, tests_by_file):
             old_text = f.read()
     new_text = apply_hunks(old_text, fd.hunks) if fd.new_path is not None else None
 
-    if path.endswith(".py") and (path.startswith("sqlglot/") or path.startswith("tests/")):
+    name = os.path.basename(path)
+    if name in ("conftest.py", "pytest.ini", "tox.ini") or _touches_pytest_config(path, fd):
+        plan.everything = True
+        plan.notes.append(f"pytest configuration {path}")
+    elif path.endswith(".py") and (path.startswith("sqlglot/") or path.startswith("tests/")):
         plan.data_only = False
         _plan_python(plan, fd, old_text, new_text, cov, tests_by_file, root)
     elif path.startswith("tests/") or path.startswith("sqlglot/"):
         _plan_data_file(plan, fd, old_text, new_text, cov)
     else:
         plan.notes.append(f"ignored {path}")
+
+
+def _touches_pytest_config(path: str, fd: FileDiff) -> bool:
+    if os.path.basename(path) not in ("pyproject.toml", "setup.cfg"):
+        return False
+    return any("pytest" in line for hunk in fd.hunks for line in hunk.lines)
 
 
 def _plan_data_file(plan: Plan, fd: FileDiff, old_text: str, new_text: str | None, cov: CoverageMap):
@@ -105,6 +116,13 @@ def _plan_data_file(plan: Plan, fd: FileDiff, old_text: str, new_text: str | Non
     plan.notes.append(f"data {path}: {len(readers)} readers")
 
 
+def module_prefix(path: str) -> str:
+    name = path[:-3].replace("/", ".")
+    if name.endswith(".__init__"):
+        name = name[: -len(".__init__")]
+    return name + ":"
+
+
 def _expand(index: StmtIndex, lines: set[int]) -> set[int]:
     out: set[int] = set()
     for line in lines:
@@ -116,15 +134,29 @@ def _expand(index: StmtIndex, lines: set[int]) -> set[int]:
 
 def _plan_python(plan, fd, old_text, new_text, cov, tests_by_file, root=""):
     path = fd.path
-    if new_text is None or fd.old_path is None:
-        # A module deleted or created: imports change, so be safe.
-        plan.everything = new_text is None
-        plan.reimport = True
-        plan.notes.append(f"{'deleted' if new_text is None else 'new'} {path}")
+    if new_text is None:
+        plan.everything = True  # a deleted module: its importers break
+        plan.notes.append(f"deleted {path}")
+        return
+    if fd.old_path is None:
+        # A new module only matters to code that imports it, which must have changed too.
+        plan.new_sources[path] = new_text
+        plan.notes.append(f"new {path}")
         return
     analysis = analyze(old_text, new_text, os.path.join(root, path) if root else path)
     if analysis.syntax_error:
-        plan.everything = True
+        # The module no longer imports: whoever imports or uses it fails. The child re-imports
+        # and adds every test file that stops importing; here, everyone who touched the module.
+        plan.reimport = True
+        plan.new_sources[path] = new_text
+        per_file = cov.lines.get(path, {})
+        plan.candidates |= cov.tests_for_lines(path, per_file.keys())
+        prefix = module_prefix(path)
+        for key, readers in cov.attrs.items():
+            if key.startswith(prefix):
+                plan.candidates |= readers
+        if path.startswith("tests/"):
+            plan.candidates |= set(tests_by_file.get(path, ()))
         plan.notes.append(f"syntax error {path}")
         return
     if analysis.noop:

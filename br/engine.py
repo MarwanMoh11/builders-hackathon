@@ -223,11 +223,19 @@ def build_dependents() -> None:
         for namespace in namespaces:
             for key, value in list(namespace.items()):
                 owner = _owner(value)
-                if owner is None or owner == name or owner not in ours:
-                    continue
                 if isinstance(value, types.ModuleType) and owner == f"{name}.{key}":
                     continue  # package -> its own submodule attribute
-                refs.add(owner)
+                if owner is not None and owner != name and owner in ours:
+                    refs.add(owner)
+                # a container built elsewhere (e.g. ENV) carries its maker's objects
+                if isinstance(value, (dict, list, tuple, set, frozenset)):
+                    items = value.values() if isinstance(value, dict) else value
+                    for count, item in enumerate(items):
+                        if count >= 64:
+                            break
+                        item_owner = _owner(item)
+                        if item_owner is not None and item_owner != name and item_owner in ours:
+                            refs.add(item_owner)
         for ref in refs:
             DEPENDENTS.setdefault(ref, set()).add(name)
 
@@ -276,13 +284,60 @@ def reimport(sources: dict[str, str], everything: bool = False):
             continue
         parent_name, _, child = name.rpartition(".")
         parent = sys.modules.get(parent_name)
-        if parent is not None and parent_name in old and getattr(parent, child, None) is not module:
+        # only when missing: a package may rebind a name its submodule also has (sqlglot.diff)
+        if parent is not None and parent_name in old and not hasattr(parent, child):
             try:
                 setattr(parent, child, module)
             except (AttributeError, TypeError):
                 pass
+    _repoint_registries(set(old))
     new = {n: sys.modules[n] for n in old if n in sys.modules}
     return old, new, failed
+
+
+_DROP = object()
+
+
+def _resolve_new(obj, purged: set[str]):
+    """The re-imported counterpart of a class or function from a purged module (None if obj is
+    not from one, _DROP if its module no longer imports or no longer defines it)."""
+    if not isinstance(obj, type):
+        return None
+    module_name_ = getattr(obj, "__module__", None)
+    if module_name_ not in purged:
+        return None
+    current = sys.modules.get(module_name_)
+    if current is None:
+        return _DROP  # its module no longer imports
+    for part in getattr(obj, "__qualname__", "").split("."):
+        current = getattr(current, part, None)
+        if current is None:
+            return None  # not reachable by name: leave it alone
+    return current if isinstance(current, type) else None
+
+
+def _repoint_registries(purged: set[str]) -> None:
+    """Kept modules may hold registries (e.g. Dialect._classes) filled with classes from modules
+    we re-imported: point them at the new classes, and drop entries whose module now fails."""
+    for name, module in list(sys.modules.items()):
+        if module is None or not is_ours(name) or name in purged:
+            continue
+        namespaces = [vars(module)]
+        for value in list(vars(module).values()):
+            if isinstance(value, type) and value.__module__ == name:
+                namespaces.append(vars(value))
+        for namespace in namespaces:
+            for value in list(namespace.values()):
+                if not isinstance(value, dict) or not value:
+                    continue
+                for key, item in list(value.items()):
+                    replacement = _resolve_new(item, purged)
+                    if replacement is None or replacement is item:
+                        continue
+                    if replacement is _DROP:
+                        del value[key]
+                    else:
+                        value[key] = replacement
 
 
 def install_overlays(overlays: dict[str, str]) -> None:

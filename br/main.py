@@ -62,7 +62,9 @@ class Costs:
         self.never_run = never_run
         self.class_setup = class_setup
         self.class_of = {}
+        self.tests_of_module: dict[str, list[int]] = {}
         for t in tests:
+            self.tests_of_module.setdefault(t["file"][:-3].replace("/", "."), []).append(t["number"])
             parts = t["id"].split("::")
             module = t["file"][:-3].replace("/", ".")
             self.class_of[t["number"]] = f"{module}::{parts[1] if len(parts) > 2 else ''}"
@@ -140,11 +142,19 @@ def child_main(plan, cov, costs, write_fd):
                     break
         if do_reimport:
             sources = {rel: new for rel, (_old, new, _a) in plan.py_files.items()}
+            sources.update(plan.new_sources)
             old, new, failed = engine.reimport(sources)
             if failed:
-                out["everything"] = True
-                out["note"] += f"import failed {failed[:3]}; "
-                raise SystemExit
+                # Test files that no longer import fail as a whole.
+                out["note"] += f"import failed {failed[:4]}; "
+                for name in failed:
+                    if name.startswith("tests."):
+                        candidates |= set(costs.tests_of_module.get(name, ()))
+                    elif not name.startswith("sqlglot."):
+                        continue
+                if any(n in ("sqlglot", "tests", "tests.helpers") for n in failed):
+                    out["everything"] = True
+                    raise SystemExit
             attrs, globals_, missing = diff_modules(old, new)
             out["note"] += f"attrs={sorted(attrs)[:6]} globals={sorted(globals_)[:6]}; "
             candidates |= _readers(attrs, globals_, old, cov, code_lines, all_codes)

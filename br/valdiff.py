@@ -229,6 +229,9 @@ def diff_modules(old: dict[str, types.ModuleType], new: dict[str, types.ModuleTy
                 continue
             ov = old_vars.get(gname, _EMPTY)
             nv = new_vars.get(gname, _EMPTY)
+            submodule = f"{name}.{gname}"
+            if getattr(ov, "__name__", None) == submodule or getattr(nv, "__name__", None) == submodule:
+                continue  # a package attribute that a same-named submodule import rebinds
             if isinstance(ov, type) and getattr(ov, "__module__", None) == name:
                 continue  # classes are compared attribute by attribute below
             if not comparer.eq(ov, nv):
