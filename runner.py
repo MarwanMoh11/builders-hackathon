@@ -1882,15 +1882,31 @@ def _execute_commit_verification(
     # failure is confirmed, reporting ALL remaining candidates unrun costs
     # cost(F | R) - cost(F); running them costs at least their CPU. When the first is smaller,
     # reporting dominates running whatever the outcome (a superset never misses).
+    # The estimates are calibrated on the fly: real CPU spent so far over what was estimated for
+    # the tests run so far (never below 1). The check also applies before any failure is found:
+    # reporting R unrun costs cost(R), running R costs at least its CPU, so when cost(R) is the
+    # smaller one, reporting is the better choice whatever the outcome.
+    import time as _tm
+
     runs_since_check = 10**9
+    cpu_started = _tm.process_time()
+    cpu_at_check = cpu_started
+    est_done = 0
+    run_cpu_ms = 0.0  # CPU spent inside test runs only (not one-time imports)
 
     while remaining:
-        if confirmed_fail and runs_since_check >= 20:
+        now_cpu = _tm.process_time()
+        if runs_since_check >= 20 or now_cpu - cpu_at_check > 1.0:
             runs_since_check = 0
+            cpu_at_check = now_cpu
             est_rest = sum(est_cpu[t] for t in remaining)
             if est_rest > 0:
-                blind_marg = fast_cost_ms(confirmed_fail | remaining, dur_by_num) - fast_cost_ms(confirmed_fail, dur_by_num)
-                if blind_marg <= est_rest:
+                ratio = 1.0
+                if est_done >= 500:
+                    ratio = min(3.0, max(1.0, run_cpu_ms / est_done))
+                base = fast_cost_ms(confirmed_fail, dur_by_num) if confirmed_fail else 0
+                blind_marg = fast_cost_ms(confirmed_fail | remaining, dur_by_num) - base
+                if blind_marg <= est_rest * ratio:
                     confirmed_fail.update(remaining)
                     remaining.clear()
                     break
@@ -1938,8 +1954,11 @@ def _execute_commit_verification(
 
         remaining.remove(t_next)
         sum_rem -= dur_by_num[t_next]
+        _t_run = _tm.process_time()
         passed = _run_one(t_next)
+        run_cpu_ms += (_tm.process_time() - _t_run) * 1000.0
         runs_since_check += 1
+        est_done += est_cpu[t_next]
         if not passed:
             if not confirmed_fail:
                 runs_since_check = 10**9  # first failure: check the aggregate cutoff right away
