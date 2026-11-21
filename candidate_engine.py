@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 _CLASS_DEF_RE = re.compile(r"^class\s+(\w+)\s*[\(:]", re.MULTILINE)
+_PLAIN_IDENT_KEY_RE = re.compile(r"^['\"][A-Za-z_][A-Za-z0-9_]*['\"]$")
 
 from patch_analyzer import (
     ChangeUnit,
@@ -139,11 +140,37 @@ class CandidateEngine:
         }
         self._file_cache: dict[str, str] = {}
         self._old_ast_cache: dict[str, Any] = {}
-        self._rev_import_graph: dict[str, set[str]] | None = None
-        self._file_classes_cache: dict[str, list[str]] = {}
-        self._class_dep_graph: dict[str, Any] | None = None
-        self._non_runtime_cache: dict[str, tuple[set[int], set[str]]] = {}
-        self._import_time_refs: tuple[dict[str, set[str]], dict[str, set[str]]] | None = None
+        static_meta = maps.get("static_ast_meta")
+        if static_meta is not None:
+            self._rev_import_graph: dict[str, set[str]] | None = {
+                k: set(v) for k, v in static_meta["rev_import_graph"].items()
+            }
+            self._file_classes_cache: dict[str, list[str]] = dict(static_meta["file_classes"])
+            cdg = static_meta["class_dep_graph"]
+            self._class_dep_graph: dict[str, Any] | None = {
+                "class_children": {k: set(v) for k, v in cdg["class_children"].items()},
+                "attr_copiers": {tuple(k): {tuple(x) for x in v} for k, v in cdg["attr_copiers"].items()},
+                "class_aliases": {k: set(v) for k, v in cdg["class_aliases"].items()},
+                "class_copiers": {k: set(v) for k, v in cdg["class_copiers"].items()},
+                "attr_mutators": {k: set(v) for k, v in cdg["attr_mutators"].items()},
+                "all_class_body_refs": set(cdg["all_class_body_refs"]),
+            }
+            self._non_runtime_cache: dict[str, tuple[set[int], set[str]]] = {
+                k: (set(v[0]), set(v[1])) for k, v in static_meta["non_runtime_info"].items()
+            }
+            self._import_time_called: dict[str, set[str]] | None = {
+                k: set(v) for k, v in static_meta["import_time_called"].items()
+            }
+            self._import_time_ref_map: dict[str, set[str]] | None = {
+                k: set(v) for k, v in static_meta["import_time_refs"].items()
+            }
+        else:
+            self._rev_import_graph = None
+            self._file_classes_cache = {}
+            self._class_dep_graph = None
+            self._non_runtime_cache = {}
+            self._import_time_called = None
+            self._import_time_ref_map = None
         # Ignore pure docstring edits ONLY when tests/test_docs.py is absent from runtime tests.json
         self.ignore_docstrings: bool = "tests/test_docs.py" not in self.file_to_test_nums
 
@@ -284,10 +311,11 @@ class CandidateEngine:
 
                 for node in self._iter_non_runtime_nodes(stmt):
                     if isinstance(node, ast.Name):
-                        if node.id != dst_attr:
+                        if node.id != dst_attr and isinstance(node.ctx, ast.Load):
                             all_class_body_refs.add(node.id)
                     elif isinstance(node, ast.Attribute):
-                        all_class_body_refs.add(node.attr)
+                        if isinstance(node.ctx, ast.Load):
+                            all_class_body_refs.add(node.attr)
                         parts = self._attr_chain(node)
                         if parts and len(parts) >= 2:
                             rparts = _resolve_chain(parts, imp)
@@ -387,9 +415,9 @@ class CandidateEngine:
                     for n in self._iter_non_runtime_nodes(s):
                         _add_node_lines(n)
                         if in_class:
-                            if isinstance(n, ast.Name):
+                            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
                                 cb_refs.add(n.id)
-                            elif isinstance(n, ast.Attribute):
+                            elif isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load):
                                 cb_refs.add(n.attr)
 
         _scan_stmts(tree.body, False)
@@ -398,8 +426,16 @@ class CandidateEngine:
         return res
 
     def _is_func_called_at_import(self, rel: str, meth_name: str) -> tuple[bool, bool, set[str]]:
-        """Fast per-symbol check (~2ms!) of whether `meth_name` is called or referenced at module/class
-        import time across sqlglot/**/*.py (substring-filtered before ast.parse!)."""
+        """O(1) precomputed lookup (or fast substring-filtered fallback) of whether `meth_name`
+        is called or referenced at module/class import time across sqlglot/**/*.py."""
+        if self._import_time_called is not None and self._import_time_ref_map is not None:
+            cf = self._import_time_called.get(meth_name)
+            rf = self._import_time_ref_map.get(meth_name)
+            if cf:
+                return True, True, cf
+            if rf:
+                return False, True, rf
+            return False, False, set()
         sg_dir = self.sqlglot_root / "sqlglot"
         py_files = list(sg_dir.rglob("*.py")) if sg_dir.exists() else []
         meta_hooks = frozenset({"__new__", "__init_subclass__", "__set_name__", "__class_getitem__", "_generate_next_value_"})
@@ -840,7 +876,10 @@ class CandidateEngine:
                             matched_e: set[Any] = set()
                             for sc in subs:
                                 matched_e.update(sg["exprs"].get(sc, []))
-                            self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], matched_e if matched_e else None)
+                            self._add_subtest_filter(
+                                commit_plan.subtest_filters, rnum, sg["tag"],
+                                matched_e if (matched_e or len(sgs) > 1) else None,
+                            )
                     elif kind == "dict_meta":
                         owners = payload
                         for sg in sgs:
@@ -848,7 +887,10 @@ class CandidateEngine:
                             for o in owners:
                                 matched_m.update(sg["dialects"].get(o.split(".")[0], []))
                                 matched_m.update(sg["dialects"].get(o, []))
-                            self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], matched_m if matched_m else None)
+                            self._add_subtest_filter(
+                                commit_plan.subtest_filters, rnum, sg["tag"],
+                                matched_m if (matched_m or len(sgs) > 1) else None,
+                            )
                     elif kind == "dict_keys":
                         owners, attr, dict_keys, rel, old_lines = payload
                         for sg in sgs:
@@ -1033,7 +1075,7 @@ class CandidateEngine:
             if (
                 is_meta_hook
                 or unit.is_cached_func
-                or (is_import_called and (unit.edit_outside_nested_func or len(hits) <= 3))
+                or (is_import_called and (unit.edit_outside_nested_func or not hits))
             ):
                 extra = self._tests_for_broken_import(rel)
                 for rf in import_ref_files:
@@ -1189,23 +1231,39 @@ class CandidateEngine:
                             if mh:
                                 key_found = True
                                 mtid_hits.update(mh)
-                        if not key_found:
+                        if not key_found and (
+                            kr in unit.dict_added_keys
+                            or kr in unit.dict_deleted_keys
+                            or not kr.startswith(("'", '"'))
+                        ):
                             any_zero_hit = True
 
                 hits = self._to_rnums(mtid_hits)
                 hits.update(self._tests_covering_lines(rel, unit.old_lines))
 
-                meta_rebuild_attrs = {
+                unconditional_meta_attrs = {
                     "TIME_MAPPING", "FORMAT_MAPPING", "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING",
                     "UNESCAPED_SEQUENCES", "ESCAPED_SEQUENCES", "DATE_PART_MAPPING", "CREATABLE_KIND_MAPPING",
                     "QUOTES", "IDENTIFIERS", "STRING_ESCAPES", "BYTE_STRING_ESCAPES",
                     "IDENTIFIER_ESCAPES", "SUPPORTED_JSON_PATH_PARTS",
-                    "KEYWORDS", "SINGLE_TOKENS", "NUMERIC_LITERALS", "NUMERIC_ESCAPES",
-                    "SHOW_PARSERS", "SET_PARSERS", "NO_PAREN_FUNCTIONS", "QUERY_MODIFIER_PARSERS",
-                    "COERCES_TO",
+                    "SINGLE_TOKENS", "NUMERIC_LITERALS", "NUMERIC_ESCAPES", "COERCES_TO",
                 }
+                keyset_sensitive_attrs = {
+                    "SHOW_PARSERS", "SET_PARSERS", "NO_PAREN_FUNCTIONS", "QUERY_MODIFIER_PARSERS",
+                }
+                has_keyset_change = bool(unit.dict_added_keys or unit.dict_deleted_keys)
+                kw_needs_trie = (
+                    attr == "KEYWORDS"
+                    and (
+                        has_keyset_change
+                        or unit.dict_keys is None
+                        or any(not _PLAIN_IDENT_KEY_RE.match(kr) for kr in unit.dict_keys)
+                    )
+                )
                 need_meta_expand = (
-                    attr in meta_rebuild_attrs
+                    attr in unconditional_meta_attrs
+                    or (attr in keyset_sensitive_attrs and has_keyset_change)
+                    or kw_needs_trie
                     or unit.dict_keys is None
                     or any_zero_hit
                     or (bool(unit.dict_deleted_keys) and attr in dep_graph["attr_mutators"])
@@ -1385,6 +1443,45 @@ class CandidateEngine:
             if not rel:
                 continue
 
+            # Handle git file renames cleanly: delete old_path AND create/patch new_path!
+            if fp.is_rename and fp.old_path and fp.new_path:
+                old_p = fp.old_path
+                new_p = fp.new_path
+                has_non_noop = True
+                only_fixtures = False
+                all_hot_func = False
+                deleted_files.add(old_p)
+                if "tpc-ds/" in old_p or "tpc-ds/" in new_p:
+                    tpcds_fixture_touched = True
+                    exec_engine_touched = True
+                if "tpc-h/" in old_p or "tpc-h/" in new_p:
+                    tpch_fixture_touched = True
+                    exec_engine_touched = True
+                old_affected: set[int] = set()
+                if old_p.endswith(".py"):
+                    old_affected.update(self._tests_for_broken_import(old_p))
+                else:
+                    old_affected.update(self._to_rnums(self.maps["fixture_to_tests"].get(old_p, [])))
+                if new_p.endswith(".py"):
+                    old_affected.update(self._tests_for_broken_import(new_p))
+                else:
+                    old_affected.update(self._to_rnums(self.maps["fixture_to_tests"].get(new_p, [])))
+                candidates.update(old_affected)
+                for rnum in old_affected:
+                    for tag in self._subtest_tags_by_num.get(rnum, ()):
+                        self._add_subtest_filter(subtest_filters, rnum, tag, None)
+                if not fp.is_binary:
+                    base_src = self._read_base_file(old_p)
+                    new_src = apply_file_patch(base_src, fp)
+                    patched_files[new_p] = new_src
+                    if new_p.endswith(".py"):
+                        try:
+                            ast.parse(new_src, filename=new_p)
+                        except SyntaxError:
+                            has_syntax_error = True
+                            syntax_error_files.append(new_p)
+                continue
+
             if fp.is_binary:
                 has_non_noop = True
                 only_fixtures = False
@@ -1447,7 +1544,7 @@ class CandidateEngine:
                     exec_engine_touched = True
 
                 if (
-                    rel in ("tests/test_parser.py", "sqlglot/parsers/athena.py")
+                    (rel == "tests/test_parser.py" and any("test_max_nodes" in fn for fn in ana.changed_funcs))
                     or (
                         rel == "sqlglot/parser.py"
                         and any(fn in ("Parser.validate_expression", "Parser.reset") for fn in ana.changed_funcs)
@@ -1491,11 +1588,23 @@ class CandidateEngine:
                         file_has_non_hot = True
                     self._handle_change_unit(unit, candidates, subtest_filters, deferred_subtests)
 
-                # Include test_lazy_load whenever an eager-imported sqlglot file has a module/class/dict/import-time edit!
+                # Include test_lazy_load on eager-imported files ONLY when import behavior could change!
                 if (
                     self.lazy_load_test_num is not None
                     and file_has_non_hot
                     and self.lazy_load_test_num in self._to_rnums(self.maps["dyn_import_to_tests"].get(rel, []))
+                    and (
+                        ana.syntax_error
+                        or fp.is_deleted
+                        or fp.is_new
+                        or any(u.kind == "module_other" for u in ana.units)
+                        or any(
+                            hl.startswith(("+", "-"))
+                            and any(tok in hl for tok in ("import ", "from ", "Dialect", "_classes", "_try_load"))
+                            for h in fp.hunks
+                            for hl in h.lines
+                        )
+                    )
                 ):
                     candidates.add(self.lazy_load_test_num)
                     all_hot_func = False

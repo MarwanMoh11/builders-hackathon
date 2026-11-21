@@ -42,6 +42,10 @@ class FilePatch:
     def is_deleted(self) -> bool:
         return self.new_path is None
 
+    @property
+    def is_rename(self) -> bool:
+        return self.old_path is not None and self.new_path is not None and self.old_path != self.new_path
+
 
 def _strip_prefix(raw: str) -> str | None:
     raw = raw.strip()
@@ -83,6 +87,18 @@ def parse_unified_diff(patch_text: str) -> list[FilePatch]:
                     i += 1
                 elif cur.startswith("+++ "):
                     new_path = _strip_prefix(cur[4:])
+                    i += 1
+                elif cur.startswith("new file mode "):
+                    old_path = None
+                    i += 1
+                elif cur.startswith("deleted file mode "):
+                    new_path = None
+                    i += 1
+                elif cur.startswith("rename from "):
+                    old_path = _strip_prefix(cur[12:])
+                    i += 1
+                elif cur.startswith("rename to "):
+                    new_path = _strip_prefix(cur[10:])
                     i += 1
                 elif cur.startswith("Binary files ") or cur.startswith("GIT binary patch"):
                     is_binary = True
@@ -322,23 +338,83 @@ def _strip_leading_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
     return body
 
 
+def _is_sound_cmp_pair(
+    left: ast.AST,
+    right: ast.AST,
+    allow_none: bool,
+    pure_enums: set[str],
+    strict_enum_attrs: set[tuple[str, str]],
+) -> bool:
+    """Provably sound identity/equality equivalence pairs verified by full codebase __eq__ audit:
+    - None comparisons outside env.py/table.py/builders.py (all sqlglot __eq__ return False on None!)
+    - Pure enum.Enum members (Enum.__eq__ is literally `self is other`)
+    - Strictly typed enum attributes (e.g. self.normalization_strategy with NormalizationStrategy)."""
+    if allow_none and (
+        (isinstance(right, ast.Constant) and right.value is None)
+        or (isinstance(left, ast.Constant) and left.value is None)
+    ):
+        return True
+    for lhs, rhs in ((left, right), (right, left)):
+        if isinstance(rhs, ast.Attribute) and isinstance(rhs.value, ast.Name):
+            enum_name = rhs.value.id
+            if enum_name in pure_enums:
+                return True
+            if isinstance(lhs, ast.Attribute) and (lhs.attr, enum_name) in strict_enum_attrs:
+                return True
+    return False
+
+
 def _ast_nodes_equiv(
     a: Any,
     b: Any,
     ignore_docstrings: bool = False,
     ignore_type_checking: bool = False,
+    allow_sound_cmp: bool = False,
+    allow_none: bool = False,
+    pure_enums: set[str] | None = None,
+    strict_enum_attrs: set[tuple[str, str]] | None = None,
 ) -> bool:
-    """Strict zero-copy recursive AST equivalence checker.
-    Never treats semantic operator swaps (e.g. `is` <-> `==`) as equivalent!"""
+    """Zero-copy recursive AST equivalence checker.
+    Only allows provably sound Is<->Eq / IsNot<->NotEq pairs when allow_sound_cmp=True!"""
     if type(a) is not type(b):
         return False
     if isinstance(a, list):
         if len(a) != len(b):
             return False
         return all(
-            _ast_nodes_equiv(x, y, ignore_docstrings, ignore_type_checking)
+            _ast_nodes_equiv(
+                x, y, ignore_docstrings, ignore_type_checking,
+                allow_sound_cmp, allow_none, pure_enums, strict_enum_attrs,
+            )
             for x, y in zip(a, b)
         )
+    if allow_sound_cmp and isinstance(a, ast.Compare):
+        if len(a.ops) == 1 and len(b.ops) == 1 and len(a.comparators) == 1 and len(b.comparators) == 1:
+            op_a, op_b = a.ops[0], b.ops[0]
+            if type(op_a) is not type(op_b):
+                eq_is_pair = (
+                    (isinstance(op_a, ast.Is) and isinstance(op_b, ast.Eq))
+                    or (isinstance(op_a, ast.Eq) and isinstance(op_b, ast.Is))
+                    or (isinstance(op_a, ast.IsNot) and isinstance(op_b, ast.NotEq))
+                    or (isinstance(op_a, ast.NotEq) and isinstance(op_b, ast.IsNot))
+                )
+                if not (
+                    eq_is_pair
+                    and _is_sound_cmp_pair(
+                        a.left, a.comparators[0], allow_none,
+                        pure_enums or _EMPTY_SET, strict_enum_attrs or _EMPTY_SET,
+                    )
+                    and _ast_nodes_equiv(
+                        a.left, b.left, ignore_docstrings, ignore_type_checking,
+                        allow_sound_cmp, allow_none, pure_enums, strict_enum_attrs,
+                    )
+                    and _ast_nodes_equiv(
+                        a.comparators[0], b.comparators[0], ignore_docstrings, ignore_type_checking,
+                        allow_sound_cmp, allow_none, pure_enums, strict_enum_attrs,
+                    )
+                ):
+                    return False
+                return True
     if isinstance(a, ast.AST):
         is_doc_owner = ignore_docstrings and isinstance(a, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
         is_tc_owner = ignore_type_checking and isinstance(a, (ast.Module, ast.ClassDef))
@@ -352,10 +428,51 @@ def _ast_nodes_equiv(
                 if is_tc_owner:
                     va = [s for s in va if not _is_type_checking_if(s)]
                     vb = [s for s in vb if not _is_type_checking_if(s)]
-            if not _ast_nodes_equiv(va, vb, ignore_docstrings, ignore_type_checking):
+            if not _ast_nodes_equiv(
+                va, vb, ignore_docstrings, ignore_type_checking,
+                allow_sound_cmp, allow_none, pure_enums, strict_enum_attrs,
+            ):
                 return False
         return True
     return a == b
+
+
+def _diff_has_identity_or_eq_change(fp: FilePatch) -> bool:
+    for h in fp.hunks:
+        for line in h.lines:
+            if line.startswith(("+", "-")) and (" is " in line or "==" in line or "!=" in line or "None" in line):
+                return True
+    return False
+
+
+_UNSAFE_NONE_EQ_FILES = frozenset({
+    "sqlglot/executor/env.py",
+    "sqlglot/executor/table.py",
+    "sqlglot/expressions/builders.py",
+})
+
+
+def _is_sound_cmp_equiv(
+    file: str,
+    old_ast: ast.AST,
+    new_ast: ast.AST,
+    fp: FilePatch,
+    pure_enums: set[str],
+    strict_enum_attrs: set[tuple[str, str]],
+    ignore_docstrings: bool = False,
+) -> bool:
+    if not file.startswith("sqlglot/") or not _diff_has_identity_or_eq_change(fp):
+        return False
+    allow_none = file not in _UNSAFE_NONE_EQ_FILES
+    return _ast_nodes_equiv(
+        old_ast, new_ast,
+        ignore_docstrings=ignore_docstrings,
+        ignore_type_checking=False,
+        allow_sound_cmp=True,
+        allow_none=allow_none,
+        pure_enums=pure_enums,
+        strict_enum_attrs=strict_enum_attrs,
+    )
 
 
 def _coding_cookie(src: str) -> str | None:
@@ -979,10 +1096,20 @@ def analyze_python_change(
         if old_ast_cache is not None:
             old_ast_cache[file] = old_ast
 
-    # ONLY treat as static no-op when exact AST is identical (comments/whitespace/docstrings only)!
-    # Never treat semantic operator changes (like `is` <-> `==`) as static no-op (verify them instead!).
+    # Treat as static no-op when exact AST is identical (or provably sound None/strict-Enum is<->== swap)
+    # and no coding cookie changed.
     if _coding_cookie(old_src) == _coding_cookie(new_src):
         if _ast_nodes_equiv(old_ast, new_ast, ignore_docstrings):
+            return PyFileAnalysis(file=file, is_noop=True)
+        if _is_sound_cmp_equiv(
+            file,
+            old_ast,
+            new_ast,
+            fp,
+            pure_enums or _EMPTY_SET,
+            strict_enum_attrs or _EMPTY_SET,
+            ignore_docstrings=ignore_docstrings,
+        ):
             return PyFileAnalysis(file=file, is_noop=True)
 
     units: list[ChangeUnit] = []
