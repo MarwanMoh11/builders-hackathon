@@ -133,6 +133,15 @@ class CandidateEngine:
             | set(maps["class_subclasses"].get("Generator", []))
             | {"JSONPathTokenizer"}
         )
+        # Comparison sites where `is`/`==` (and `is not`/`!=`) agreed on every execution of the
+        # whole suite at the pinned commit (tools/cmptrace.py).
+        self.cmp_agree: frozenset[str] = frozenset()
+        cmp_path = Path(subtests_dir).parent / "cmp_agree.zlib" if subtests_dir else None
+        if cmp_path is not None and cmp_path.exists():
+            import marshal as _marshal
+            import zlib as _zlib
+
+            self.cmp_agree = frozenset(_marshal.loads(_zlib.decompress(cmp_path.read_bytes())))
         self.pure_enums: set[str] = set(maps.get("pure_enums", []))
         self.strict_enum_attrs: set[tuple[str, str]] = {
             tuple(x) for x in maps.get("strict_enum_attrs", [])
@@ -1411,6 +1420,7 @@ class CandidateEngine:
                     pure_enums=self.pure_enums,
                     strict_enum_attrs=self.strict_enum_attrs,
                     ignore_docstrings=self.ignore_docstrings,
+                    cmp_agree=self.cmp_agree,
                 )
                 if ana.is_noop:
                     continue

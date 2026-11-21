@@ -1972,8 +1972,36 @@ def _execute_commit_verification(
 # Dual-Fork Orchestrator (Pre-SQLGlot Zygote + Warm-SQLGlot Zygote)
 # ---------------------------------------------------------------------------
 
-def _run_in_fork(fn, *args) -> Any:
-    """Fork a clean CoW child process, redirect stdout->stderr in child, return pickled result."""
+# Wall-clock safety net. A run over the time limit is rejected outright, so every forked child
+# gets a timeout, and nothing new starts once the global deadline is near: unverified commits
+# fall back to reporting their candidates (more seconds, never a miss, never a rejection).
+DEADLINE: float = float("inf")  # time.monotonic() value; set by selector.main()
+PER_COMMIT_TIMEOUT = float(os.environ.get("BLAST_COMMIT_TIMEOUT", "45"))
+
+
+class _ForkTimeout(Exception):
+    pass
+
+
+def _time_left() -> float:
+    import time as _time
+
+    return DEADLINE - _time.monotonic()
+
+
+def _run_in_fork(fn, *args, timeout: float | None = None) -> Any:
+    """Fork a clean CoW child process, redirect stdout->stderr in child, return pickled result.
+    The child is killed after `timeout` seconds (default: per-commit cap, never past DEADLINE)."""
+    import select as _select
+    import time as _time
+
+    budget = _time_left()
+    if timeout is None:
+        timeout = PER_COMMIT_TIMEOUT
+    timeout = min(timeout, budget)
+    if timeout <= 0.5:
+        raise _ForkTimeout("global deadline reached")
+    started = _time.monotonic()
     r_fd, w_fd = os.pipe()
     sys.stderr.flush()
     pid = os.fork()
@@ -1999,6 +2027,16 @@ def _run_in_fork(fn, *args) -> Any:
         os.close(w_fd)
         chunks: list[bytes] = []
         while True:
+            left = timeout - (_time.monotonic() - started)
+            ready = _select.select([r_fd], [], [], max(0.0, left))[0] if left > 0 else []
+            if not ready:
+                try:
+                    os.kill(pid, 9)
+                except ProcessLookupError:
+                    pass
+                os.close(r_fd)
+                os.waitpid(pid, 0)
+                raise _ForkTimeout(f"child exceeded {timeout:.1f}s")
             chunk = os.read(r_fd, 65536)
             if not chunk:
                 break
@@ -2294,7 +2332,13 @@ def verify_batch(
 
         return warm_results, fallback_commits
 
-    warm_results, fallback_commits = _run_in_fork(_run_warm_zygote)
+    try:
+        warm_results, fallback_commits = _run_in_fork(_run_warm_zygote, timeout=float("inf"))
+    except Exception:
+        # the zygote itself ran out of time: its commits report their candidates
+        warm_results, fallback_commits = {}, []
+        for plan in lazy_fork_plans + fixture_plans + hot_func_plans:
+            results[plan.commit] = sorted(plan.candidates)
     results.update(warm_results)
 
     # 3. Any lazy_fork / hot_func / fixture commit that needed fallback runs in a clean Pre-SQLGlot full_fork!
@@ -2307,4 +2351,8 @@ def verify_batch(
             except Exception:
                 results[cid] = sorted(plan.candidates)
 
+    # Belt and braces: anything still unresolved reports its candidates.
+    for plan in plans:
+        if plan.commit not in results:
+            results[plan.commit] = sorted(plan.candidates)
     return results

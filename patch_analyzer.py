@@ -322,22 +322,42 @@ def _strip_leading_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
     return body
 
 
+# Identity/equality twins: `a is b` <-> `a == b`, `a is not b` <-> `a != b`.
+_CMP_TWINS = {(ast.Is, ast.Eq), (ast.Eq, ast.Is), (ast.IsNot, ast.NotEq), (ast.NotEq, ast.IsNot)}
+
+
 def _ast_nodes_equiv(
     a: Any,
     b: Any,
     ignore_docstrings: bool = False,
     ignore_type_checking: bool = False,
+    cmp_site_ok: Any = None,
 ) -> bool:
     """Strict zero-copy recursive AST equivalence checker.
-    Never treats semantic operator swaps (e.g. `is` <-> `==`) as equivalent!"""
+
+    Operator swaps are never equivalent by kind. The one exception is data-driven: an
+    `is` <-> `==` (or `is not` <-> `!=`) swap at a comparison site where, traced over the whole
+    test suite at the pinned commit, both operators gave the same bool on every execution
+    (`cmp_site_ok(lineno, col)`; maps/cmp_agree.zlib from tools/cmptrace.py)."""
     if type(a) is not type(b):
         return False
     if isinstance(a, list):
         if len(a) != len(b):
             return False
         return all(
-            _ast_nodes_equiv(x, y, ignore_docstrings, ignore_type_checking)
+            _ast_nodes_equiv(x, y, ignore_docstrings, ignore_type_checking, cmp_site_ok)
             for x, y in zip(a, b)
+        )
+    if (
+        cmp_site_ok is not None
+        and isinstance(a, ast.Compare)
+        and len(a.ops) == 1
+        and len(b.ops) == 1
+        and (type(a.ops[0]), type(b.ops[0])) in _CMP_TWINS
+        and cmp_site_ok(a.lineno, a.col_offset)
+    ):
+        return _ast_nodes_equiv(a.left, b.left, ignore_docstrings, ignore_type_checking, cmp_site_ok) and (
+            _ast_nodes_equiv(a.comparators, b.comparators, ignore_docstrings, ignore_type_checking, cmp_site_ok)
         )
     if isinstance(a, ast.AST):
         is_doc_owner = ignore_docstrings and isinstance(a, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
@@ -352,7 +372,7 @@ def _ast_nodes_equiv(
                 if is_tc_owner:
                     va = [s for s in va if not _is_type_checking_if(s)]
                     vb = [s for s in vb if not _is_type_checking_if(s)]
-            if not _ast_nodes_equiv(va, vb, ignore_docstrings, ignore_type_checking):
+            if not _ast_nodes_equiv(va, vb, ignore_docstrings, ignore_type_checking, cmp_site_ok):
                 return False
         return True
     return a == b
@@ -941,6 +961,7 @@ def analyze_python_change(
     pure_enums: set[str] | None = None,
     strict_enum_attrs: set[tuple[str, str]] | None = None,
     ignore_docstrings: bool = False,
+    cmp_agree: Any = None,
 ) -> PyFileAnalysis:
     """Analyze a modified Python file into semantic ChangeUnits."""
     changed_old, anchor_old, cf_old = _extract_hunk_lines(fp)
@@ -983,6 +1004,11 @@ def analyze_python_change(
     # Never treat semantic operator changes (like `is` <-> `==`) as static no-op (verify them instead!).
     if _coding_cookie(old_src) == _coding_cookie(new_src):
         if _ast_nodes_equiv(old_ast, new_ast, ignore_docstrings):
+            return PyFileAnalysis(file=file, is_noop=True)
+        if cmp_agree and _ast_nodes_equiv(
+            old_ast, new_ast, ignore_docstrings,
+            cmp_site_ok=lambda line, col: f"{file}:{line}:{col}" in cmp_agree,
+        ):
             return PyFileAnalysis(file=file, is_noop=True)
 
     units: list[ChangeUnit] = []

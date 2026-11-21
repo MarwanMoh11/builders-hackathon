@@ -30,6 +30,13 @@ MAPS_DIR = Path(os.environ.get("BLAST_MAPS_DIR", str(Path(__file__).resolve().pa
 
 def main() -> None:
     t0 = time.perf_counter()
+    import runner as _runner
+
+    # The run is rejected past 180 s (270 s in the final, which has ~1.5x the commits). Scale the
+    # verification budget with the batch, leaving margin for packing and output.
+    n_commits = len(list((DATA_DIR / "commits").glob("*.patch")))
+    budget = float(os.environ.get("BLAST_BUDGET", min(230.0, max(150.0, 5.0 * n_commits))))
+    _runner.DEADLINE = time.monotonic() + budget
 
     # 1. Load runtime tests.json
     tests_list: list[dict] = json.loads((DATA_DIR / "tests.json").read_text(encoding="utf-8"))["tests"]
