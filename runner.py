@@ -1878,7 +1878,22 @@ def _execute_commit_verification(
             bucket = 2
         return (bucket, -r, e)
 
+    # Aggregate cutoff (complements the per-test one, which ignores tests under 150 ms): once a
+    # failure is confirmed, reporting ALL remaining candidates unrun costs
+    # cost(F | R) - cost(F); running them costs at least their CPU. When the first is smaller,
+    # reporting dominates running whatever the outcome (a superset never misses).
+    runs_since_check = 10**9
+
     while remaining:
+        if confirmed_fail and runs_since_check >= 20:
+            runs_since_check = 0
+            est_rest = sum(est_cpu[t] for t in remaining)
+            if est_rest > 0:
+                blind_marg = fast_cost_ms(confirmed_fail | remaining, dur_by_num) - fast_cost_ms(confirmed_fail, dur_by_num)
+                if blind_marg <= est_rest:
+                    confirmed_fail.update(remaining)
+                    remaining.clear()
+                    break
         if confirmed_fail:
             if not zero_ms_absorbed:
                 _absorb_zero_ms()
@@ -1924,7 +1939,10 @@ def _execute_commit_verification(
         remaining.remove(t_next)
         sum_rem -= dur_by_num[t_next]
         passed = _run_one(t_next)
+        runs_since_check += 1
         if not passed:
+            if not confirmed_fail:
+                runs_since_check = 10**9  # first failure: check the aggregate cutoff right away
             _add_confirmed(t_next)
             _probe_lazy_import_crashes()
             # If the test's file failed to import or setUpClass crashed, immediately mark ALL siblings as failing!
