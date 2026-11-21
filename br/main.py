@@ -52,7 +52,7 @@ def pack(numbers, dur_ms):
 
 
 P_BREAK = float(os.environ.get("BR_P_BREAK", "0.55"))  # chance a covered change breaks something
-CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.0"))  # scorer CPU vs our measurements
+CPU_SCALE = 1.0  # scorer CPU per unit of our measured CPU; calibrated in main()
 
 
 class Costs:
@@ -77,6 +77,23 @@ class Costs:
         return sum(self.cpu(n) for n in numbers) + CPU_SCALE * sum(
             self.class_setup.get(c, 0.05) for c in classes
         )
+
+
+def calibrate_cpu_scale(tests, run_cost) -> float:
+    """Our CPU measurements versus the recorded seconds, on single-process dialect tests where
+    recorded time is CPU time: converts our measurements into the scorer machine's seconds."""
+    setting = os.environ.get("BR_CPU_SCALE", "1.0")
+    if setting != "auto":
+        return float(setting)
+    ratios = sorted(
+        run_cost[t["number"]] / t["seconds"]
+        for t in tests
+        if "/dialects/" in t["file"] and t["seconds"] >= 0.05 and t["number"] in run_cost
+    )
+    if len(ratios) < 5:
+        return 1.0
+    median = ratios[len(ratios) // 2]
+    return min(1.5, max(0.3, 1.0 / median))
 
 
 def split_run_blind(candidates, costs: Costs):
@@ -292,6 +309,9 @@ def main():
         never_run = {number_by_id[i] for i in measured.get("never_run", []) if i in number_by_id}
         class_setup = measured.get("class_setup", {})
     costs = Costs(tests, dur_ms, run_cost, class_setup, never_run)
+    global CPU_SCALE
+    CPU_SCALE = calibrate_cpu_scale(tests, run_cost)
+    log(f"cpu scale {CPU_SCALE:.2f}")
 
     import engine
 
