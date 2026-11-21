@@ -25,7 +25,11 @@ def main(tests_path, out_path):
     total = time.process_time() - t0
     by_id = {tests[n]["id"]: round(c, 4) for n, c in cpu.items()}
     never_run = [t["id"] for t in tests if "test_lazy_load" in t["id"]]
-    json.dump({"cpu": by_id, "never_run": never_run, "setup_cpu": round(setup_cpu, 3)}, open(out_path, "w"), indent=0)
+    class_setup = {k: round(v, 4) for k, v in engine.CLASS_SETUP_CPU.items()}
+    json.dump({"cpu": by_id, "class_setup": class_setup, "never_run": never_run,
+               "setup_cpu": round(setup_cpu, 3)}, open(out_path, "w"), indent=0)
+    for k, v in sorted(class_setup.items(), key=lambda kv: -kv[1])[:6]:
+        print(f"  class setup {v:6.3f}s  {k}", file=sys.stderr)
     print(f"setup {setup_cpu:.2f}s cpu, all tests {total - setup_cpu:.2f}s cpu, failing {len(failing)}", file=sys.stderr)
     for n in sorted(failing):
         print("  FAIL", tests[n]["id"], file=sys.stderr)

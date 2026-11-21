@@ -114,6 +114,7 @@ def setup_parent(tests: list[dict], import_tests: bool = True) -> None:
             importlib.import_module(info.name)
         except Exception as error:  # noqa: BLE001
             log(f"import {info.name} failed: {error!r}")
+    build_dependents()
     for obj in gc.get_objects():
         if type(obj) is types.FunctionType:
             filename = obj.__code__.co_filename
@@ -194,10 +195,67 @@ class PatchedFinder:
         )
 
 
-def reimport(sources: dict[str, str]):
-    """Drop every sqlglot and test module and import them again, patched sources first in line.
-    Returns (old modules, new modules, names that failed to import)."""
-    old = {n: m for n, m in sys.modules.items() if is_ours(n) and m is not None}
+DEPENDENTS: dict[str, set[str]] = {}  # module -> modules whose import-time state refers to it
+
+
+def _owner(value) -> str | None:
+    if isinstance(value, types.ModuleType):
+        return value.__name__
+    owner = getattr(value, "__module__", None) if isinstance(value, (type, types.FunctionType)) else None
+    if owner is None:
+        owner = getattr(type(value), "__module__", None)
+    return owner if isinstance(owner, str) else None
+
+
+def build_dependents() -> None:
+    """Who refers to whom, read off live module (and class) namespaces after import.
+
+    A module that binds nothing from another cannot hold state built from it, so re-importing a
+    changed module only needs its dependents re-imported. A package's submodule attributes do not
+    count: re-importing a submodule rebinds that attribute by itself."""
+    ours = {n: m for n, m in sys.modules.items() if is_ours(n) and m is not None}
+    for name, module in ours.items():
+        refs: set[str] = set()
+        namespaces = [vars(module)]
+        for value in list(vars(module).values()):
+            if isinstance(value, type) and value.__module__ == name:
+                namespaces.append(vars(value))
+        for namespace in namespaces:
+            for key, value in list(namespace.items()):
+                owner = _owner(value)
+                if owner is None or owner == name or owner not in ours:
+                    continue
+                if isinstance(value, types.ModuleType) and owner == f"{name}.{key}":
+                    continue  # package -> its own submodule attribute
+                refs.add(owner)
+        for ref in refs:
+            DEPENDENTS.setdefault(ref, set()).add(name)
+
+
+def dependent_closure(names) -> set[str]:
+    out = set(names)
+    stack = list(names)
+    while stack:
+        for dep in DEPENDENTS.get(stack.pop(), ()):
+            if dep not in out:
+                out.add(dep)
+                stack.append(dep)
+    return out
+
+
+def reimport(sources: dict[str, str], everything: bool = False):
+    """Drop the changed modules and every module depending on them, and import them again,
+    patched sources first in line. Returns (old modules, new modules, names that failed)."""
+    changed = {module_name(rel) for rel in sources}
+    if everything or not DEPENDENTS:
+        selected = None
+    else:
+        selected = dependent_closure(changed)
+    old = {
+        n: m
+        for n, m in sys.modules.items()
+        if is_ours(n) and m is not None and (selected is None or n in selected)
+    }
     for n in old:
         del sys.modules[n]
     importlib.invalidate_caches()
@@ -211,6 +269,18 @@ def reimport(sources: dict[str, str]):
         except Exception as error:  # noqa: BLE001
             failed.append(name)
             log(f"re-import {name} failed: {error!r}")
+    # A re-imported package only gets attributes for submodules imported after it: re-attach the
+    # submodules that were kept.
+    for name, module in list(sys.modules.items()):
+        if module is None or not is_ours(name) or "." not in name:
+            continue
+        parent_name, _, child = name.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None and parent_name in old and getattr(parent, child, None) is not module:
+            try:
+                setattr(parent, child, module)
+            except (AttributeError, TypeError):
+                pass
     new = {n: sys.modules[n] for n in old if n in sys.modules}
     return old, new, failed
 
@@ -252,8 +322,12 @@ def _alarm(signum, frame):
     raise _Timeout()
 
 
+CLASS_SETUP_CPU: dict[str, float] = {}
+
+
 def run_tests(numbers, budget_seconds: float | None = None) -> tuple[set[int], dict[int, float]]:
-    """Run tests by number; return (failing numbers, CPU seconds per test)."""
+    """Run tests by number; return (failing numbers, CPU seconds per test). Class setup CPU is
+    recorded in CLASS_SETUP_CPU."""
     signal.signal(signal.SIGALRM, _alarm)
     groups: dict[tuple[str, str], list[dict]] = {}
     for n in sorted(numbers):
@@ -271,6 +345,7 @@ def run_tests(numbers, budget_seconds: float | None = None) -> tuple[set[int], d
             continue
         if getattr(cls, "__unittest_skip__", False):
             continue
+        setup_started = time.process_time()
         try:
             cls.setUpClass()
         except BaseException:  # noqa: BLE001
@@ -280,6 +355,7 @@ def run_tests(numbers, budget_seconds: float | None = None) -> tuple[set[int], d
             except BaseException:  # noqa: BLE001
                 pass
             continue
+        CLASS_SETUP_CPU[f"{modname}::{clsname}"] = time.process_time() - setup_started
         for t in items:
             method = t["id"].split("::")[-1]
             result = unittest.TestResult()

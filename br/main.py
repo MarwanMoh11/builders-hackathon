@@ -51,26 +51,75 @@ def pack(numbers, dur_ms):
 # ------------------------------------------------------------------ deciding what to run
 
 
-def split_run_blind(candidates, run_cost, dur_ms, never_run):
-    """Choose tests to run (pay CPU, learn the truth) and tests to report unrun (pay their time)."""
+P_BREAK = float(os.environ.get("BR_P_BREAK", "0.55"))  # chance a covered change breaks something
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.0"))  # scorer CPU vs our measurements
+
+
+class Costs:
+    def __init__(self, tests, dur_ms, run_cost, class_setup, never_run):
+        self.dur_ms = dur_ms
+        self.run_cost = run_cost
+        self.never_run = never_run
+        self.class_setup = class_setup
+        self.class_of = {}
+        for t in tests:
+            parts = t["id"].split("::")
+            module = t["file"][:-3].replace("/", ".")
+            self.class_of[t["number"]] = f"{module}::{parts[1] if len(parts) > 2 else ''}"
+
+    def cpu(self, n):
+        return CPU_SCALE * self.run_cost.get(n, 2.0 * self.dur_ms[n] / 1000 + 0.01)
+
+    def run_cpu(self, numbers):
+        classes = {self.class_of[n] for n in numbers}
+        return sum(self.cpu(n) for n in numbers) + CPU_SCALE * sum(
+            self.class_setup.get(c, 0.05) for c in classes
+        )
+
+
+def split_run_blind(candidates, costs: Costs):
+    """Choose tests to run (pay their CPU, learn the truth) and tests to report unrun (pay their
+    recorded time). Running only pays off for tests likely to pass, so this compares expected
+    totals: report everything, or run a subset and report what fails plus the rest."""
     candidates = set(candidates)
-    giants = {n for n in candidates if n in never_run or run_cost.get(n, dur_ms[n] / 1000) > GIANT_SECONDS}
-    rest = candidates - giants
-    if not giants:
-        return rest, set()
-    # With a giant reported anyway, other tests ride along on spare workers almost for free.
-    blind_all, _ = pack(candidates, dur_ms)
-    giant_only, _ = pack(giants, dur_ms)
-    run_cpu_ms = sum(run_cost.get(n, dur_ms[n] / 1000) for n in rest) * 1000
-    if blind_all <= giant_only + WORKER_MS + run_cpu_ms:
+    if not candidates:
+        return set(), set()
+    dur_ms = costs.dur_ms
+    blind_all = pack(candidates, dur_ms)[0] / 1000
+    giants = {n for n in candidates if n in costs.never_run or costs.cpu(n) > GIANT_SECONDS}
+    run = candidates - giants
+
+    def estimate(run_set, blind_set):
+        if not run_set:
+            return pack(blind_set, dur_ms)[0] / 1000
+        tail = (pack(blind_set, dur_ms)[0] / 1000 + P_BREAK * WORKER_MS / 1000) if blind_set else P_BREAK * (
+            WORKER_MS / 1000 + 0.3
+        )
+        return costs.run_cpu(run_set) + tail
+
+    best = estimate(run, giants)
+    blind = set(giants)
+    improved = True
+    while improved and run:
+        improved = False
+        groups: dict[str, set[int]] = {}
+        for n in run:
+            groups.setdefault(costs.class_of[n], set()).add(n)
+        for members in sorted(groups.values(), key=lambda m: -costs.run_cpu(m)):
+            trial = estimate(run - members, blind | members)
+            if trial < best - 1e-9:
+                run, blind, best = run - members, blind | members, trial
+                improved = True
+                break
+    if blind_all <= best:
         return set(), candidates
-    return rest, giants
+    return run, blind
 
 
 # ------------------------------------------------------------------ the child
 
 
-def child_main(plan, cov, run_cost, dur_ms, never_run, write_fd):
+def child_main(plan, cov, costs, write_fd):
     import engine
     from pyanalyze import all_codes, code_lines
     from valdiff import diff_modules
@@ -78,6 +127,7 @@ def child_main(plan, cov, run_cost, dur_ms, never_run, write_fd):
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     out = {"failing": [], "blind": [], "everything": False, "note": ""}
+    t0 = time.process_time()
     try:
         engine.install_overlays(plan.overlays)
         candidates = set(plan.candidates)
@@ -98,8 +148,10 @@ def child_main(plan, cov, run_cost, dur_ms, never_run, write_fd):
             attrs, globals_, missing = diff_modules(old, new)
             out["note"] += f"attrs={sorted(attrs)[:6]} globals={sorted(globals_)[:6]}; "
             candidates |= _readers(attrs, globals_, old, cov, code_lines, all_codes)
-        run, blind = split_run_blind(candidates, run_cost, dur_ms, never_run)
-        failing, _cpu = engine.run_tests(run)
+        t1 = time.process_time()
+        run, blind = split_run_blind(candidates, costs)
+        failing, cpu_by_test = engine.run_tests(run)
+        out["cpu"] = [round(t1 - t0, 2), round(time.process_time() - t1, 2), round(sum(cpu_by_test.values()), 2)]
         out["failing"] = sorted(failing)
         out["blind"] = sorted(blind)
         out["ran"] = len(run)
@@ -217,13 +269,16 @@ def main():
     cov = CoverageMap(MAP_PATH)
     run_cost: dict[int, float] = {}
     never_run: set[int] = set()
+    class_setup: dict[str, float] = {}
     if os.path.exists(COSTS_PATH):
-        costs = json.load(open(COSTS_PATH))
+        measured = json.load(open(COSTS_PATH))
         number_by_id = {t["id"]: t["number"] for t in tests}
-        for test_id, seconds in costs.get("cpu", {}).items():
+        for test_id, seconds in measured.get("cpu", {}).items():
             if test_id in number_by_id:
                 run_cost[number_by_id[test_id]] = seconds
-        never_run = {number_by_id[i] for i in costs.get("never_run", []) if i in number_by_id}
+        never_run = {number_by_id[i] for i in measured.get("never_run", []) if i in number_by_id}
+        class_setup = measured.get("class_setup", {})
+    costs = Costs(tests, dur_ms, run_cost, class_setup, never_run)
 
     import engine
 
@@ -261,7 +316,7 @@ def main():
                 pid = os.fork()
                 if pid == 0:
                     os.close(r)
-                    child_main(plan, cov, run_cost, dur_ms, never_run, w)
+                    child_main(plan, cov, costs, w)
                 os.close(w)
                 running[r] = (pid, plan, [], time.time() + 60)
             ready, _, _ = _select.select(list(running), [], [], 1.0)
@@ -292,7 +347,7 @@ def main():
                 else:
                     answers[plan.commit] = pack(set(result["failing"]) | set(result["blind"]), dur_ms)[1]
                 log(
-                    f"{plan.commit}: ran={result.get('ran')} failing={len(result.get('failing', []))} "
+                    f"{plan.commit}: cpu(prep,run,tests)={result.get('cpu')} ran={result.get('ran')} failing={len(result.get('failing', []))} "
                     f"blind={len(result.get('blind', []))} {result.get('note', '')}"
                 )
 
