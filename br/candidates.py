@@ -102,7 +102,9 @@ def _plan_file(plan, fd: FileDiff, root, cov, tests_by_file):
     elif path.endswith(".py") and (path.startswith("sqlglot/") or path.startswith("tests/")):
         plan.data_only = False
         _plan_python(plan, fd, old_text, new_text, cov, tests_by_file, root)
-    elif path.startswith("tests/") or path.startswith("sqlglot/"):
+        if new_text is not None:
+            plan.overlays[path] = new_text  # tests that read the source see the patched text
+    elif path.startswith("tests/") or path.startswith("sqlglot/") or path in cov.opens:
         _plan_data_file(plan, fd, old_text, new_text, cov)
     else:
         plan.notes.append(f"ignored {path}")

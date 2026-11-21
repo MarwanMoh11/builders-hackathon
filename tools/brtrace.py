@@ -47,8 +47,13 @@ def _audit(event, args):
         path = args[0]
         if isinstance(path, bytes):
             path = path.decode(errors="replace")
-        if path.startswith(ROOT) and not path.endswith((".py", ".pyc")):
-            _current_opens.add(path[len(ROOT):])
+        if path.startswith(ROOT):
+            rel = path[len(ROOT):]
+            # .py files under sqlglot/ and tests/ are opened by imports; anything else (data,
+            # sqlglotc/setup.py run by a test, pyproject.toml ...) is a file a test depends on
+            if rel.endswith(".pyc") or (rel.endswith(".py") and rel.startswith(("sqlglot/", "tests/"))):
+                return
+            _current_opens.add(rel)
 
 
 class InlineExecutor:
