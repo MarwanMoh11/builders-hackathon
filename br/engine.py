@@ -380,9 +380,16 @@ def _alarm(signum, frame):
 CLASS_SETUP_CPU: dict[str, float] = {}
 
 
-def run_tests(numbers, budget_seconds: float | None = None) -> tuple[set[int], dict[int, float]]:
+UNRUN: set[int] = set()  # tests skipped after a timeout or budget overrun; report them unrun
+
+
+def run_tests(numbers, limits: dict[int, float] | None = None, budget_seconds: float | None = None):
     """Run tests by number; return (failing numbers, CPU seconds per test). Class setup CPU is
-    recorded in CLASS_SETUP_CPU."""
+    recorded in CLASS_SETUP_CPU. After a timeout (the patch likely loops) or once the CPU budget
+    is spent, the remaining tests are not run but left in UNRUN for the caller to report."""
+    limits = limits or {}
+    started_all = time.process_time()
+    stop = False
     signal.signal(signal.SIGALRM, _alarm)
     groups: dict[tuple[str, str], list[dict]] = {}
     for n in sorted(numbers):
@@ -392,6 +399,10 @@ def run_tests(numbers, budget_seconds: float | None = None) -> tuple[set[int], d
     failing: set[int] = set()
     cpu: dict[int, float] = {}
     for (modname, clsname), items in groups.items():
+        if stop or (budget_seconds is not None and time.process_time() - started_all > budget_seconds):
+            stop = True
+            UNRUN.update(t["number"] for t in items)
+            continue
         try:
             module = importlib.import_module(modname)
             cls = getattr(module, clsname)
@@ -412,22 +423,33 @@ def run_tests(numbers, budget_seconds: float | None = None) -> tuple[set[int], d
             continue
         CLASS_SETUP_CPU[f"{modname}::{clsname}"] = time.process_time() - setup_started
         for t in items:
+            if stop:
+                UNRUN.add(t["number"])
+                continue
             method = t["id"].split("::")[-1]
             result = unittest.TestResult()
             started = time.process_time()
-            limit = max(5.0, 15.0 * t["seconds"])
+            limit = limits.get(t["number"], max(3.0, 15.0 * t["seconds"]))
+            timed_out = False
             signal.setitimer(signal.ITIMER_REAL, limit)
             try:
                 cls(method).run(result)
             except _Timeout:
                 result.errors.append((None, "timeout"))
+                timed_out = True
             except BaseException as error:  # noqa: BLE001
                 result.errors.append((None, repr(error)))
             finally:
                 signal.setitimer(signal.ITIMER_REAL, 0)
-            cpu[t["number"]] = time.process_time() - started
+            elapsed = time.process_time() - started
+            cpu[t["number"]] = elapsed
             if result.failures or result.errors or result.unexpectedSuccesses:
                 failing.add(t["number"])
+                # unittest swallows the alarm inside the test: spot it by the time spent
+                if timed_out or elapsed >= 0.9 * limit:
+                    stop = True
+            if budget_seconds is not None and time.process_time() - started_all > budget_seconds:
+                stop = True
         try:
             cls.tearDownClass()
         except BaseException:  # noqa: BLE001

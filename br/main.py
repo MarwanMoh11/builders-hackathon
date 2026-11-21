@@ -160,7 +160,10 @@ def child_main(plan, cov, costs, write_fd):
             candidates |= _readers(attrs, globals_, old, cov, code_lines, all_codes)
         t1 = time.process_time()
         run, blind = split_run_blind(candidates, costs)
-        failing, cpu_by_test = engine.run_tests(run)
+        limits = {n: max(2.0, 6.0 * costs.cpu(n) + 1.0) for n in run}
+        budget = 3.0 * costs.run_cpu(run) + 5.0
+        failing, cpu_by_test = engine.run_tests(run, limits, budget)
+        blind |= engine.UNRUN
         out["cpu"] = [round(t1 - t0, 2), round(time.process_time() - t1, 2), round(sum(cpu_by_test.values()), 2)]
         out["failing"] = sorted(failing)
         out["blind"] = sorted(blind)
