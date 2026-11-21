@@ -214,6 +214,12 @@ def build_dependents() -> None:
     changed module only needs its dependents re-imported. A package's submodule attributes do not
     count: re-importing a submodule rebinds that attribute by itself."""
     ours = {n: m for n, m in sys.modules.items() if is_ours(n) and m is not None}
+    # The module that first holds a container (in import order) made it; later holders imported it.
+    container_owner: dict[int, str] = {}
+    for name, module in ours.items():
+        for value in list(vars(module).values()):
+            if isinstance(value, (dict, list, set)) and id(value) not in container_owner:
+                container_owner[id(value)] = name
     for name, module in ours.items():
         refs: set[str] = set()
         namespaces = [vars(module)]
@@ -227,15 +233,11 @@ def build_dependents() -> None:
                     continue  # package -> its own submodule attribute
                 if owner is not None and owner != name and owner in ours:
                     refs.add(owner)
-                # a container built elsewhere (e.g. ENV) carries its maker's objects
-                if isinstance(value, (dict, list, tuple, set, frozenset)):
-                    items = value.values() if isinstance(value, dict) else value
-                    for count, item in enumerate(items):
-                        if count >= 64:
-                            break
-                        item_owner = _owner(item)
-                        if item_owner is not None and item_owner != name and item_owner in ours:
-                            refs.add(item_owner)
+                # a container imported from the module that built it (e.g. ENV)
+                if isinstance(value, (dict, list, set)):
+                    maker = container_owner.get(id(value))
+                    if maker is not None and maker != name:
+                        refs.add(maker)
         for ref in refs:
             DEPENDENTS.setdefault(ref, set()).add(name)
 
