@@ -215,11 +215,15 @@ def pytest_runtest_setup(item):
     # Lines run in setup (setUpClass included) are also kept apart, so class-level setup
     # can be credited to every test of the class afterwards.
     before = set(_current_lines)
+    opens_before = set(_current_opens)
+    attrs_before = set(_current_attrs)
     yield
     item.stash.setdefault(_setup_key, set()).update(_current_lines - before)
+    item.stash[_setup_extra_key] = (sorted(_current_opens - opens_before), sorted(_current_attrs - attrs_before))
 
 
 _setup_key = pytest.StashKey[set]()
+_setup_extra_key = pytest.StashKey[tuple]()
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -232,6 +236,9 @@ def pytest_runtest_makereport(item, call):
         if entry is None:
             _results[item.nodeid] = entry = {}
         entry["setup"] = _encode(setup_lines)
+        opens, attrs = item.stash.get(_setup_extra_key, ([], []))
+        entry["setup_opens"] = opens
+        entry["setup_attrs"] = attrs
     if report.failed:
         _results.setdefault(item.nodeid, {})["failed_" + call.when] = True
 

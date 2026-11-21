@@ -17,6 +17,8 @@ import sys
 
 def read_attrs(attr_dir: str, number_by_id: dict) -> dict[str, list[int]]:
     attrs: dict[str, set[int]] = {}
+    members: dict[str, set[int]] = {}
+    setup_attrs: dict[str, set[str]] = {}
     for path in sorted(glob.glob(os.path.join(attr_dir, "trace-*.json"))):
         data = json.load(open(path))
         keys = data.get("attr_keys", {})
@@ -24,8 +26,15 @@ def read_attrs(attr_dir: str, number_by_id: dict) -> dict[str, list[int]]:
             number = number_by_id.get(nodeid)
             if number is None:
                 continue
+            klass = nodeid.rsplit("::", 1)[0]
+            members.setdefault(klass, set()).add(number)
             for key in entry.get("attrs", []):
                 attrs.setdefault(keys[str(key)], set()).add(number)
+            setup_attrs.setdefault(klass, set()).update(keys[str(k)] for k in entry.get("setup_attrs", []))
+    # attributes read by setUpClass serve the whole class
+    for klass, names in setup_attrs.items():
+        for name in names:
+            attrs.setdefault(name, set()).update(members.get(klass, set()))
     return {k: sorted(v) for k, v in sorted(attrs.items())}
 
 
@@ -39,6 +48,7 @@ def main(trace_dir: str, tests_path: str, out_path: str, attr_dir: str | None = 
     traced_seconds: dict[int, float] = {}
     class_setup: dict[str, set[tuple[str, int]]] = {}
     class_members: dict[str, set[int]] = {}
+    class_setup_opens: dict[str, set[str]] = {}
     unknown = 0
 
     for path in sorted(glob.glob(os.path.join(trace_dir, "trace-*.json"))):
@@ -62,12 +72,18 @@ def main(trace_dir: str, tests_path: str, out_path: str, attr_dir: str | None = 
             class_members.setdefault(klass, set()).add(number)
             for fid, lines in entry.get("setup", {}).items():
                 class_setup.setdefault(klass, set()).update((files[int(fid)], l) for l in lines)
+            class_setup_opens.setdefault(klass, set()).update(entry.get("setup_opens", []))
 
     # setUpClass runs once, inside the first test of its class: credit it to the whole class.
     for klass, lines in class_setup.items():
         members = class_members.get(klass, set())
         for filename, line in lines:
             line_tests.setdefault(filename, {}).setdefault(line, set()).update(members)
+
+    # Files read by setUpClass serve the whole class.
+    for klass, opened in class_setup_opens.items():
+        for name in opened:
+            open_tests.setdefault(name, set()).update(class_members.get(klass, set()))
 
     # Many lines share one set of tests, so store each distinct set once.
     set_index: dict[tuple[int, ...], int] = {}

@@ -12,6 +12,17 @@ from pyanalyze import StmtIndex, all_codes, analyze, code_lines, is_function
 
 
 class CoverageMap:
+    @classmethod
+    def load(cls, path: str) -> "CoverageMap":
+        """From the pickle made at build time if present (several times faster), else the json."""
+        import pickle
+
+        cached = path.replace(".json.gz", ".pickle")
+        if os.path.exists(cached):
+            with open(cached, "rb") as f:
+                return pickle.load(f)
+        return cls(path)
+
     def __init__(self, path: str):
         with gzip.open(path, "rt") as f:
             data = json.load(f)
@@ -212,3 +223,13 @@ def _plan_python(plan, fd, old_text, new_text, cov, tests_by_file, root=""):
         f"py {path}: kinds={sorted(set(kinds))} structural={analysis.structural} "
         f"tests={len(tests)} import_time={import_time}"
     )
+
+
+if __name__ == "__main__":
+    import pickle
+    import sys
+
+    import candidates  # pickle the class under its importable name, not __main__
+
+    with open(sys.argv[2], "wb") as f:
+        pickle.dump(candidates.CoverageMap(sys.argv[1]), f, protocol=pickle.HIGHEST_PROTOCOL)

@@ -11,6 +11,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Exactly the packages the labeling environment had.
 COPY requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir --disable-pip-version-check -r /app/requirements.lock
+# The slim image ships the standard library without bytecode: compile it once here instead of
+# on every run (CPU time is scored).
+RUN python -m compileall -q -j 0 /usr/local/lib/python3.13 > /dev/null || true
 
 # sqlglot at the pinned commit, from sqlglot's own repository.
 RUN python -c "import urllib.request as u; u.urlretrieve('https://github.com/tobymao/sqlglot/archive/eb11aec4be8cb2122afe713a4816662c3f0fb2fa.tar.gz', '/tmp/sqlglot.tgz')" \
@@ -22,6 +25,6 @@ RUN python -c "import urllib.request as u; u.urlretrieve('https://github.com/tob
 
 COPY br /app/br
 COPY tools /app/tools
-RUN chmod -R a+rX /app && python -m compileall -q /app/br
+RUN python /app/br/candidates.py /app/br/map.json.gz /app/br/map.pickle  && chmod -R a+rX /app && python -m compileall -q /app/br
 
 CMD ["python", "/app/br/main.py"]

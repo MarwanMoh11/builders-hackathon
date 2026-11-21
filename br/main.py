@@ -276,7 +276,7 @@ def main():
     for t in tests:
         tests_by_file.setdefault(t["file"], []).append(t["number"])
     all_tests = [t["number"] for t in tests]
-    cov = CoverageMap(MAP_PATH)
+    cov = CoverageMap.load(MAP_PATH)
     run_cost: dict[int, float] = {}
     never_run: set[int] = set()
     class_setup: dict[str, float] = {}
