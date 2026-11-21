@@ -30,6 +30,14 @@ MAPS_DIR = Path(os.environ.get("BLAST_MAPS_DIR", str(Path(__file__).resolve().pa
 
 def main() -> None:
     t0 = time.perf_counter()
+    import runner as _runner
+
+    # Scale wall-clock safety deadline with batch size (180s Practice <=45 commits, 270s Final >45 commits)
+    patch_paths = sorted((DATA_DIR / "commits").glob("*.patch"))
+    n_commits = len(patch_paths)
+    default_budget = 155.0 if n_commits <= 45 else 240.0
+    budget = float(os.environ.get("BLAST_BUDGET", default_budget))
+    _runner.DEADLINE = time.monotonic() + budget
 
     # 1. Load runtime tests.json
     tests_list: list[dict] = json.loads((DATA_DIR / "tests.json").read_text(encoding="utf-8"))["tests"]
@@ -45,7 +53,6 @@ def main() -> None:
 
     # 3. Plan all commits in /data/commits/*.patch
     engine = CandidateEngine(maps, tests_list, SQLGLOT_ROOT, subtests_dir=MAPS_DIR / "subtests")
-    patch_paths = sorted((DATA_DIR / "commits").glob("*.patch"))
     plans = [
         engine.plan_commit(p.stem, p.read_text(encoding="utf-8", errors="replace"))
         for p in patch_paths

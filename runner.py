@@ -35,6 +35,10 @@ class _TestTimeout(BaseException):
     """Raised by SIGALRM when a test exceeds its per-test timeout (infinite loops)."""
 
 
+class _EconomicAbort(BaseException):
+    """Raised when real-time CPU exceeds a test's marginal simulated cost (include safely, 0% miss risk)."""
+
+
 def _alarm_handler(signum: int, frame: Any) -> None:
     raise _TestTimeout()
 
@@ -56,7 +60,7 @@ class _InMemoryLoader(importlib.abc.Loader):
         module.__file__ = self.filepath
         if self.is_pkg:
             module.__path__ = [os.path.dirname(self.filepath)]
-        code = compile(self.source, self.filepath, "exec")
+        code = compile(self.source.encode("utf-8"), self.filepath, "exec")
         exec(code, module.__dict__)
 
 
@@ -238,6 +242,7 @@ IN_ASSERT_CTX: int = 0
 ACTIVE_COMMIT_PLAN: CommitPlan | None = None
 ACTIVE_ENGINE: Any = None
 ACTIVE_TNUM: int = -1
+ACTIVE_CPU_BUDGET_SEC: float | None = None
 
 
 def _hash_df(df) -> str:
@@ -626,7 +631,11 @@ def _install_fast_test_patches(maps: dict[str, Any], commit_plan: CommitPlan, sq
                     m.load_sql_fixtures = _filtered_fixtures
 
 
-def _patch_optimizer_module(maps: dict[str, Any], helpers_patched: bool = False) -> None:
+def _patch_optimizer_module(
+    maps: dict[str, Any],
+    helpers_patched: bool = False,
+    allow_duck_cache: bool = True,
+) -> None:
     topt = sys.modules.get("tests.test_optimizer")
     if topt is None or getattr(topt, "_blast_patched", False):
         return
@@ -685,7 +694,9 @@ def _patch_optimizer_module(maps: dict[str, Any], helpers_patched: bool = False)
     # Synchronous, fail-fast in-process check_file (no ProcessPoolExecutor spawn!)
     # Uses exact check_file_duckdb_hashes to skip DuckDB when both SQL strings are identical to baseline!
     duck_hashes = maps.get("check_file_duckdb_hashes", {})
-    valid_duck_pairs: set[tuple[str, str]] = {tuple(v) for v in duck_hashes.values()} if not helpers_patched else set()
+    valid_duck_pairs: set[tuple[str, str]] = (
+        {tuple(v) for v in duck_hashes.values()} if (not helpers_patched or allow_duck_cache) else set()
+    )
 
     def _fast_check_file(self, file, func, pretty=False, execute=None, only=None, **kwargs):
         check_pickle_all = getattr(topt, "_blast_check_pickle", False)
@@ -928,7 +939,7 @@ def _fast_compare_rows(
     return "fallback" if need_fallback else "pass"
 
 
-def _patch_executor_module(maps: dict[str, Any]) -> None:
+def _patch_executor_module(maps: dict[str, Any], helpers_patched: bool = False) -> None:
     texec = sys.modules.get("tests.test_executor")
     if texec is None or getattr(texec, "_blast_patched", False):
         return
@@ -1095,9 +1106,27 @@ def _patch_executor_module(maps: dict[str, Any]) -> None:
         rem_outer_init = signal.getitimer(signal.ITIMER_REAL)[0]
         outer_has_timer = rem_outer_init > 0.0
         outer_deadline = time.monotonic() + (rem_outer_init if outer_has_timer else 45.0)
+        cpu_budget = ACTIVE_CPU_BUDGET_SEC
+        cpu_t0 = time.process_time()
+        q_weights = [
+            (qmeta_map.get(qi, {}).get("sec_opt", 0.05) + qmeta_map.get(qi, {}).get("sec_exec", 0.25))
+            for qi in indices
+        ]
+        total_w = sum(q_weights)
+        done_w = 0.0
+        q_done = 0
+        warmup_cpu: float | None = None
+        warmup_w: float = 0.0
+
+        def _check_cpu_budget() -> None:
+            if cpu_budget is None or cpu_budget <= 0.0 or q_done >= len(indices):
+                return
+            cpu_spent = time.process_time() - cpu_t0
+            if cpu_spent >= 0.90 * cpu_budget:
+                raise _EconomicAbort()
 
         try:
-            for qidx in indices:
+            for q_pos, qidx in enumerate(indices):
                 args, sql, _ = sqls[qidx - 1]
                 qm = qmeta_map.get(qidx)
                 if outer_has_timer:
@@ -1108,15 +1137,23 @@ def _patch_executor_module(maps: dict[str, Any]) -> None:
                     q_budget = max(3.5, 6.0 * q_sec + 2.5)
                     signal.setitimer(signal.ITIMER_REAL, min(q_budget, rem_outer))
 
+                ran_heavy = False
                 with self.subTest(f"{tag} {qidx}"):
                     expr = parse_one(sql)
                     if check_pickle:
                         expr = pickle.loads(pickle.dumps(expr))
                     if not args.get("execute"):
+                        done_w += q_weights[q_pos]
+                        q_done += 1
                         continue
                     optimized = optimize(expr, schema_obj, leave_tables_isolated=True)
                     opt_sql_hash = hashlib.blake2b(optimized.sql().encode(), digest_size=12).hexdigest()
-                    base_ok = qm is not None and qm.get("execute") and not fixture_touched
+                    base_ok = (
+                        not helpers_patched
+                        and qm is not None
+                        and qm.get("execute")
+                        and not fixture_touched
+                    )
                     if opt_or_duck_untouched and base_ok and qm.get("duck_sql_hash"):
                         duck_sql = None
                         duck_unchanged = True
@@ -1135,6 +1172,8 @@ def _patch_executor_module(maps: dict[str, Any]) -> None:
                         and opt_unchanged
                         and duck_unchanged
                     ):
+                        done_w += q_weights[q_pos]
+                        q_done += 1
                         continue
 
                     # Tier 1B: Types touched (annotate_types/typing/*.py/dialect.py) -> check exact AST type hash!
@@ -1146,10 +1185,13 @@ def _patch_executor_module(maps: dict[str, Any]) -> None:
                         and qm.get("opt_types_hash")
                         and _hash_expr_types(optimized) == qm["opt_types_hash"]
                     ):
+                        done_w += q_weights[q_pos]
+                        q_done += 1
                         continue
 
                     if executor_init_touched:
                         # Real sqlglot.executor.execute() path when sqlglot/executor/__init__.py is patched!
+                        ran_heavy = True
                         q_tables = {tbl.name: tables[tbl.name] for tbl in find_tables(expr)}
                         t_names = list(q_tables.keys())
                         table = sg_execute(expr, schema=schema_obj, tables=q_tables)
@@ -1162,6 +1204,8 @@ def _patch_executor_module(maps: dict[str, Any]) -> None:
                             and det_h is not None
                             and det_h == qm["det_plan_hash"]
                         ):
+                            done_w += q_weights[q_pos]
+                            q_done += 1
                             continue
                         # Tier 2B: generators/python.py or shared runtime file touched (NOT sqlglot/executor/) ->
                         # if Plan DAG AND generated Python source code match baseline, skip PythonExecutor & DuckDB!
@@ -1172,8 +1216,11 @@ def _patch_executor_module(maps: dict[str, Any]) -> None:
                             and qm.get("py_code_hash")
                             and _hash_plan_py_code(plan) == qm["py_code_hash"]
                         ):
+                            done_w += q_weights[q_pos]
+                            q_done += 1
                             continue
 
+                        ran_heavy = True
                         q_tables = {}
                         t_names = []
                         for tbl in find_tables(expr):
@@ -1189,6 +1236,9 @@ def _patch_executor_module(maps: dict[str, Any]) -> None:
                         and qm.get("rows_hash")
                         and _hash_table_rows(table.columns, table.rows) == qm["rows_hash"]
                     ):
+                        done_w += q_weights[q_pos]
+                        q_done += 1
+                        _check_cpu_budget()
                         continue
 
                     # Pure-Python fast compare against DuckDB BEFORE importing numpy/pandas (~450ms saved!)
@@ -1201,24 +1251,26 @@ def _patch_executor_module(maps: dict[str, Any]) -> None:
                         self.cache[raw_key] = ([d[0] for d in cur.description], cur.fetchall())
                     a_cols, a_rows = self.cache[raw_key]
                     verdict = _fast_compare_rows(a_cols, a_rows, list(table.columns), list(table.rows))
-                    if verdict == "pass":
-                        continue
                     if verdict == "fail":
                         self.fail(f"{tag} {qidx} result mismatch")
+                    if verdict == "fallback":
+                        # Edge case (subtle float/type coercion): run full pandas assert_frame_equal
+                        if np_mod is None:
+                            import numpy as np_mod
+                            import pandas as pd_mod
+                            from pandas.testing import assert_frame_equal as afe_fn
+                        b = pd_mod.DataFrame(
+                            ((np_mod.nan if c is None else c for c in r) for r in table.rows),
+                            columns=table.columns,
+                        )
+                        if sql not in self.cache:
+                            self.cache[sql] = conn.execute(duck_sql).fetchdf()
+                        a = self.cache[sql]
+                        afe_fn(a, b, check_dtype=False, check_index_type=False)
 
-                    # Edge case (subtle float/type coercion): run full pandas assert_frame_equal
-                    if np_mod is None:
-                        import numpy as np_mod
-                        import pandas as pd_mod
-                        from pandas.testing import assert_frame_equal as afe_fn
-                    b = pd_mod.DataFrame(
-                        ((np_mod.nan if c is None else c for c in r) for r in table.rows),
-                        columns=table.columns,
-                    )
-                    if sql not in self.cache:
-                        self.cache[sql] = conn.execute(duck_sql).fetchdf()
-                    a = self.cache[sql]
-                    afe_fn(a, b, check_dtype=False, check_index_type=False)
+                done_w += q_weights[q_pos]
+                q_done += 1
+                _check_cpu_budget()
         finally:
             if outer_has_timer:
                 rem = outer_deadline - time.monotonic()
@@ -1229,7 +1281,7 @@ def _patch_executor_module(maps: dict[str, Any]) -> None:
         cp = ACTIVE_COMMIT_PLAN
         assert cp is not None
         all_touched = set(cp.patched_files) | set(cp.deleted_files)
-        tpch_touched = cp.tpch_fixture_touched or any("tpc-h" in r for r in all_touched)
+        tpch_touched = helpers_patched or cp.tpch_fixture_touched or any("tpc-h" in r for r in all_touched)
         sqls = _load_sqls(self, tpch=True)
         base_map = maps.get("opt_tpch_baseline", {})
         allowed = ACTIVE_FIXTURE_FILTERS.get("opt-tpch", None)
@@ -1636,12 +1688,12 @@ def _est_verify_ms(
         if not exec_dir_t and not commit_plan.tpcds_fixture_touched:
             qset = (sub_f or {}).get("tpc-ds")
             n = len(qset) if qset is not None else (15 if has_deferred else 60)
-            return min(2000, max(30, n * 30))
+            return min(2200, max(30, n * 35))
         qset = (sub_f or {}).get("tpc-ds")
         if qset is not None:
             qmeta = maps["tpcds_meta"]
             return int(sum((qmeta.get(q, {}).get("sec_opt", 0.02) + qmeta.get(q, {}).get("sec_exec", 0.2)) * 1000 for q in qset))
-        return 10000
+        return 18000
     if tid_str.endswith("::test_execute_tpch"):
         all_t = set(commit_plan.patched_files) | set(commit_plan.deleted_files)
         py_exec_t = any(
@@ -1653,13 +1705,33 @@ def _est_verify_ms(
             qset = (sub_f or {}).get("tpc-h")
             n = len(qset) if qset is not None else (8 if has_deferred else 22)
             return min(600, max(15, n * 15))
-        return 1500
+        return 1800
     if tid_str.endswith("::test_generator_memory"):
         if "tests/test_generator.py" in commit_plan.patched_files:
             return 6700
         dset = (sub_f or {}).get("gen-mem")
         n = len(dset) if dset is not None else (3 if has_deferred else 34)
         return max(15, n * 10)
+    if tid_str.endswith("::test_scope"):
+        fast_scope = (
+            "tests/helpers.py" not in commit_plan.patched_files
+            and "tests/test_optimizer.py" not in commit_plan.patched_files
+            and not any(
+                rel in (
+                    "sqlglot/optimizer/scope.py",
+                    "sqlglot/parser.py",
+                    "sqlglot/parsers/base.py",
+                    "sqlglot/dialects/dialect.py",
+                    "sqlglot/helper.py",
+                    "sqlglot/__init__.py",
+                    "sqlglot/tokens.py",
+                    "sqlglot/tokenizer_core.py",
+                )
+                or rel.startswith("sqlglot/expressions/")
+                for rel in commit_plan.patched_files
+            )
+        )
+        return 350 if fast_scope else 1800
     if tid_str.endswith("::test_optimize_in_nulls"):
         return 80
     if tid_str.endswith("::test_optimize_correlated_all"):
@@ -1671,7 +1743,7 @@ def _est_verify_ms(
         total_cases = 0
         for v in sub_f.values():
             if v is None:
-                return min(recorded, 400)
+                return max(5, int(recorded * 0.70))
             total_cases += len(v)
         if total_cases == 0:
             return 2
@@ -1679,7 +1751,7 @@ def _est_verify_ms(
     if has_deferred:
         return max(5, min(recorded, 60))
 
-    return max(2, min(recorded, 800))
+    return max(2, int(recorded * 0.70))
 
 
 def _execute_commit_verification(
@@ -1753,18 +1825,36 @@ def _execute_commit_verification(
                     if zero_ms_absorbed and dur_by_num[x] == 0:
                         _add_confirmed(x)
                     else:
-                        remaining.add(x)
-                        nonlocal sum_rem
-                        sum_rem += dur_by_num[x]
-                        est_cpu[x] = _est_verify_ms(x, num_to_test, dur_by_num, commit_plan, maps)
+                        _add_remaining(x)
 
     # Precompute estimated verification costs
     est_cpu = {t: _est_verify_ms(t, num_to_test, dur_by_num, commit_plan, maps) for t in remaining}
+    imported_tfiles: set[str] = {
+        tf
+        for tf in file_to_all_tnums
+        if tf.removesuffix(".py").replace("/", ".") in sys.modules
+    }
+    helpers_patched_global = "tests/helpers.py" in commit_plan.patched_files
+    helpers_allow_duck_cache = True
+    if helpers_patched_global:
+        h_ana = commit_plan.py_analyses.get("tests/helpers.py")
+        if h_ana is None or h_ana.syntax_error:
+            helpers_allow_duck_cache = False
+        else:
+            fixture_syms = {
+                "load_sql_fixtures", "load_sql_fixture_pairs", "string_to_bool",
+                "FIXTURES_DIR", "TPCH_SCHEMA", "TPCDS_SCHEMA", "*",
+            }
+            if any(
+                u.kind == "module_other" or (u.symbol_name or "*") in fixture_syms
+                for u in h_ana.units
+            ):
+                helpers_allow_duck_cache = False
 
-    def _run_one(tnum: int) -> bool:
-        """Returns True if test PASSED, False if test FAILED/ERRORED/TIMED OUT."""
+    def _run_one(tnum: int, cpu_budget_sec: float | None = None) -> bool:
+        """Returns True if test PASSED, False if test FAILED/ERRORED/TIMED OUT/ECONOMICALLY ABORTED."""
         nonlocal timeout_count
-        global ACTIVE_GEN_MEM_DIALECTS, ACTIVE_VAL_CALLS, ACTIVE_VAL_COUNTER, ACTIVE_VAL_FILE, ACTIVE_TNUM
+        global ACTIVE_GEN_MEM_DIALECTS, ACTIVE_VAL_CALLS, ACTIVE_VAL_COUNTER, ACTIVE_VAL_FILE, ACTIVE_TNUM, ACTIVE_CPU_BUDGET_SEC
         tinfo = num_to_test[tnum]
         tf, cls_name, meth = tinfo["id"].split("::")
         if tf in failed_test_files:
@@ -1777,7 +1867,8 @@ def _execute_commit_verification(
         ACTIVE_VAL_COUNTER = 0
         ACTIVE_VAL_FILE = tf
         ACTIVE_TNUM = tnum
-        helpers_patched = "tests/helpers.py" in commit_plan.patched_files
+        ACTIVE_CPU_BUDGET_SEC = cpu_budget_sec
+        helpers_patched = helpers_patched_global
         if helpers_patched or tf in commit_plan.patched_files:
             sub_f = None
         elif engine is not None:
@@ -1787,14 +1878,11 @@ def _execute_commit_verification(
         if sub_f:
             for tag, cases in sub_f.items():
                 if tag == "gen-mem":
-                    ACTIVE_GEN_MEM_DIALECTS = None if not cases else set(cases)
+                    ACTIVE_GEN_MEM_DIALECTS = None if cases is None else set(cases)
                 elif tag == "val-calls":
-                    ACTIVE_VAL_CALLS = None if not cases else set(cases)
+                    ACTIVE_VAL_CALLS = None if cases is None else set(cases)
                 else:
                     ACTIVE_FIXTURE_FILTERS[tag] = cases
-            # Belt-and-suspenders: if every fixture filter tag is empty set(), clear to run unfiltered!
-            if ACTIVE_FIXTURE_FILTERS and all(v is not None and len(v) == 0 for v in ACTIVE_FIXTURE_FILTERS.values()):
-                ACTIVE_FIXTURE_FILTERS.clear()
 
         cls_key = (tf, cls_name)
         cls = class_cache.get(cls_key)
@@ -1802,38 +1890,53 @@ def _execute_commit_verification(
             mod_name = tf.removesuffix(".py").replace("/", ".")
             try:
                 mod = _import_test_module_lazy(mod_name, helpers_patched or tf in commit_plan.patched_files)
+                imported_tfiles.add(tf)
                 # Apply module-specific fast patches when the test module itself is unpatched!
                 if mod_name == "tests.test_parser" and "tests/test_parser.py" not in commit_plan.patched_files:
                     _patch_parser_max_nodes()
                 if mod_name == "tests.test_generator" and "tests/test_generator.py" not in commit_plan.patched_files:
                     _patch_generator_module()
-                if mod_name == "tests.test_optimizer" and "tests/test_optimizer.py" not in commit_plan.patched_files:
-                    _patch_optimizer_module(maps, helpers_patched=helpers_patched)
-                    mod._blast_check_pickle = "sqlglot/serde.py" in commit_plan.patched_files
-                    mod._blast_check_pickle_sample = not mod._blast_check_pickle and any(
-                        rel in ("sqlglot/schema.py", "sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py")
-                        or rel.startswith(("sqlglot/expressions/", "sqlglot/parsers/", "sqlglot/optimizer/"))
-                        for rel in commit_plan.patched_files
+                if mod_name == "tests.test_executor" and "tests/test_executor.py" not in commit_plan.patched_files:
+                    _patch_executor_module(maps, helpers_patched=helpers_patched)
+                if mod_name == "tests.test_optimizer":
+                    topt_patched = "tests/test_optimizer.py" in commit_plan.patched_files
+                    topt_ana = commit_plan.py_analyses.get("tests/test_optimizer.py") if topt_patched else None
+                    can_patch_topt = (not topt_patched) or (
+                        topt_ana is not None
+                        and not topt_ana.syntax_error
+                        and all(u.kind == "func_body" for u in topt_ana.units)
+                        and "TestOptimizer.check_file" not in topt_ana.changed_funcs
+                        and "TestOptimizer.setUpClass" not in topt_ana.changed_funcs
                     )
-                    mod._blast_fast_scope = not helpers_patched and not any(
-                        rel in (
-                            "sqlglot/optimizer/scope.py",
-                            "sqlglot/parser.py",
-                            "sqlglot/parsers/base.py",
-                            "sqlglot/dialects/dialect.py",
-                            "sqlglot/helper.py",
-                            "sqlglot/__init__.py",
-                            "sqlglot/tokens.py",
-                            "sqlglot/tokenizer_core.py",
+                    if can_patch_topt:
+                        _patch_optimizer_module(
+                            maps,
+                            helpers_patched=helpers_patched or topt_patched,
+                            allow_duck_cache=(not topt_patched) and helpers_allow_duck_cache,
                         )
-                        or rel.startswith("sqlglot/expressions/")
-                        for rel in commit_plan.patched_files
-                    )
+                        mod._blast_check_pickle = "sqlglot/serde.py" in commit_plan.patched_files
+                        mod._blast_check_pickle_sample = not mod._blast_check_pickle and any(
+                            rel in ("sqlglot/schema.py", "sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py")
+                            or rel.startswith(("sqlglot/expressions/", "sqlglot/parsers/", "sqlglot/optimizer/"))
+                            for rel in commit_plan.patched_files
+                        )
+                        mod._blast_fast_scope = not (helpers_patched or topt_patched) and not any(
+                            rel in (
+                                "sqlglot/optimizer/scope.py",
+                                "sqlglot/parser.py",
+                                "sqlglot/parsers/base.py",
+                                "sqlglot/dialects/dialect.py",
+                                "sqlglot/helper.py",
+                                "sqlglot/__init__.py",
+                                "sqlglot/tokens.py",
+                                "sqlglot/tokenizer_core.py",
+                            )
+                            or rel.startswith("sqlglot/expressions/")
+                            for rel in commit_plan.patched_files
+                        )
                 if not helpers_patched:
                     if mod_name.startswith("tests.dialects.") and "tests/dialects/test_dialect.py" not in commit_plan.patched_files:
                         _patch_dialect_validator(maps, sqlglot_root)
-                    elif mod_name == "tests.test_executor" and "tests/test_executor.py" not in commit_plan.patched_files:
-                        _patch_executor_module(maps)
                     elif mod_name in ("tests.test_serde", "tests.test_transpile") and tf not in commit_plan.patched_files:
                         import tests.helpers as th
                         if hasattr(mod, "load_sql_fixtures"):
@@ -1895,12 +1998,16 @@ def _execute_commit_verification(
         prev_handler = signal.signal(signal.SIGALRM, _alarm_handler)
         signal.setitimer(signal.ITIMER_REAL, timeout_sec)
         passed = False
+        econ_aborted = False
         try:
             inst = cls(meth)
             res = unittest.TestResult()
             inst.run(res)
             passed = res.wasSuccessful()
         except _FailFast:
+            passed = False
+        except _EconomicAbort:
+            econ_aborted = True
             passed = False
         except _TestTimeout:
             timeout_count += 1
@@ -1920,10 +2027,11 @@ def _execute_commit_verification(
             ACTIVE_VAL_CALLS = None
             ACTIVE_VAL_COUNTER = 0
             ACTIVE_TNUM = -1
+            ACTIVE_CPU_BUDGET_SEC = None
 
         # Safety net: if a val-calls filtered test failed OUTSIDE a validate_* call (e.g. a mock
         # assertion expecting a skipped call to have run), re-run unfiltered to avoid false positive!
-        if not passed and used_val_filter and not VAL_FAILED_INSIDE:
+        if not passed and not econ_aborted and used_val_filter and not VAL_FAILED_INSIDE:
             signal.signal(signal.SIGALRM, _alarm_handler)
             signal.setitimer(signal.ITIMER_REAL, timeout_sec)
             try:
@@ -1944,16 +2052,47 @@ def _execute_commit_verification(
 
         return passed
 
-    # Track incremental sums/maxes so we NEVER run O(N^2) fast_cost_ms sorts on wide commits!
+    # Track incremental sums/maxes/est_cpu so we NEVER run O(N^2) fast_cost_ms sorts on wide commits!
+    def _is_cheap_heavy(t: int) -> bool:
+        return dur_by_num[t] >= 3000 and est_cpu[t] <= 2400
+
     sum_f = 0
     max_d_f = 0
     sum_rem = sum(dur_by_num[t] for t in remaining)
+    sum_est_cpu = sum(est_cpu[t] for t in remaining)
+    cheap_heavy_rem = sum(1 for t in remaining if _is_cheap_heavy(t))
     c_fail = 0
     max_total_cap = 0
     zero_ms_absorbed = False
+    c_all_dirty = True
+    c_all_cached = 0
+    iters_since_group_chk = 0
+
+    def _add_remaining(t: int) -> None:
+        nonlocal sum_rem, sum_est_cpu, cheap_heavy_rem, c_all_dirty
+        if t in remaining or t in confirmed_fail:
+            return
+        remaining.add(t)
+        sum_rem += dur_by_num[t]
+        est_cpu[t] = _est_verify_ms(t, num_to_test, dur_by_num, commit_plan, maps)
+        sum_est_cpu += est_cpu[t]
+        if _is_cheap_heavy(t):
+            cheap_heavy_rem += 1
+        c_all_dirty = True
+
+    def _remove_remaining(t: int) -> None:
+        nonlocal sum_rem, sum_est_cpu, cheap_heavy_rem, c_all_dirty
+        if t not in remaining:
+            return
+        remaining.remove(t)
+        sum_rem -= dur_by_num[t]
+        sum_est_cpu -= est_cpu[t]
+        if _is_cheap_heavy(t):
+            cheap_heavy_rem -= 1
+        c_all_dirty = True
 
     def _add_confirmed(t: int) -> None:
-        nonlocal sum_f, max_d_f, c_fail, max_total_cap
+        nonlocal sum_f, max_d_f, c_fail, max_total_cap, c_all_dirty
         if t in confirmed_fail:
             return
         confirmed_fail.add(t)
@@ -1962,6 +2101,7 @@ def _execute_commit_verification(
         if d > max_d_f:
             max_d_f = d
         c_fail = -1  # mark dirty
+        c_all_dirty = True
 
     def _absorb_zero_ms() -> None:
         nonlocal zero_ms_absorbed
@@ -1970,7 +2110,7 @@ def _execute_commit_verification(
         zero_ms_absorbed = True
         zeros = [t for t in remaining if dur_by_num[t] == 0]
         for z in zeros:
-            remaining.remove(z)
+            _remove_remaining(z)
             confirmed_fail.add(z)
 
     def _priority(t: int) -> tuple[int, int, int]:
@@ -1978,12 +2118,7 @@ def _execute_commit_verification(
         r = dur_by_num[t]
         if num_to_test[t]["id"].endswith("::test_lazy_load"):
             return (-1, 0, e)
-        if e <= 800:
-            bucket = 0
-        elif r >= 3 * e:
-            bucket = 1
-        else:
-            bucket = 2
+        bucket = 0 if (e <= 800 or r >= 3 * e) else 1
         return (bucket, -r, e)
 
     while remaining:
@@ -1995,10 +2130,13 @@ def _execute_commit_verification(
             if c_fail < 0:
                 c_fail = fast_cost_ms(confirmed_fail, dur_by_num)
                 max_total_cap = max_total_for_cost_ms(c_fail, max_d_f)
+                iters_since_group_chk = 999  # force check on failure growth
 
             # SLACK-ABSORPTION THEOREM: only compute c_all when total duration CAN POSSIBLY fit in c_fail!
             if sum_f + sum_rem <= max_total_cap:
                 c_all = fast_cost_ms(confirmed_fail | remaining, dur_by_num)
+                c_all_cached = c_all
+                c_all_dirty = False
                 if c_all == c_fail:
                     if len(confirmed_fail) + len(remaining) <= 100:
                         if optimal_cost_ms(confirmed_fail | remaining, dur_by_num) == optimal_cost_ms(confirmed_fail, dur_by_num):
@@ -2008,30 +2146,84 @@ def _execute_commit_verification(
                         confirmed_fail.update(remaining)
                         break
 
+            # GROUP ECONOMIC ABSORPTION THEOREM (100% sound, 0% miss risk):
+            # Once cheap high-leverage tests have run, if verifying ALL remaining tests costs strictly
+            # MORE native CPU than the MAXIMUM simulated time they could possibly save, absorb all!
+            iters_since_group_chk += 1
+            if (
+                len(remaining) >= 15
+                and cheap_heavy_rem == 0
+                and iters_since_group_chk >= 16
+            ):
+                iters_since_group_chk = 0
+                if c_all_dirty:
+                    c_all_cached = fast_cost_ms(confirmed_fail | remaining, dur_by_num)
+                    c_all_dirty = False
+                group_marg = c_all_cached - c_fail
+                if group_marg == 0:
+                    confirmed_fail.update(remaining)
+                    break
+                unimp_files = len({num_to_test[x]["file"] for x in remaining} - imported_tfiles)
+                est_rem_cpu = sum_est_cpu + unimp_files * 25
+                if est_rem_cpu > int(group_marg * 1.15):
+                    confirmed_fail.update(remaining)
+                    break
+
         t_next = min(remaining, key=_priority)
 
-        # Economic cutoff when confirmed_fail is already non-empty:
+        # Smart O(1) slack-unlocking jump when confirmed_fail is non-empty and remaining is moderate:
+        # if t_next has 0 marginal cost in c_all, test a high-r candidate that DOES affect c_all first!
+        if confirmed_fail and len(remaining) <= 200 and dur_by_num[t_next] < 2000:
+            if c_all_dirty:
+                c_all_cached = fast_cost_ms(confirmed_fail | remaining, dur_by_num)
+                c_all_dirty = False
+            c_wo_chk = fast_cost_ms(confirmed_fail | (remaining - {t_next}), dur_by_num)
+            if c_all_cached - c_wo_chk == 0:
+                top_k = sorted(remaining, key=lambda x: (-dur_by_num[x], est_cpu[x]))[:6]
+                useful = [
+                    x for x in top_k
+                    if fast_cost_ms(confirmed_fail | (remaining - {x}), dur_by_num) < c_all_cached
+                ]
+                if useful:
+                    t_next = min(useful, key=_priority)
+
+        # Per-test economic cutoff when confirmed_fail is already non-empty:
+        t_budget_sec: float | None = None
         if confirmed_fail and est_cpu[t_next] > 150:
             # Provable dominance: if verifying costs >= test's full recorded duration, blindly including is strictly better!
             if est_cpu[t_next] >= dur_by_num[t_next]:
-                remaining.remove(t_next)
-                sum_rem -= dur_by_num[t_next]
+                _remove_remaining(t_next)
                 _add_confirmed(t_next)
                 continue
             m_confirmed = fast_cost_ms(confirmed_fail | {t_next}, dur_by_num) - c_fail
             if est_cpu[t_next] > m_confirmed:
-                c_all_chk = fast_cost_ms(confirmed_fail | remaining, dur_by_num)
+                if c_all_dirty:
+                    c_all_cached = fast_cost_ms(confirmed_fail | remaining, dur_by_num)
+                    c_all_dirty = False
                 c_without = fast_cost_ms(confirmed_fail | (remaining - {t_next}), dur_by_num)
-                marg = c_all_chk - c_without
+                marg = c_all_cached - c_without
                 if est_cpu[t_next] > max(marg, m_confirmed):
-                    remaining.remove(t_next)
-                    sum_rem -= dur_by_num[t_next]
+                    _remove_remaining(t_next)
                     _add_confirmed(t_next)
                     continue
 
-        remaining.remove(t_next)
-        sum_rem -= dur_by_num[t_next]
-        passed = _run_one(t_next)
+        # Compute real-time CPU budget ONLY when confirmed_fail already makes marginal cost < 15s
+        t_id_next = num_to_test[t_next]["id"]
+        if confirmed_fail and t_id_next.endswith(("::test_execute_tpcds", "::test_execute_tpch")):
+            m_conf_b = fast_cost_ms(confirmed_fail | {t_next}, dur_by_num) - c_fail
+            if len(remaining) == 1:
+                m_eff = m_conf_b
+            else:
+                if c_all_dirty:
+                    c_all_cached = fast_cost_ms(confirmed_fail | remaining, dur_by_num)
+                    c_all_dirty = False
+                c_wo_b = fast_cost_ms(confirmed_fail | (remaining - {t_next}), dur_by_num)
+                m_eff = min(dur_by_num[t_next], max(m_conf_b, c_all_cached - c_wo_b))
+            if m_eff < 15000:
+                t_budget_sec = max(1.5, m_eff / 1000.0)
+
+        _remove_remaining(t_next)
+        passed = _run_one(t_next, cpu_budget_sec=t_budget_sec)
         if not passed:
             _add_confirmed(t_next)
             _probe_lazy_import_crashes()
@@ -2045,8 +2237,7 @@ def _execute_commit_verification(
                     failed_test_files.add(bf)
                     for x in file_to_all_tnums.get(bf, ()):
                         if x in remaining:
-                            remaining.remove(x)
-                            sum_rem -= dur_by_num[x]
+                            _remove_remaining(x)
                         _add_confirmed(x)
                 # Runtime Import-Crash Escalation: if tf itself was NOT patched, the import crash came from
                 # patched sqlglot/ code -> escalate to full broken-import closure so no other unimportable file is missed!
@@ -2061,16 +2252,13 @@ def _execute_commit_verification(
                             if zero_ms_absorbed and dur_by_num[x] == 0:
                                 _add_confirmed(x)
                             else:
-                                remaining.add(x)
-                                sum_rem += dur_by_num[x]
-                                est_cpu[x] = _est_verify_ms(x, num_to_test, dur_by_num, commit_plan, maps)
+                                _add_remaining(x)
             elif setup_classes_done.get(ck_str) is False:
                 # If setUpClass crashed, EVERY test in that class fails (even if not originally in candidates!)
                 for x in file_to_all_tnums.get(tf, ()):
                     if "::".join(num_to_test[x]["id"].split("::")[:2]) == ck_str:
                         if x in remaining:
-                            remaining.remove(x)
-                            sum_rem -= dur_by_num[x]
+                            _remove_remaining(x)
                         _add_confirmed(x)
 
     return sorted(confirmed_fail)
@@ -2080,8 +2268,31 @@ def _execute_commit_verification(
 # Dual-Fork Orchestrator (Pre-SQLGlot Zygote + Warm-SQLGlot Zygote)
 # ---------------------------------------------------------------------------
 
-def _run_in_fork(fn, *args) -> Any:
-    """Fork a clean CoW child process, redirect stdout->stderr in child, return pickled result."""
+# Wall-clock safety net so a batch can NEVER be rejected for exceeding the run timeout.
+DEADLINE: float = float("inf")  # time.monotonic() value; set by selector.main()
+PER_COMMIT_TIMEOUT: float = float(os.environ.get("BLAST_COMMIT_TIMEOUT", "90"))
+
+
+class _ForkTimeout(Exception):
+    pass
+
+
+def _time_left() -> float:
+    return DEADLINE - time.monotonic()
+
+
+def _run_in_fork(fn, *args, timeout: float | None = None) -> Any:
+    """Fork a clean CoW child process, redirect stdout->stderr in child, return pickled result.
+    Kills child after `timeout` seconds (default: per-commit cap, never past DEADLINE)."""
+    import select as _select
+
+    budget = _time_left()
+    if timeout is None:
+        timeout = PER_COMMIT_TIMEOUT
+    timeout = min(timeout, budget)
+    if timeout <= 0.5:
+        raise _ForkTimeout("global deadline reached")
+    started = time.monotonic()
     r_fd, w_fd = os.pipe()
     sys.stderr.flush()
     pid = os.fork()
@@ -2107,6 +2318,19 @@ def _run_in_fork(fn, *args) -> Any:
         os.close(w_fd)
         chunks: list[bytes] = []
         while True:
+            left = timeout - (time.monotonic() - started)
+            if math.isinf(left):
+                ready = [r_fd]
+            else:
+                ready = _select.select([r_fd], [], [], max(0.0, left))[0] if left > 0 else []
+            if not ready:
+                try:
+                    os.kill(pid, 9)
+                except ProcessLookupError:
+                    pass
+                os.close(r_fd)
+                os.waitpid(pid, 0)
+                raise _ForkTimeout(f"child exceeded {timeout:.1f}s")
             chunk = os.read(r_fd, 65536)
             if not chunk:
                 break
@@ -2239,11 +2463,23 @@ def verify_batch(
     # Freeze parent heap objects before os.fork() to prevent Linux CoW page faults & GC scans in children!
     gc.freeze()
 
+    def _safe_fallback_tests(plan: CommitPlan) -> list[int]:
+        out = set(plan.candidates)
+        if engine is not None:
+            for rel in list(plan.patched_files) + list(plan.deleted_files):
+                if rel.startswith("sqlglot/expressions/") or rel in (
+                    "sqlglot/parser.py", "sqlglot/parsers/base.py", "sqlglot/tokens.py",
+                    "sqlglot/tokenizer_core.py", "sqlglot/generator.py",
+                    "sqlglot/dialects/dialect.py", "sqlglot/helper.py", "sqlglot/__init__.py",
+                ):
+                    out.update(engine._tests_for_broken_import(rel))
+        return sorted(out)
+
     for plan in eager_fork_plans:
         try:
             results[plan.commit] = _run_in_fork(_run_full_fork_child, plan)
         except Exception:
-            results[plan.commit] = sorted(plan.candidates)
+            results[plan.commit] = _safe_fallback_tests(plan)
 
     if not (lazy_fork_plans or fixture_plans or hot_func_plans):
         return results
@@ -2269,18 +2505,44 @@ def verify_batch(
                     lf.add(mf[len(root_prefix):])
             return lf
 
+        # Preload frequently-referenced subtest maps ONCE before forking so CoW children skip zlib I/O!
+        all_warm_plans = lazy_fork_plans + fixture_plans + hot_func_plans
+        if engine is not None and len(all_warm_plans) >= 3:
+            st_freq: dict[int, int] = {}
+            for p in all_warm_plans:
+                for tnum in p.deferred_subtests:
+                    st_freq[tnum] = st_freq.get(tnum, 0) + 1
+            for tnum, cnt in st_freq.items():
+                if cnt >= 3:
+                    engine._get_subtests(tnum)
+
+        all_patched_py = {
+            rel for p in all_warm_plans for rel in p.patched_files if rel.endswith(".py")
+        }
         loaded_files = _snapshot_loaded()
         opt_conflict_plans: list[CommitPlan] = []
-        opt_safe_plans: list[CommitPlan] = []
+        dialect_conflict_plans: list[CommitPlan] = []
+        dialect_safe_plans: list[CommitPlan] = []
+        _DIALECT_PRELOAD_CONFLICTS = frozenset({
+            "sqlglot/dialects/duckdb.py", "sqlglot/parsers/duckdb.py", "sqlglot/generators/duckdb.py",
+            "sqlglot/dialects/bigquery.py", "sqlglot/parsers/bigquery.py", "sqlglot/generators/bigquery.py",
+            "sqlglot/dialects/hive.py", "sqlglot/parsers/hive.py", "sqlglot/generators/hive.py",
+            "sqlglot/dialects/snowflake.py", "sqlglot/parsers/snowflake.py", "sqlglot/generators/snowflake.py",
+            "sqlglot/dialects/spark2.py", "sqlglot/parsers/spark2.py", "sqlglot/generators/spark2.py",
+            "sqlglot/dialects/mysql.py", "sqlglot/parsers/mysql.py", "sqlglot/generators/mysql.py",
+            "tests/dialects/test_dialect.py", "tests/dialects/test_mysql.py",
+        })
         for plan in lazy_fork_plans:
+            py_rels = [rel for rel in plan.patched_files if rel.endswith(".py")]
             if any(
-                rel == "tests/test_optimizer.py" or rel.startswith("sqlglot/optimizer/")
-                for rel in plan.patched_files
-                if rel.endswith(".py")
+                rel in ("tests/test_optimizer.py", "tests/test_schema.py") or rel.startswith("sqlglot/optimizer/")
+                for rel in py_rels
             ):
                 opt_conflict_plans.append(plan)
+            elif any(rel in _DIALECT_PRELOAD_CONFLICTS or rel.startswith("tests/dialects/") for rel in py_rels):
+                dialect_conflict_plans.append(plan)
             else:
-                opt_safe_plans.append(plan)
+                dialect_safe_plans.append(plan)
 
         if opt_conflict_plans:
             gc.freeze()
@@ -2293,22 +2555,45 @@ def verify_batch(
             except Exception:
                 fallback_commits.append(plan.commit)
 
-        # Pre-import tests.test_optimizer lazily if >=2 remaining plans (lazy_safe + fixture + hot_func) touch it
-        opt_users = sum(
-            1
-            for p in (opt_safe_plans + fixture_plans + hot_func_plans)
-            if any(num_to_test[t]["file"] == "tests/test_optimizer.py" for t in p.candidates)
-        )
-        if opt_users >= 2:
-            try:
-                _import_test_module_lazy("tests.test_optimizer", False)
-                loaded_files = _snapshot_loaded()
-            except Exception:
-                pass
+        # Pre-import tests.test_optimizer lazily if >=2 remaining plans use it!
+        rem_after_opt = dialect_conflict_plans + dialect_safe_plans + fixture_plans + hot_func_plans
+        if "tests/test_optimizer.py" not in all_patched_py:
+            opt_users = sum(
+                1 for p in rem_after_opt
+                if any(num_to_test[t]["file"] == "tests/test_optimizer.py" for t in p.candidates)
+            )
+            if opt_users >= 2:
+                try:
+                    _import_test_module_lazy("tests.test_optimizer", False)
+                    loaded_files = _snapshot_loaded()
+                except Exception:
+                    pass
 
-        if opt_safe_plans:
+        if dialect_conflict_plans:
             gc.freeze()
-        for plan in opt_safe_plans:
+        for plan in dialect_conflict_plans:
+            if any(rel in loaded_files for rel in plan.patched_files if rel.endswith(".py")):
+                fallback_commits.append(plan.commit)
+                continue
+            try:
+                warm_results[plan.commit] = _run_in_fork(_run_full_fork_child, plan)
+            except Exception:
+                fallback_commits.append(plan.commit)
+
+        # Pre-import tests.dialects.test_dialect ONLY when >=3 dialect_safe_plans use dialect tests!
+        if dialect_safe_plans:
+            ds_dial_users = sum(
+                1 for p in dialect_safe_plans
+                if any(num_to_test[t]["file"].startswith("tests/dialects/") for t in p.candidates)
+            )
+            if ds_dial_users >= 3 and "tests/dialects/test_dialect.py" not in all_patched_py:
+                try:
+                    importlib.import_module("tests.dialects.test_dialect")
+                    loaded_files = _snapshot_loaded()
+                except Exception:
+                    pass
+            gc.freeze()
+        for plan in dialect_safe_plans:
             if any(rel in loaded_files for rel in plan.patched_files if rel.endswith(".py")):
                 fallback_commits.append(plan.commit)
                 continue
@@ -2402,7 +2687,12 @@ def verify_batch(
 
         return warm_results, fallback_commits
 
-    warm_results, fallback_commits = _run_in_fork(_run_warm_zygote)
+    try:
+        warm_results, fallback_commits = _run_in_fork(_run_warm_zygote, timeout=float("inf"))
+    except Exception:
+        warm_results, fallback_commits = {}, []
+        for plan in lazy_fork_plans + fixture_plans + hot_func_plans:
+            results[plan.commit] = _safe_fallback_tests(plan)
     results.update(warm_results)
 
     # 3. Any lazy_fork / hot_func / fixture commit that needed fallback runs in a clean Pre-SQLGlot full_fork!
@@ -2413,6 +2703,10 @@ def verify_batch(
             try:
                 results[cid] = _run_in_fork(_run_full_fork_child, plan)
             except Exception:
-                results[cid] = sorted(plan.candidates)
+                results[cid] = _safe_fallback_tests(plan)
+
+    for plan in plans:
+        if plan.commit not in results:
+            results[plan.commit] = _safe_fallback_tests(plan)
 
     return results

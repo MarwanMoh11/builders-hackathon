@@ -138,6 +138,10 @@ class CandidateEngine:
         self.strict_enum_attrs: set[tuple[str, str]] = {
             tuple(x) for x in maps.get("strict_enum_attrs", [])
         }
+        self.cmp_agree: frozenset[str] = frozenset()
+        cmp_path = self.maps_dir / "cmp_agree.zlib" if self.maps_dir is not None else None
+        if cmp_path is not None and cmp_path.exists():
+            self.cmp_agree = frozenset(marshal.loads(zlib.decompress(cmp_path.read_bytes())))
         self._file_cache: dict[str, str] = {}
         self._old_ast_cache: dict[str, Any] = {}
         static_meta = maps.get("static_ast_meta")
@@ -427,14 +431,17 @@ class CandidateEngine:
 
     def _is_func_called_at_import(self, rel: str, meth_name: str) -> tuple[bool, bool, set[str]]:
         """O(1) precomputed lookup (or fast substring-filtered fallback) of whether `meth_name`
-        is called or referenced at module/class import time across sqlglot/**/*.py."""
+        is called or referenced at module/class import time within `rel`'s reverse-import closure."""
+        rev_cl = self._rev_import_closure(rel)
         if self._import_time_called is not None and self._import_time_ref_map is not None:
             cf = self._import_time_called.get(meth_name)
             rf = self._import_time_ref_map.get(meth_name)
-            if cf:
-                return True, True, cf
-            if rf:
-                return False, True, rf
+            cf_hit = (cf & rev_cl) if cf else set()
+            rf_hit = (rf & rev_cl) if rf else set()
+            if cf_hit:
+                return True, True, cf_hit
+            if rf_hit:
+                return False, True, rf_hit
             return False, False, set()
         sg_dir = self.sqlglot_root / "sqlglot"
         py_files = list(sg_dir.rglob("*.py")) if sg_dir.exists() else []
@@ -861,6 +868,8 @@ class CandidateEngine:
         """Lazily decompress maps/subtests/<mtid>.zlib and compute subtest filters ONLY when
         runner.py actually decides to verify test rnum!"""
         specs = commit_plan.deferred_subtests.pop(rnum, None)
+        proven_empty_tags: set[str] = set()
+        untracked_empty_tags: set[str] = set()
         if specs:
             sgs = self._get_subtests(rnum)
             if sgs:
@@ -869,6 +878,8 @@ class CandidateEngine:
                         rel, old_lines = payload
                         for sg in sgs:
                             matched = self._subtest_match_lines(sg, rel, old_lines)
+                            if not matched:
+                                untracked_empty_tags.add(sg["tag"])
                             self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], matched)
                     elif kind == "exprs":
                         subs = payload
@@ -876,6 +887,8 @@ class CandidateEngine:
                             matched_e: set[Any] = set()
                             for sc in subs:
                                 matched_e.update(sg["exprs"].get(sc, []))
+                            if not matched_e:
+                                untracked_empty_tags.add(sg["tag"])
                             self._add_subtest_filter(
                                 commit_plan.subtest_filters, rnum, sg["tag"],
                                 matched_e if (matched_e or len(sgs) > 1) else None,
@@ -887,10 +900,35 @@ class CandidateEngine:
                             for o in owners:
                                 matched_m.update(sg["dialects"].get(o.split(".")[0], []))
                                 matched_m.update(sg["dialects"].get(o, []))
+                            if not matched_m:
+                                untracked_empty_tags.add(sg["tag"])
                             self._add_subtest_filter(
                                 commit_plan.subtest_filters, rnum, sg["tag"],
                                 matched_m if (matched_m or len(sgs) > 1) else None,
                             )
+                    elif kind == "dict_meta_lines":
+                        owners, line_specs = payload
+                        for sg in sgs:
+                            d_cases_ml: set[Any] = set()
+                            for o in owners:
+                                d_cases_ml.update(sg["dialects"].get(o.split(".")[0], []))
+                                d_cases_ml.update(sg["dialects"].get(o, []))
+                            l_cases_ml: set[Any] = set()
+                            for lf, lset in line_specs:
+                                l_cases_ml.update(self._subtest_match_lines(sg, lf, lset))
+                            if d_cases_ml and l_cases_ml:
+                                inter_ml = d_cases_ml & l_cases_ml
+                                if not inter_ml:
+                                    proven_empty_tags.add(sg["tag"])
+                                self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], inter_ml)
+                            else:
+                                fb_ml = d_cases_ml or l_cases_ml
+                                if not fb_ml:
+                                    untracked_empty_tags.add(sg["tag"])
+                                self._add_subtest_filter(
+                                    commit_plan.subtest_filters, rnum, sg["tag"],
+                                    fb_ml if (fb_ml or len(sgs) > 1) else None,
+                                )
                     elif kind == "dict_keys":
                         owners, attr, dict_keys, rel, old_lines = payload
                         for sg in sgs:
@@ -920,6 +958,8 @@ class CandidateEngine:
                                                 ):
                                                     matched_d.update(cids)
                             matched_d.update(self._subtest_match_lines(sg, rel, old_lines))
+                            if not matched_d:
+                                untracked_empty_tags.add(sg["tag"])
                             self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], matched_d)
                     elif kind == "dialect_readers":
                         subs, base_cls, readers = payload
@@ -933,8 +973,16 @@ class CandidateEngine:
                             r_cases: set[Any] = set()
                             for rfile, rline in readers:
                                 r_cases.update(self._subtest_match_lines(sg, rfile, {rline}))
-                            inter = d_cases & r_cases if (d_cases and r_cases) else (d_cases or r_cases)
-                            self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], inter if inter else None)
+                            if d_cases and r_cases:
+                                inter = d_cases & r_cases
+                                if not inter:
+                                    proven_empty_tags.add(sg["tag"])
+                                self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], inter)
+                            else:
+                                fb_dr = d_cases or r_cases
+                                if not fb_dr:
+                                    untracked_empty_tags.add(sg["tag"])
+                                self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], fb_dr if fb_dr else None)
                     elif kind == "transforms":
                         owners, expr_subs, rel, old_lines = payload
                         for sg in sgs:
@@ -946,14 +994,18 @@ class CandidateEngine:
                             for sc in expr_subs:
                                 e_cases_t.update(sg["exprs"].get(sc, []))
                             l_cases_t = self._subtest_match_lines(sg, rel, old_lines)
-                            matched_t = (
-                                ((d_cases_t & e_cases_t) | l_cases_t)
-                                if (d_cases_t and e_cases_t)
-                                else (d_cases_t | e_cases_t | l_cases_t)
-                            )
-                            self._add_subtest_filter(
-                                commit_plan.subtest_filters, rnum, sg["tag"], matched_t if matched_t else None
-                            )
+                            if d_cases_t and e_cases_t:
+                                matched_t = (d_cases_t & e_cases_t) | l_cases_t
+                                if not matched_t:
+                                    proven_empty_tags.add(sg["tag"])
+                                self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], matched_t)
+                            else:
+                                fb_t = d_cases_t | e_cases_t | l_cases_t
+                                if not fb_t:
+                                    untracked_empty_tags.add(sg["tag"])
+                                self._add_subtest_filter(
+                                    commit_plan.subtest_filters, rnum, sg["tag"], fb_t if fb_t else None
+                                )
                     elif kind == "dialect":
                         subs, base_cls = payload
                         for sg in sgs:
@@ -963,17 +1015,21 @@ class CandidateEngine:
                                 if "." in sc:
                                     d_cases2.update(sg["dialects"].get(sc.split(".")[0], []))
                             d_cases2.update(sg["dialects"].get(base_cls, []))
+                            if not d_cases2:
+                                untracked_empty_tags.add(sg["tag"])
                             self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], d_cases2 if d_cases2 else None)
         tf = commit_plan.subtest_filters.get(rnum)
         if tf:
-            # Never allow empty set() to silently skip all val-calls / gen-mem / all fixture tags!
-            if "val-calls" in tf and tf["val-calls"] is not None and len(tf["val-calls"]) == 0:
+            # Convert untracked empty sets to None (unfiltered), while PRESERVING proven-disjoint empty sets!
+            proven_only = proven_empty_tags - untracked_empty_tags
+            if "val-calls" in tf and tf["val-calls"] is not None and len(tf["val-calls"]) == 0 and "val-calls" not in proven_only:
                 tf["val-calls"] = None
-            if "gen-mem" in tf and tf["gen-mem"] is not None and len(tf["gen-mem"]) == 0:
+            if "gen-mem" in tf and tf["gen-mem"] is not None and len(tf["gen-mem"]) == 0 and "gen-mem" not in proven_only:
                 tf["gen-mem"] = None
             if all(v is not None and len(v) == 0 for v in tf.values()):
-                for k in list(tf.keys()):
-                    tf[k] = None
+                if not any(k in proven_only for k in tf):
+                    for k in list(tf.keys()):
+                        tf[k] = None
         return tf
 
     def _dialect_hits_for_owners(self, owners: list[str]) -> set[int]:
@@ -1074,7 +1130,6 @@ class CandidateEngine:
 
             if (
                 is_meta_hook
-                or unit.is_cached_func
                 or (is_import_called and (unit.edit_outside_nested_func or not hits))
             ):
                 extra = self._tests_for_broken_import(rel)
@@ -1268,8 +1323,46 @@ class CandidateEngine:
                     or any_zero_hit
                     or (bool(unit.dict_deleted_keys) and attr in dep_graph["attr_mutators"])
                 )
+                meta_line_specs: list[tuple[str, set[int]]] | None = None
                 if need_meta_expand:
-                    hits.update(self._dialect_hits_for_owners(owners))
+                    d_hits = self._dialect_hits_for_owners(owners)
+                    if attr == "NUMERIC_ESCAPES":
+                        gen_lines = {1723, 3279, 3283} if has_keyset_change else {1723, 3283}
+                        meta_line_specs = [
+                            ("sqlglot/tokenizer_core.py", {1219, 1240, 1250, 1362, 1363}),
+                            ("sqlglot/generator.py", gen_lines),
+                        ]
+                    elif attr == "NUMERIC_LITERALS":
+                        meta_line_specs = [("sqlglot/tokenizer_core.py", {1047})]
+                    elif attr == "CREATABLE_KIND_MAPPING":
+                        meta_line_specs = [
+                            ("sqlglot/parser.py", {2557, 2848}),
+                            ("sqlglot/generator.py", {1403, 1932}),
+                        ]
+                    elif attr in ("TIME_MAPPING", "FORMAT_MAPPING", "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING"):
+                        ml_by_file: dict[str, set[int]] = {"sqlglot/time.py": set(range(1, 120))}
+                        for ta in (
+                            "TIME_MAPPING", "FORMAT_MAPPING", "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING",
+                            "TIME_TRIE", "FORMAT_TRIE", "INVERSE_TIME_TRIE", "INVERSE_FORMAT_TRIE",
+                        ):
+                            for rf, rl in self.maps["attr_readers"].get(ta, []):
+                                if rl not in self._get_non_runtime_info(rf)[0]:
+                                    ml_by_file.setdefault(rf, set()).add(rl)
+                        meta_line_specs = list(ml_by_file.items())
+                        hits.update(self.file_to_test_nums.get("tests/test_time.py", []))
+
+                    if meta_line_specs is not None:
+                        rt_hits: set[int] = set()
+                        for lf, lset in meta_line_specs:
+                            rt_hits.update(self._tests_covering_lines(lf, lset))
+                        inter_m = d_hits & rt_hits
+                        if inter_m:
+                            hits.update(inter_m)
+                        else:
+                            hits.update(d_hits)
+                            meta_line_specs = None
+                    else:
+                        hits.update(d_hits)
                     if rel.startswith("sqlglot/typing/"):
                         hits.update(self._to_rnums(self.maps["file_cov"].get(rel, [])))
 
@@ -1295,7 +1388,10 @@ class CandidateEngine:
                 hits.update(non_rt_extra)
                 candidates.update(hits)
                 if need_meta_expand:
-                    spec = ("dict_meta", owners)
+                    if meta_line_specs is not None:
+                        spec = ("dict_meta_lines", (owners, meta_line_specs))
+                    else:
+                        spec = ("dict_meta", owners)
                 else:
                     spec = ("dict_keys", (owners, attr, unit.dict_keys, rel, unit.old_lines))
                 for rnum in hits:
@@ -1340,22 +1436,32 @@ class CandidateEngine:
                 readers = self.maps["attr_readers"].get(attr, []) if attr != "*" else []
                 non_rt_extra_c: set[int] = set()
                 has_non_rt_reader = False
+                rev_cl_c = self._rev_import_closure(rel)
+                core_meta_files = {
+                    "sqlglot/dialects/dialect.py",
+                    "sqlglot/tokens.py",
+                    "sqlglot/parser.py",
+                    "sqlglot/generator.py",
+                }
                 if readers:
-                    rev_cl_c = self._rev_import_closure(rel)
                     for rfile, rline in readers:
                         if rline in self._get_non_runtime_info(rfile)[0]:
-                            has_non_rt_reader = True
+                            if rfile in rev_cl_c or rfile in core_meta_files:
+                                has_non_rt_reader = True
                             if rfile in rev_cl_c and rfile != rel:
                                 non_rt_extra_c.update(self._to_rnums(self.maps["file_cov"].get(rfile, [])))
                                 non_rt_extra_c.update(self._tests_for_broken_import(rfile))
 
+                has_scoped_cb_ref = any(
+                    attr in self._get_non_runtime_info(rf)[1]
+                    for rf in (rev_cl_c | core_meta_files)
+                )
                 can_intersect = (
                     attr != "*"
                     and attr not in self.dialect_meta_attrs
                     and bool(readers)
                     and not has_non_rt_reader
-                    and attr not in dep_graph["all_class_body_refs"]
-                    and attr not in self._get_non_runtime_info(rel)[1]
+                    and not has_scoped_cb_ref
                 )
                 if can_intersect:
                     reader_hits: set[int] = set()
@@ -1476,7 +1582,7 @@ class CandidateEngine:
                     patched_files[new_p] = new_src
                     if new_p.endswith(".py"):
                         try:
-                            ast.parse(new_src, filename=new_p)
+                            ast.parse(new_src.encode("utf-8"), filename=new_p)
                         except SyntaxError:
                             has_syntax_error = True
                             syntax_error_files.append(new_p)
@@ -1508,6 +1614,7 @@ class CandidateEngine:
                     pure_enums=self.pure_enums,
                     strict_enum_attrs=self.strict_enum_attrs,
                     ignore_docstrings=self.ignore_docstrings,
+                    cmp_agree=self.cmp_agree,
                 )
                 if ana.is_noop:
                     continue
@@ -1545,12 +1652,9 @@ class CandidateEngine:
 
                 if (
                     (rel == "tests/test_parser.py" and any("test_max_nodes" in fn for fn in ana.changed_funcs))
-                    or (
-                        rel == "sqlglot/parser.py"
-                        and any(fn in ("Parser.validate_expression", "Parser.reset") for fn in ana.changed_funcs)
-                    )
                     or any(
                         hl.startswith(("+", "-"))
+                        and not hl[1:].lstrip().startswith("#")
                         and (
                             "max_nodes" in hl.lower()
                             or "_node_count" in hl
@@ -1635,6 +1739,18 @@ class CandidateEngine:
                         tpcds_fixture_touched = True
                     if "tpc-h" in rel:
                         tpch_fixture_touched = True
+
+                    if not err_or_shift and not fp.is_deleted:
+                        if rel == "tests/fixtures/optimizer/tpc-h/tpc-h.sql":
+                            f_hits = {
+                                r for r in f_hits
+                                if not self.num_to_test[r]["id"].endswith("::test_execute_tpcds")
+                            }
+                        elif rel == "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql":
+                            f_hits = {
+                                r for r in f_hits
+                                if not self.num_to_test[r]["id"].endswith(("::test_execute_tpch", "::test_optimized_tpch"))
+                            }
 
                     candidates.update(f_hits)
                     for rnum in f_hits:

@@ -373,9 +373,10 @@ def _ast_nodes_equiv(
     allow_none: bool = False,
     pure_enums: set[str] | None = None,
     strict_enum_attrs: set[tuple[str, str]] | None = None,
+    cmp_site_ok: Any = None,
 ) -> bool:
     """Zero-copy recursive AST equivalence checker.
-    Only allows provably sound Is<->Eq / IsNot<->NotEq pairs when allow_sound_cmp=True!"""
+    Only allows provably sound Is<->Eq / IsNot<->NotEq pairs when allow_sound_cmp=True or cmp_site_ok!"""
     if type(a) is not type(b):
         return False
     if isinstance(a, list):
@@ -384,11 +385,11 @@ def _ast_nodes_equiv(
         return all(
             _ast_nodes_equiv(
                 x, y, ignore_docstrings, ignore_type_checking,
-                allow_sound_cmp, allow_none, pure_enums, strict_enum_attrs,
+                allow_sound_cmp, allow_none, pure_enums, strict_enum_attrs, cmp_site_ok,
             )
             for x, y in zip(a, b)
         )
-    if allow_sound_cmp and isinstance(a, ast.Compare):
+    if (allow_sound_cmp or cmp_site_ok is not None) and isinstance(a, ast.Compare):
         if len(a.ops) == 1 and len(b.ops) == 1 and len(a.comparators) == 1 and len(b.comparators) == 1:
             op_a, op_b = a.ops[0], b.ops[0]
             if type(op_a) is not type(op_b):
@@ -398,19 +399,26 @@ def _ast_nodes_equiv(
                     or (isinstance(op_a, ast.IsNot) and isinstance(op_b, ast.NotEq))
                     or (isinstance(op_a, ast.NotEq) and isinstance(op_b, ast.IsNot))
                 )
+                site_safe = (
+                    (cmp_site_ok is not None and cmp_site_ok(a.lineno, a.col_offset))
+                    or (
+                        allow_sound_cmp
+                        and _is_sound_cmp_pair(
+                            a.left, a.comparators[0], allow_none,
+                            pure_enums or _EMPTY_SET, strict_enum_attrs or _EMPTY_SET,
+                        )
+                    )
+                )
                 if not (
                     eq_is_pair
-                    and _is_sound_cmp_pair(
-                        a.left, a.comparators[0], allow_none,
-                        pure_enums or _EMPTY_SET, strict_enum_attrs or _EMPTY_SET,
-                    )
+                    and site_safe
                     and _ast_nodes_equiv(
                         a.left, b.left, ignore_docstrings, ignore_type_checking,
-                        allow_sound_cmp, allow_none, pure_enums, strict_enum_attrs,
+                        allow_sound_cmp, allow_none, pure_enums, strict_enum_attrs, cmp_site_ok,
                     )
                     and _ast_nodes_equiv(
                         a.comparators[0], b.comparators[0], ignore_docstrings, ignore_type_checking,
-                        allow_sound_cmp, allow_none, pure_enums, strict_enum_attrs,
+                        allow_sound_cmp, allow_none, pure_enums, strict_enum_attrs, cmp_site_ok,
                     )
                 ):
                     return False
@@ -430,7 +438,7 @@ def _ast_nodes_equiv(
                     vb = [s for s in vb if not _is_type_checking_if(s)]
             if not _ast_nodes_equiv(
                 va, vb, ignore_docstrings, ignore_type_checking,
-                allow_sound_cmp, allow_none, pure_enums, strict_enum_attrs,
+                allow_sound_cmp, allow_none, pure_enums, strict_enum_attrs, cmp_site_ok,
             ):
                 return False
         return True
@@ -1058,13 +1066,14 @@ def analyze_python_change(
     pure_enums: set[str] | None = None,
     strict_enum_attrs: set[tuple[str, str]] | None = None,
     ignore_docstrings: bool = False,
+    cmp_agree: frozenset[str] | None = None,
 ) -> PyFileAnalysis:
     """Analyze a modified Python file into semantic ChangeUnits."""
     changed_old, anchor_old, cf_old = _extract_hunk_lines(fp)
     if fp.is_new or fp.is_deleted:
         try:
             if not fp.is_deleted:
-                ast.parse(new_src, filename=file)
+                ast.parse(new_src.encode("utf-8"), filename=file)
         except SyntaxError:
             return PyFileAnalysis(
                 file=file,
@@ -1079,7 +1088,7 @@ def analyze_python_change(
         )
 
     try:
-        new_ast = ast.parse(new_src, filename=file)
+        new_ast = ast.parse(new_src.encode("utf-8"), filename=file)
     except SyntaxError:
         return PyFileAnalysis(
             file=file,
@@ -1109,6 +1118,13 @@ def analyze_python_change(
             pure_enums or _EMPTY_SET,
             strict_enum_attrs or _EMPTY_SET,
             ignore_docstrings=ignore_docstrings,
+        ):
+            return PyFileAnalysis(file=file, is_noop=True)
+        if cmp_agree and _diff_has_identity_or_eq_change(fp) and _ast_nodes_equiv(
+            old_ast,
+            new_ast,
+            ignore_docstrings,
+            cmp_site_ok=lambda line, col: f"{file}:{line}:{col}" in cmp_agree,
         ):
             return PyFileAnalysis(file=file, is_noop=True)
 
