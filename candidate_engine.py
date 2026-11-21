@@ -89,14 +89,21 @@ class CandidateEngine:
                     self._subtest_tags_by_num.setdefault(rnum, []).append(sg["tag"])
 
         # Pre-grouped dict_keys_by_oa: owner -> attr -> key -> list[mtid]
+        # v4 stores dict_keys_by_oa lazily in maps/dict_maps.zlib and line_cov per-file in maps/line_cov/<idx>.zlib!
+        self.maps_dir: Path | None = subtests_dir.parent if subtests_dir is not None else None
+        self._dict_keys_by_oa: dict[str, dict[str, dict[str, list[int]]]] | None = None
         if "dict_keys_by_oa" in maps:
-            self.dict_keys_by_oa: dict[str, dict[str, dict[str, list[int]]]] = maps["dict_keys_by_oa"]
-        else:
+            self._dict_keys_by_oa = maps["dict_keys_by_oa"]
+        elif "dict_key_to_tests" in maps:
             dk_oa: dict[str, dict[str, dict[str, list[int]]]] = {}
             for full_k, mtids in maps["dict_key_to_tests"].items():
                 o, a, k = full_k.split("|", 2)
                 dk_oa.setdefault(o, {}).setdefault(a, {})[k] = mtids
-            self.dict_keys_by_oa = dk_oa
+            self._dict_keys_by_oa = dk_oa
+
+        self._line_cov_inline: dict[str, dict[int, list[int]]] | None = maps.get("line_cov")
+        self._line_cov_index: dict[str, int] = maps.get("line_cov_index", {})
+        self._line_cov_cache: dict[str, dict[int, list[int]]] = {}
 
         self.typing_test_num = self.id_to_num.get(
             "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
@@ -104,7 +111,19 @@ class CandidateEngine:
         self.lazy_load_test_num = self.id_to_num.get(
             "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
         )
-        self.dialect_meta_attrs: set[str] = set(maps["dialect_meta_attrs"])
+        self.dialect_meta_attrs: set[str] = set(maps["dialect_meta_attrs"]) | {
+            "BIT_STRINGS", "BYTE_STRINGS", "COMMENTS", "HEREDOC_STRING", "HEREDOC_STRINGS",
+            "HEX_STRINGS", "HINT_START", "IDENTIFIERS", "NATIONAL_RAW_STRING",
+            "NATIONAL_RAW_STRINGS", "NATIONAL_STRING", "QUOTES", "RAW_STRING", "RAW_STRINGS",
+            "SINGLE_TOKENS", "UNICODE_STRINGS", "NUMERIC_LITERALS", "NUMERIC_ESCAPES",
+            "KEYWORDS", "VAR_SINGLE_TOKENS", "COMMANDS", "COMMAND_PREFIX_TOKENS",
+            "STRING_ESCAPES", "BYTE_STRING_ESCAPES", "IDENTIFIER_ESCAPES",
+            "SUPPORTED_JSON_PATH_PARTS", "DATE_PART_MAPPING", "TIME_MAPPING",
+            "FORMAT_MAPPING", "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING",
+            "CREATABLE_KIND_MAPPING", "UNESCAPED_SEQUENCES", "ESCAPED_SEQUENCES",
+            "VALID_INTERVAL_UNITS", "TIME_TRIE", "FORMAT_TRIE", "INVERSE_TIME_TRIE",
+            "INVERSE_FORMAT_TRIE",
+        }
         self.expr_meta_attrs: set[str] = set(maps["expr_meta_attrs"])
         self.all_expr_classes: set[str] = set(maps["class_subclasses"].get("Expr", []))
         self.all_dialect_family: set[str] = (
@@ -112,6 +131,7 @@ class CandidateEngine:
             | set(maps["class_subclasses"].get("Tokenizer", []))
             | set(maps["class_subclasses"].get("Parser", []))
             | set(maps["class_subclasses"].get("Generator", []))
+            | {"JSONPathTokenizer"}
         )
         self.pure_enums: set[str] = set(maps.get("pure_enums", []))
         self.strict_enum_attrs: set[tuple[str, str]] = {
@@ -121,8 +141,385 @@ class CandidateEngine:
         self._old_ast_cache: dict[str, Any] = {}
         self._rev_import_graph: dict[str, set[str]] | None = None
         self._file_classes_cache: dict[str, list[str]] = {}
+        self._class_dep_graph: dict[str, Any] | None = None
+        self._non_runtime_cache: dict[str, tuple[set[int], set[str]]] = {}
+        self._import_time_refs: tuple[dict[str, set[str]], dict[str, set[str]]] | None = None
         # Ignore pure docstring edits ONLY when tests/test_docs.py is absent from runtime tests.json
         self.ignore_docstrings: bool = "tests/test_docs.py" not in self.file_to_test_nums
+
+    def _parse_base_ast(self, rel: str) -> ast.Module | None:
+        cached = self._old_ast_cache.get(rel)
+        if cached is not None:
+            return cached
+        txt = self._read_base_file(rel)
+        if not txt:
+            return None
+        try:
+            tree = ast.parse(txt, filename=rel)
+        except SyntaxError:
+            return None
+        self._old_ast_cache[rel] = tree
+        return tree
+
+    @staticmethod
+    def _attr_chain(node: ast.AST) -> list[str] | None:
+        parts: list[str] = []
+        cur: ast.AST = node
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if isinstance(cur, ast.Name):
+            parts.append(cur.id)
+            parts.reverse()
+            return parts
+        return None
+
+    @staticmethod
+    def _iter_non_runtime_nodes(root: ast.AST):
+        """Yield AST nodes evaluated at class/module definition time (skipping FunctionDef,
+        AsyncFunctionDef, ClassDef, and Lambda.body!)."""
+        stack: list[ast.AST] = [root]
+        while stack:
+            node = stack.pop()
+            yield node
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(node, ast.Lambda):
+                # Only evaluate default args at class-definition time, NOT the lambda body!
+                stack.extend(node.args.defaults)
+                stack.extend(d for d in node.args.kw_defaults if d is not None)
+                continue
+            stack.extend(ast.iter_child_nodes(node))
+
+    def _get_class_dep_graph(self) -> dict[str, Any]:
+        """Lazily scan sqlglot class hierarchies, cross-class attribute copiers (e.g. MySQL->Presto,
+        Hive->Athena, Trino->_TrinoTokenizer->Athena, TypeAnnotator->BigQuery, JSONPathTokenizer),
+        mutators (.pop/del), and class-body bare-name reads directly from sqlglot@eb11aec ASTs."""
+        if self._class_dep_graph is not None:
+            return self._class_dep_graph
+
+        class_children: dict[str, set[str]] = {}
+        attr_copiers: dict[tuple[str, str], set[tuple[str, str]]] = {}
+        class_aliases: dict[str, set[str]] = {}
+        class_copiers: dict[str, set[str]] = {}
+        attr_mutators: dict[str, set[str]] = {}
+        all_class_body_refs: set[str] = set()
+
+        sg_dir = self.sqlglot_root / "sqlglot"
+        scan_paths: list[Path] = []
+        for sub in ("dialects", "parsers", "generators", "typing"):
+            d = sg_dir / sub
+            if d.exists():
+                scan_paths.extend(d.glob("*.py"))
+        for single in ("tokens.py", "jsonpath.py", "optimizer/annotate_types.py", "expressions/__init__.py"):
+            p = sg_dir / single
+            if p.exists():
+                scan_paths.append(p)
+
+        def _extract_imports(tree: ast.Module) -> dict[str, str]:
+            imp: dict[str, str] = {}
+            for s in tree.body:
+                if isinstance(s, ast.ImportFrom):
+                    for a in s.names:
+                        if a.name != "*":
+                            imp[a.asname or a.name] = a.name
+                elif isinstance(s, ast.Import):
+                    for a in s.names:
+                        if a.asname:
+                            imp[a.asname] = a.name.rsplit(".", 1)[-1]
+            return imp
+
+        def _resolve_chain(parts: list[str], imp: dict[str, str]) -> list[str]:
+            if not parts:
+                return parts
+            head = imp.get(parts[0], parts[0])
+            return [head, *parts[1:]]
+
+        def _scan_class(cls_node: ast.ClassDef, parent_chain: list[str], imp: dict[str, str], local_classes: set[str]) -> None:
+            cur_chain = [*parent_chain, cls_node.name]
+            cur_qual = ".".join(cur_chain)
+            for base in cls_node.bases:
+                parts = self._attr_chain(base)
+                if parts:
+                    rparts = _resolve_chain(parts, imp)
+                    parent_qual = ".".join(rparts)
+                    class_children.setdefault(parent_qual, set()).add(cur_qual)
+                    if len(rparts) == 1 and rparts[0] in ("Tokenizer", "Parser", "Generator", "JSONPathTokenizer"):
+                        class_children.setdefault(rparts[0], set()).add(cur_qual)
+                    elif len(rparts) >= 2:
+                        class_children.setdefault(rparts[-1], set()).add(cur_qual)
+
+            for stmt in cls_node.body:
+                if isinstance(stmt, ast.ClassDef):
+                    _scan_class(stmt, cur_chain, imp, local_classes)
+                    continue
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                dst_attr: str | None = None
+                val_node: ast.AST | None = None
+                if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                    dst_attr = stmt.targets[0].id
+                    val_node = stmt.value
+                elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    dst_attr = stmt.target.id
+                    val_node = stmt.value
+
+                # Check direct class alias assignment inside class body (e.g. `Tokenizer = _TrinoTokenizer`)
+                if dst_attr is not None and isinstance(val_node, ast.Name):
+                    rname = imp.get(val_node.id, val_node.id)
+                    if rname in local_classes or rname in self.all_dialect_family or rname.startswith("_"):
+                        class_aliases.setdefault(rname, set()).add(cur_qual)
+                        class_children.setdefault(rname, set()).add(f"{cur_qual}.{dst_attr}")
+
+                # Detect in-place dict mutations like `KEYWORDS.pop(...)` or `del KEYWORDS[...]`
+                if isinstance(stmt, ast.Delete):
+                    for t in stmt.targets:
+                        if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name):
+                            attr_mutators.setdefault(t.value.id, set()).add(cur_qual)
+                elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                    fn = stmt.value.func
+                    if isinstance(fn, ast.Attribute) and fn.attr in ("pop", "update", "clear", "setdefault"):
+                        if isinstance(fn.value, ast.Name):
+                            attr_mutators.setdefault(fn.value.id, set()).add(cur_qual)
+
+                for node in self._iter_non_runtime_nodes(stmt):
+                    if isinstance(node, ast.Name):
+                        if node.id != dst_attr:
+                            all_class_body_refs.add(node.id)
+                    elif isinstance(node, ast.Attribute):
+                        all_class_body_refs.add(node.attr)
+                        parts = self._attr_chain(node)
+                        if parts and len(parts) >= 2:
+                            rparts = _resolve_chain(parts, imp)
+                            src_head = rparts[0]
+                            if src_head in ("self", "cls", "exp", "t", "typing", "TokenType", "re", "math", "functools", "itertools", "collections"):
+                                continue
+                            # Record cross-class attribute copies (e.g. MySQL.TIME_MAPPING, MySQL.Tokenizer.QUOTES, TypeAnnotator.COERCES_TO)
+                            if len(rparts) == 2:
+                                src_cls, src_attr = rparts[0], rparts[1]
+                                if src_cls != cur_qual and src_cls != cls_node.name:
+                                    attr_copiers.setdefault((src_cls, src_attr), set()).add((cur_qual, dst_attr or "*"))
+                                    class_copiers.setdefault(src_cls, set()).add(cur_qual)
+                            elif len(rparts) >= 3:
+                                src_nested = ".".join(rparts[:-1])
+                                src_attr = rparts[-1]
+                                if src_nested != cur_qual:
+                                    attr_copiers.setdefault((src_nested, src_attr), set()).add((cur_qual, dst_attr or "*"))
+                                    attr_copiers.setdefault((rparts[0], src_attr), set()).add((cur_qual, dst_attr or "*"))
+                                    class_copiers.setdefault(src_nested, set()).add(cur_qual)
+                                    class_copiers.setdefault(rparts[0], set()).add(cur_qual)
+
+        for p in scan_paths:
+            rel = p.relative_to(self.sqlglot_root).as_posix()
+            tree = self._parse_base_ast(rel)
+            if tree is None:
+                continue
+            imp = _extract_imports(tree)
+            local_classes = {s.name for s in tree.body if isinstance(s, ast.ClassDef)}
+            for s in tree.body:
+                if isinstance(s, ast.ClassDef):
+                    _scan_class(s, [], imp, local_classes)
+
+        self._class_dep_graph = {
+            "class_children": class_children,
+            "attr_copiers": attr_copiers,
+            "class_aliases": class_aliases,
+            "class_copiers": class_copiers,
+            "attr_mutators": attr_mutators,
+            "all_class_body_refs": all_class_body_refs,
+        }
+        return self._class_dep_graph
+
+    def _get_non_runtime_info(self, rel: str) -> tuple[set[int], set[str]]:
+        """Lazily return (non_runtime_lines, class_body_refs) for a single sqlglot/ file."""
+        cached = self._non_runtime_cache.get(rel)
+        if cached is not None:
+            return cached
+        tree = self._parse_base_ast(rel)
+        if tree is None:
+            res: tuple[set[int], set[str]] = (set(), set())
+            self._non_runtime_cache[rel] = res
+            return res
+
+        non_rt: set[int] = set()
+        cb_refs: set[str] = set()
+        meta_hooks = frozenset({"__new__", "__init_subclass__", "__set_name__", "__class_getitem__", "_generate_next_value_"})
+
+        def _add_node_lines(node: ast.AST) -> None:
+            ln = getattr(node, "lineno", None)
+            if ln is not None:
+                non_rt.add(ln)
+
+        def _scan_stmts(stmts: list[ast.stmt], in_class: bool) -> None:
+            for s in stmts:
+                if isinstance(s, ast.ClassDef):
+                    for d in s.decorator_list:
+                        for n in ast.walk(d):
+                            _add_node_lines(n)
+                    for b in s.bases:
+                        for n in ast.walk(b):
+                            _add_node_lines(n)
+                    for kw in s.keywords:
+                        for n in ast.walk(kw):
+                            _add_node_lines(n)
+                    non_rt.add(s.lineno)
+                    _scan_stmts(s.body, True)
+                elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for d in s.decorator_list:
+                        for n in ast.walk(d):
+                            _add_node_lines(n)
+                    for df in s.args.defaults:
+                        for n in ast.walk(df):
+                            _add_node_lines(n)
+                    for df in s.args.kw_defaults:
+                        if df is not None:
+                            for n in ast.walk(df):
+                                _add_node_lines(n)
+                    non_rt.add(s.lineno)
+                    if in_class and s.name in meta_hooks:
+                        for n in ast.walk(s):
+                            _add_node_lines(n)
+                            if isinstance(n, ast.Name):
+                                cb_refs.add(n.id)
+                            elif isinstance(n, ast.Attribute):
+                                cb_refs.add(n.attr)
+                else:
+                    for n in self._iter_non_runtime_nodes(s):
+                        _add_node_lines(n)
+                        if in_class:
+                            if isinstance(n, ast.Name):
+                                cb_refs.add(n.id)
+                            elif isinstance(n, ast.Attribute):
+                                cb_refs.add(n.attr)
+
+        _scan_stmts(tree.body, False)
+        res = (non_rt, cb_refs)
+        self._non_runtime_cache[rel] = res
+        return res
+
+    def _is_func_called_at_import(self, rel: str, meth_name: str) -> tuple[bool, bool, set[str]]:
+        """Fast per-symbol check (~2ms!) of whether `meth_name` is called or referenced at module/class
+        import time across sqlglot/**/*.py (substring-filtered before ast.parse!)."""
+        sg_dir = self.sqlglot_root / "sqlglot"
+        py_files = list(sg_dir.rglob("*.py")) if sg_dir.exists() else []
+        meta_hooks = frozenset({"__new__", "__init_subclass__", "__set_name__", "__class_getitem__", "_generate_next_value_"})
+        called_files: set[str] = set()
+        ref_files: set[str] = set()
+
+        def _record_expr(expr: ast.AST, f_rel: str, is_dec: bool = False) -> None:
+            for n in self._iter_non_runtime_nodes(expr):
+                if isinstance(n, ast.Call):
+                    f = n.func
+                    if (isinstance(f, ast.Name) and f.id == meth_name) or (isinstance(f, ast.Attribute) and f.attr == meth_name):
+                        called_files.add(f_rel)
+                if (isinstance(n, ast.Name) and n.id == meth_name) or (isinstance(n, ast.Attribute) and n.attr == meth_name):
+                    ref_files.add(f_rel)
+                    if is_dec and n is expr:
+                        called_files.add(f_rel)
+
+        def _scan_stmts(stmts: list[ast.stmt], f_rel: str, in_class: bool) -> None:
+            for s in stmts:
+                if isinstance(s, ast.ClassDef):
+                    for d in s.decorator_list:
+                        _record_expr(d, f_rel, is_dec=True)
+                    _scan_stmts(s.body, f_rel, True)
+                elif isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for d in s.decorator_list:
+                        _record_expr(d, f_rel, is_dec=True)
+                    for df in s.args.defaults:
+                        _record_expr(df, f_rel)
+                    for df in s.args.kw_defaults:
+                        if df is not None:
+                            _record_expr(df, f_rel)
+                    if in_class and s.name in meta_hooks:
+                        for n in ast.walk(s):
+                            if isinstance(n, ast.Call):
+                                f = n.func
+                                if (isinstance(f, ast.Name) and f.id == meth_name) or (isinstance(f, ast.Attribute) and f.attr == meth_name):
+                                    called_files.add(f_rel)
+                elif isinstance(s, ast.If):
+                    test = s.test
+                    is_tc = (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+                        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+                    )
+                    if not is_tc:
+                        _record_expr(test, f_rel)
+                        _scan_stmts(s.body, f_rel, in_class)
+                    _scan_stmts(s.orelse, f_rel, in_class)
+                else:
+                    _record_expr(s, f_rel)
+
+        for p in py_files:
+            f_rel = p.relative_to(self.sqlglot_root).as_posix()
+            txt = self._read_base_file(f_rel)
+            if meth_name not in txt:
+                continue
+            tree = self._parse_base_ast(f_rel)
+            if tree is not None:
+                _scan_stmts(tree.body, f_rel, False)
+
+        return bool(called_files), bool(ref_files), called_files if called_files else ref_files
+
+    def _rev_import_closure(self, rel: str) -> set[str]:
+        rev_graph = self._get_rev_import_graph()
+        closure: set[str] = {rel}
+        stack = [rel]
+        while stack:
+            cur = stack.pop()
+            for nxt in rev_graph.get(cur, ()):
+                if nxt not in closure:
+                    closure.add(nxt)
+                    stack.append(nxt)
+        return closure
+
+    def _expand_class_and_copiers(self, class_name: str, attr: str = "*") -> list[str]:
+        """BFS over class_subclasses + AST class_children + class_aliases + attr_copiers/class_copiers."""
+        dep = self._get_class_dep_graph()
+        class_children = dep["class_children"]
+        attr_copiers = dep["attr_copiers"]
+        class_aliases = dep["class_aliases"]
+        class_copiers = dep["class_copiers"]
+
+        visited: set[str] = set()
+        queue: list[tuple[str, str]] = [(class_name, attr)]
+        if class_name == "JSONPathTokenizer":
+            for o in self.dict_keys_by_oa:
+                if "JSONPathTokenizer" in o:
+                    queue.append((o, attr))
+
+        while queue:
+            cur, cur_attr = queue.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+
+            for sc in self._subclasses_of(cur):
+                if sc not in visited:
+                    queue.append((sc, cur_attr))
+            for ch in class_children.get(cur, ()):
+                if ch not in visited:
+                    queue.append((ch, cur_attr))
+            for al in class_aliases.get(cur, ()):
+                if al not in visited:
+                    queue.append((al, cur_attr))
+            if "." in cur:
+                parent_d, leaf = cur.split(".", 1)
+                for psub in set(self._subclasses_of(parent_d)) | set(class_children.get(parent_d, ())):
+                    cand = f"{psub}.{leaf}"
+                    if cand not in visited:
+                        queue.append((cand, cur_attr))
+                    if psub not in visited:
+                        queue.append((psub, cur_attr))
+            if cur_attr != "*":
+                for dst_cls, dst_attr in attr_copiers.get((cur, cur_attr), ()):
+                    if dst_cls not in visited:
+                        queue.append((dst_cls, dst_attr if dst_attr != "*" else cur_attr))
+            else:
+                for dst_cls in class_copiers.get(cur, ()):
+                    if dst_cls not in visited:
+                        queue.append((dst_cls, "*"))
+
+        return sorted(visited)
 
     def _get_rev_import_graph(self) -> dict[str, set[str]]:
         """Lazily build EXACT top-level static reverse-import graph across sqlglot/**/*.py
@@ -174,6 +571,7 @@ class CandidateEngine:
                     _scan_stmts(s.finalbody, cur_pkg, targets)
 
         rev: dict[str, set[str]] = {}
+        imp_re = re.compile(r"^[ \t]*(?:from[ \t]+(\.*[\w.]*)[ \t]+import[ \t]+([^\n#\\]+)|import[ \t]+([^\n#\\]+))", re.MULTILINE)
         for p in py_files:
             rel = p.relative_to(self.sqlglot_root).as_posix()
             cur_pkg = (
@@ -182,19 +580,81 @@ class CandidateEngine:
                 else rel.rsplit("/", 1)[0].replace("/", ".")
             )
             txt = self._read_base_file(rel)
-            try:
-                tree = ast.parse(txt, filename=rel)
-            except SyntaxError:
-                continue
-            self._file_classes_cache[rel] = [s.name for s in tree.body if isinstance(s, ast.ClassDef)]
-            targets: list[str] = []
-            _scan_stmts(tree.body, cur_pkg, targets)
+            if rel in self._old_ast_cache:
+                tree = self._old_ast_cache[rel]
+                self._file_classes_cache[rel] = [s.name for s in tree.body if isinstance(s, ast.ClassDef)]
+                targets: list[str] = []
+                _scan_stmts(tree.body, cur_pkg, targets)
+            else:
+                # Fast path: only ast.parse files that contain TYPE_CHECKING or multiline imports;
+                # otherwise extract top-level imports & class names via regex (30x faster on huge files!)
+                self._file_classes_cache[rel] = _CLASS_DEF_RE.findall(txt)
+                if "TYPE_CHECKING" in txt:
+                    tree = self._parse_base_ast(rel)
+                    if tree is None:
+                        continue
+                    targets = []
+                    _scan_stmts(tree.body, cur_pkg, targets)
+                else:
+                    targets = []
+                    for m in imp_re.finditer(txt):
+                        # Only top-level imports (column 0) so function-local imports are skipped
+                        if m.group(0)[0] in (" ", "\t"):
+                            continue
+                        if m.group(1) is not None:
+                            raw_mod = m.group(1)
+                            level = len(raw_mod) - len(raw_mod.lstrip("."))
+                            sub_mod = raw_mod[level:]
+                            if level > 0:
+                                parts = cur_pkg.split(".")
+                                base = ".".join(parts[: max(0, len(parts) - (level - 1))])
+                                mod_name = f"{base}.{sub_mod}" if sub_mod else base
+                            else:
+                                mod_name = sub_mod
+                            if mod_name:
+                                targets.append(mod_name)
+                                for part in m.group(2).replace("(", "").replace(")", "").split(","):
+                                    nm = part.strip().split(" ")[0]
+                                    if nm and nm != "*":
+                                        targets.append(f"{mod_name}.{nm}")
+                        elif m.group(3) is not None:
+                            for part in m.group(3).split(","):
+                                nm = part.strip().split(" ")[0]
+                                if nm:
+                                    targets.append(nm)
             for t in targets:
                 tf = mod_to_file.get(t)
                 if tf and tf != rel:
                     rev.setdefault(tf, set()).add(rel)
         self._rev_import_graph = rev
         return rev
+
+    @property
+    def dict_keys_by_oa(self) -> dict[str, dict[str, dict[str, list[int]]]]:
+        if self._dict_keys_by_oa is None:
+            if self.maps_dir is not None:
+                p = self.maps_dir / "dict_maps.zlib"
+                if p.exists():
+                    self._dict_keys_by_oa = marshal.loads(zlib.decompress(p.read_bytes()))
+                    return self._dict_keys_by_oa
+            self._dict_keys_by_oa = {}
+        return self._dict_keys_by_oa
+
+    def _get_line_cov(self, rel: str) -> dict[int, list[int]] | None:
+        if self._line_cov_inline is not None:
+            return self._line_cov_inline.get(rel)
+        cached = self._line_cov_cache.get(rel)
+        if cached is not None:
+            return cached
+        idx = self._line_cov_index.get(rel)
+        if idx is None or self.maps_dir is None:
+            return None
+        p = self.maps_dir / "line_cov" / f"{idx}.zlib"
+        if not p.exists():
+            return None
+        lm = marshal.loads(zlib.decompress(p.read_bytes()))
+        self._line_cov_cache[rel] = lm
+        return lm
 
     def _get_subtests(self, rnum: int) -> list[dict[str, Any]]:
         if rnum not in self._subtest_tags_by_num:
@@ -300,7 +760,7 @@ class CandidateEngine:
         return sorted(subs)
 
     def _tests_covering_lines(self, rel: str, lines: set[int]) -> set[int]:
-        lm = self.maps["line_cov"].get(rel)
+        lm = self._get_line_cov(rel)
         if not lm:
             return set()
         out: set[int] = set()
@@ -433,6 +893,25 @@ class CandidateEngine:
                                 r_cases.update(self._subtest_match_lines(sg, rfile, {rline}))
                             inter = d_cases & r_cases if (d_cases and r_cases) else (d_cases or r_cases)
                             self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], inter if inter else None)
+                    elif kind == "transforms":
+                        owners, expr_subs, rel, old_lines = payload
+                        for sg in sgs:
+                            d_cases_t: set[Any] = set()
+                            for o in owners:
+                                d_cases_t.update(sg["dialects"].get(o.split(".")[0], []))
+                                d_cases_t.update(sg["dialects"].get(o, []))
+                            e_cases_t: set[Any] = set()
+                            for sc in expr_subs:
+                                e_cases_t.update(sg["exprs"].get(sc, []))
+                            l_cases_t = self._subtest_match_lines(sg, rel, old_lines)
+                            matched_t = (
+                                ((d_cases_t & e_cases_t) | l_cases_t)
+                                if (d_cases_t and e_cases_t)
+                                else (d_cases_t | e_cases_t | l_cases_t)
+                            )
+                            self._add_subtest_filter(
+                                commit_plan.subtest_filters, rnum, sg["tag"], matched_t if matched_t else None
+                            )
                     elif kind == "dialect":
                         subs, base_cls = payload
                         for sg in sgs:
@@ -443,7 +922,25 @@ class CandidateEngine:
                                     d_cases2.update(sg["dialects"].get(sc.split(".")[0], []))
                             d_cases2.update(sg["dialects"].get(base_cls, []))
                             self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], d_cases2 if d_cases2 else None)
-        return commit_plan.subtest_filters.get(rnum)
+        tf = commit_plan.subtest_filters.get(rnum)
+        if tf:
+            # Never allow empty set() to silently skip all val-calls / gen-mem / all fixture tags!
+            if "val-calls" in tf and tf["val-calls"] is not None and len(tf["val-calls"]) == 0:
+                tf["val-calls"] = None
+            if "gen-mem" in tf and tf["gen-mem"] is not None and len(tf["gen-mem"]) == 0:
+                tf["gen-mem"] = None
+            if all(v is not None and len(v) == 0 for v in tf.values()):
+                for k in list(tf.keys()):
+                    tf[k] = None
+        return tf
+
+    def _dialect_hits_for_owners(self, owners: list[str]) -> set[int]:
+        out: set[int] = set()
+        dmap = self.maps["dialect_to_tests"]
+        for o in owners:
+            out.update(self._to_rnums(dmap.get(o.split(".")[0], [])))
+            out.update(self._to_rnums(dmap.get(o, [])))
+        return out
 
     def _handle_change_unit(
         self,
@@ -470,9 +967,16 @@ class CandidateEngine:
                     exact_id = f"{rel}::{parts[0]}::{parts[1]}"
                     rnum = self.id_to_num.get(exact_id)
                     if rnum is not None:
-                        candidates.add(rnum)
-                        for tag in has_sub.get(rnum, ()):
-                            self._add_subtest_filter(subtest_filters, rnum, tag, None)
+                        matched_nums = {rnum}
+                        # Also include any subclass test with the same method name in importing test files!
+                        for imp_tf in self.maps["import_file_to_test_files"].get(rel, []):
+                            for cand_num in self.file_to_test_nums.get(imp_tf, []):
+                                if self.num_to_test[cand_num]["id"].endswith(f"::{parts[1]}"):
+                                    matched_nums.add(cand_num)
+                        candidates.update(matched_nums)
+                        for mnum in matched_nums:
+                            for tag in has_sub.get(mnum, ()):
+                                self._add_subtest_filter(subtest_filters, mnum, tag, None)
                         return
             affected = set(self.file_to_test_nums.get(rel, []))
             for tf in self.maps["import_file_to_test_files"].get(rel, []):
@@ -491,6 +995,19 @@ class CandidateEngine:
         if rel.startswith("sqlglot/typing/") and self.typing_test_num is not None:
             candidates.add(self.typing_test_num)
 
+        # Delta Finding #1: build_maps._mp_execute_tracked bypasses sqlglot.executor.execute(),
+        # so explicitly include test_execute_tpch/tpcds whenever sqlglot/executor/__init__.py changes!
+        if rel == "sqlglot/executor/__init__.py":
+            for tid in (
+                "tests/test_executor.py::TestExecutor::test_execute_tpch",
+                "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+            ):
+                rnum = self.id_to_num.get(tid)
+                if rnum is not None:
+                    candidates.add(rnum)
+                    for tag in has_sub.get(rnum, ()):
+                        self._add_subtest_filter(subtest_filters, rnum, tag, None)
+
         if unit.kind == "func_body":
             target_lines = unit.old_lines
             hits = self._tests_covering_lines(rel, target_lines)
@@ -499,6 +1016,35 @@ class CandidateEngine:
             if not hits and unit.enclosing_lines:
                 target_lines = unit.enclosing_lines
                 hits = self._tests_covering_lines(rel, target_lines)
+
+            meth_name = (unit.symbol_name or "").rsplit(".", 1)[-1]
+            is_meta_hook = meth_name in (
+                "__new__", "__init_subclass__", "__set_name__", "__class_getitem__",
+                "_generate_next_value_", "_build_dispatch", "sql_names",
+            )
+            is_import_called = False
+            import_ref_files: set[str] = set()
+            if not unit.class_name or is_meta_hook:
+                was_called, was_ref, f_set = self._is_func_called_at_import(rel, meth_name)
+                if was_called or (not hits and was_ref):
+                    is_import_called = True
+                    import_ref_files = f_set
+
+            if (
+                is_meta_hook
+                or unit.is_cached_func
+                or (is_import_called and (unit.edit_outside_nested_func or len(hits) <= 3))
+            ):
+                extra = self._tests_for_broken_import(rel)
+                for rf in import_ref_files:
+                    extra.update(self._tests_for_broken_import(rf))
+                all_hits = hits | extra
+                candidates.update(all_hits)
+                for rnum in all_hits:
+                    for tag in has_sub.get(rnum, ()):
+                        self._add_subtest_filter(subtest_filters, rnum, tag, None)
+                return
+
             candidates.update(hits)
             spec = ("lines", (rel, target_lines))
             for rnum in hits:
@@ -514,6 +1060,8 @@ class CandidateEngine:
                 for sc in subs:
                     hits.update(self._to_rnums(self.maps["expr_to_tests"].get(sc, [])))
                 hits.update(self._tests_covering_lines(rel, unit.old_lines))
+                if not hits:
+                    hits.update(self._to_rnums(self.maps["file_cov"].get(rel, [])))
                 candidates.update(hits)
                 spec = ("exprs", subs)
                 for rnum in hits:
@@ -524,119 +1072,286 @@ class CandidateEngine:
             owners: list[str] = []
             if unit.class_name:
                 if unit.class_name == "Tokenizer":
-                    owners = [o for o in self.dict_keys_by_oa if "Tokenizer" in o]
+                    owners = sorted(
+                        {o for o in self.dict_keys_by_oa if "Tokenizer" in o}
+                        | set(self._expand_class_and_copiers("Tokenizer", attr))
+                    )
                 elif unit.class_name == "Parser":
-                    owners = [o for o in self.dict_keys_by_oa if "Parser" in o]
+                    owners = sorted(
+                        {o for o in self.dict_keys_by_oa if "Parser" in o}
+                        | set(self._expand_class_and_copiers("Parser", attr))
+                    )
                 elif unit.class_name == "Generator":
-                    owners = [o for o in self.dict_keys_by_oa if "Generator" in o]
+                    owners = sorted(
+                        {o for o in self.dict_keys_by_oa if "Generator" in o}
+                        | set(self._expand_class_and_copiers("Generator", attr))
+                    )
                 elif unit.class_name == "Dialect":
-                    owners = list(self.dict_keys_by_oa.keys())
+                    owners = sorted(
+                        set(self.dict_keys_by_oa.keys())
+                        | set(self._expand_class_and_copiers("Dialect", attr))
+                    )
                 else:
-                    owners = self._subclasses_of(unit.class_name)
+                    owners = self._expand_class_and_copiers(unit.class_name, attr)
                     if unit.class_name not in owners:
                         owners.append(unit.class_name)
             elif rel.startswith("sqlglot/typing/"):
+                # Collect both sqlglot.typing.* modules AND all Dialect/copier classes in reverse-import closure!
                 mod_owner = rel.removesuffix(".py").replace("/", ".")
-                owners = [mod_owner]
-                for o, o_map in self.dict_keys_by_oa.items():
-                    if attr in o_map and o.startswith("sqlglot.typing.") and o not in owners:
-                        owners.append(o)
+                owner_set: set[str] = {mod_owner}
+                rev_graph = self._get_rev_import_graph()
+                closure: set[str] = {rel}
+                stack = [rel]
+                while stack:
+                    cur = stack.pop()
+                    for nxt in rev_graph.get(cur, ()):
+                        if nxt not in closure:
+                            closure.add(nxt)
+                            stack.append(nxt)
+                for cf in closure:
+                    if cf.startswith("sqlglot/typing/"):
+                        owner_set.add(cf.removesuffix(".py").replace("/", "."))
+                    for cname in self._file_classes_cache.get(cf, ()):
+                        owner_set.update(self._expand_class_and_copiers(cname, attr))
+                if "Dialect" in owner_set or rel == "sqlglot/typing/__init__.py":
+                    for o, o_map in self.dict_keys_by_oa.items():
+                        if attr in o_map:
+                            owner_set.add(o)
+                    owner_set.update(self.maps["class_subclasses"].get("Dialect", []))
+                owners = sorted(owner_set)
+
+            dep_graph = self._get_class_dep_graph()
+
+            # CATASTROPHIC FIX (#6.1): Generator.TRANSFORMS is copied via C PyDict_Merge into _DISPATCH_CACHE,
+            # bypassing TrackedDict! Always derive hits from dialect_hits & expr_hits (or full dialect_hits).
+            if attr == "TRANSFORMS":
+                dialect_hits = self._dialect_hits_for_owners(owners)
+                mtid_hits_t: set[int] = set()
+                if unit.dict_keys is None:
+                    for o in owners:
+                        for mtids in self.dict_keys_by_oa.get(o, {}).get(attr, {}).values():
+                            mtid_hits_t.update(mtids)
+                else:
+                    for o in owners:
+                        for kr in unit.dict_keys:
+                            mtid_hits_t.update(self._match_dict_key(o, attr, kr))
+                direct_hits = self._to_rnums(mtid_hits_t) | self._tests_covering_lines(rel, unit.old_lines)
+
+                use_expr_inter = False
+                expr_subs: set[str] = set()
+                expr_hits: set[int] = set()
+                if (
+                    unit.dict_keys is not None
+                    and not unit.dict_deleted_keys
+                    and not (attr in dep_graph["attr_mutators"] and unit.dict_deleted_keys)
+                ):
+                    all_expr = True
+                    for kr in unit.dict_keys:
+                        last = kr.rsplit(".", 1)[-1]
+                        if last in self.all_expr_classes:
+                            for sc in self._subclasses_of(last):
+                                expr_subs.add(sc)
+                                expr_hits.update(self._to_rnums(self.maps["expr_to_tests"].get(sc, [])))
+                        else:
+                            all_expr = False
+                            break
+                    if all_expr and expr_hits and (dialect_hits & expr_hits):
+                        use_expr_inter = True
+
+                if use_expr_inter:
+                    hits = (dialect_hits & expr_hits) | direct_hits
+                    spec = ("transforms", (owners, sorted(expr_subs), rel, unit.old_lines))
+                else:
+                    hits = dialect_hits | direct_hits
+                    spec = ("dict_meta", owners)
+
+                if unit.class_name and unit.class_name.split(".")[0] not in self.all_dialect_family:
+                    hits.update(self._to_rnums(self.maps["file_cov"].get(rel, [])))
+                candidates.update(hits)
+                for rnum in hits:
+                    if rnum in has_sub:
+                        deferred_subtests.setdefault(rnum, []).append(spec)
+                return
 
             tracked = any(attr in self.dict_keys_by_oa.get(o, {}) for o in owners)
             if tracked:
                 mtid_hits: set[int] = set()
+                any_zero_hit = False
                 if unit.dict_keys is None:
                     for o in owners:
                         for mtids in self.dict_keys_by_oa.get(o, {}).get(attr, {}).values():
                             mtid_hits.update(mtids)
                 else:
-                    for o in owners:
-                        for kr in unit.dict_keys:
-                            mtid_hits.update(self._match_dict_key(o, attr, kr))
+                    for kr in unit.dict_keys:
+                        key_found = False
+                        for o in owners:
+                            mh = self._match_dict_key(o, attr, kr)
+                            if mh:
+                                key_found = True
+                                mtid_hits.update(mh)
+                        if not key_found:
+                            any_zero_hit = True
 
                 hits = self._to_rnums(mtid_hits)
                 hits.update(self._tests_covering_lines(rel, unit.old_lines))
 
                 meta_rebuild_attrs = {
                     "TIME_MAPPING", "FORMAT_MAPPING", "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING",
-                    "UNESCAPED_SEQUENCES", "DATE_PART_MAPPING", "CREATABLE_KIND_MAPPING",
+                    "UNESCAPED_SEQUENCES", "ESCAPED_SEQUENCES", "DATE_PART_MAPPING", "CREATABLE_KIND_MAPPING",
                     "QUOTES", "IDENTIFIERS", "STRING_ESCAPES", "BYTE_STRING_ESCAPES",
                     "IDENTIFIER_ESCAPES", "SUPPORTED_JSON_PATH_PARTS",
+                    "KEYWORDS", "SINGLE_TOKENS", "NUMERIC_LITERALS", "NUMERIC_ESCAPES",
+                    "SHOW_PARSERS", "SET_PARSERS", "NO_PAREN_FUNCTIONS", "QUERY_MODIFIER_PARSERS",
+                    "COERCES_TO",
                 }
-                if attr in meta_rebuild_attrs or (attr == "KEYWORDS" and (unit.dict_keys is None or "'(+)'" in unit.dict_keys)):
-                    for o in owners:
-                        base_d = o.split(".")[0]
-                        hits.update(self._to_rnums(self.maps["dialect_to_tests"].get(base_d, [])))
-                        hits.update(self._to_rnums(self.maps["dialect_to_tests"].get(o, [])))
+                need_meta_expand = (
+                    attr in meta_rebuild_attrs
+                    or unit.dict_keys is None
+                    or any_zero_hit
+                    or (bool(unit.dict_deleted_keys) and attr in dep_graph["attr_mutators"])
+                )
+                if need_meta_expand:
+                    hits.update(self._dialect_hits_for_owners(owners))
+                    if rel.startswith("sqlglot/typing/"):
+                        hits.update(self._to_rnums(self.maps["file_cov"].get(rel, [])))
 
+                # Check non-runtime readers of `attr` ONLY in files that actually import `rel` (e.g. Parser.FACTOR -> simplify.py!)
+                # Never pull in unrelated base files like sqlglot/tokens.py when only Snowflake.Tokenizer changed!
+                non_rt_extra: set[int] = set()
+                readers_d = self.maps["attr_readers"].get(attr, [])
+                if readers_d:
+                    rev_cl = self._rev_import_closure(rel)
+                    for rfile, rline in readers_d:
+                        if rfile in rev_cl and rfile != rel and rline in self._get_non_runtime_info(rfile)[0]:
+                            non_rt_extra.update(self._to_rnums(self.maps["file_cov"].get(rfile, [])))
+                            non_rt_extra.update(self._tests_for_broken_import(rfile))
+
+                # Delta Finding #2: if class is non-Dialect (e.g. TypeAnnotator.COERCES_TO), ALWAYS union file_cov[rel]!
+                if (
+                    unit.class_name
+                    and unit.class_name.split(".")[0] not in self.all_dialect_family
+                    and unit.class_name not in self.all_dialect_family
+                ):
+                    non_rt_extra.update(self._to_rnums(self.maps["file_cov"].get(rel, [])))
+
+                hits.update(non_rt_extra)
                 candidates.update(hits)
-                if attr in meta_rebuild_attrs or unit.dict_keys is None:
+                if need_meta_expand:
                     spec = ("dict_meta", owners)
                 else:
                     spec = ("dict_keys", (owners, attr, unit.dict_keys, rel, unit.old_lines))
                 for rnum in hits:
-                    if rnum in has_sub:
+                    if rnum in non_rt_extra:
+                        for tag in has_sub.get(rnum, ()):
+                            self._add_subtest_filter(subtest_filters, rnum, tag, None)
+                    elif rnum in has_sub:
                         deferred_subtests.setdefault(rnum, []).append(spec)
                 return
 
         if unit.kind in ("class_attr", "dict_key") and unit.class_name:
             attr = unit.symbol_name or "*"
-            subs = self._subclasses_of(unit.class_name)
+            subs = self._expand_class_and_copiers(unit.class_name, attr)
             base_cls = unit.class_name.split(".")[0]
+            dep_graph = self._get_class_dep_graph()
 
             if base_cls in self.all_expr_classes or unit.class_name in self.all_expr_classes:
                 hits = set()
                 for sc in subs:
                     hits.update(self._to_rnums(self.maps["expr_to_tests"].get(sc, [])))
                 hits.update(self._tests_covering_lines(rel, unit.old_lines))
+                if attr in ("_sql_names", "sql_names", "*"):
+                    hits.update(self._to_rnums(self.maps["dialect_to_tests"].get("Parser", [])))
+                    hits.update(self._to_rnums(self.maps["file_cov"].get("sqlglot/parser.py", [])))
                 if not hits:
                     hits.update(self._to_rnums(self.maps["file_cov"].get(rel, [])))
                 candidates.update(hits)
                 spec = ("exprs", subs)
                 for rnum in hits:
                     if rnum in has_sub:
-                        deferred_subtests.setdefault(rnum, []).append(spec)
+                        if attr in ("_sql_names", "sql_names", "*"):
+                            for tag in has_sub.get(rnum, ()):
+                                self._add_subtest_filter(subtest_filters, rnum, tag, None)
+                        else:
+                            deferred_subtests.setdefault(rnum, []).append(spec)
                 return
 
             if base_cls in self.all_dialect_family or unit.class_name in self.all_dialect_family:
-                dialect_hits: set[int] = set()
-                for sc in subs:
-                    dialect_hits.update(self._to_rnums(self.maps["dialect_to_tests"].get(sc, [])))
-                    if "." in sc:
-                        dialect_hits.update(self._to_rnums(self.maps["dialect_to_tests"].get(sc.split(".")[0], [])))
+                dialect_hits = self._dialect_hits_for_owners(subs)
                 dialect_hits.update(self._to_rnums(self.maps["dialect_to_tests"].get(base_cls, [])))
 
                 readers = self.maps["attr_readers"].get(attr, []) if attr != "*" else []
-                if attr != "*" and attr not in self.dialect_meta_attrs and readers:
+                non_rt_extra_c: set[int] = set()
+                has_non_rt_reader = False
+                if readers:
+                    rev_cl_c = self._rev_import_closure(rel)
+                    for rfile, rline in readers:
+                        if rline in self._get_non_runtime_info(rfile)[0]:
+                            has_non_rt_reader = True
+                            if rfile in rev_cl_c and rfile != rel:
+                                non_rt_extra_c.update(self._to_rnums(self.maps["file_cov"].get(rfile, [])))
+                                non_rt_extra_c.update(self._tests_for_broken_import(rfile))
+
+                can_intersect = (
+                    attr != "*"
+                    and attr not in self.dialect_meta_attrs
+                    and bool(readers)
+                    and not has_non_rt_reader
+                    and attr not in dep_graph["all_class_body_refs"]
+                    and attr not in self._get_non_runtime_info(rel)[1]
+                )
+                if can_intersect:
                     reader_hits: set[int] = set()
                     for rfile, rline in readers:
                         reader_hits.update(self._tests_covering_lines(rfile, {rline}))
-                    hits = dialect_hits & reader_hits
-                    hits.update(self._tests_covering_lines(rel, unit.old_lines))
-                    candidates.update(hits)
-                    spec = ("dialect_readers", (subs, base_cls, readers))
-                    for rnum in hits:
-                        if rnum in has_sub:
-                            deferred_subtests.setdefault(rnum, []).append(spec)
-                    return
+                    inter = dialect_hits & reader_hits
+                    if inter:
+                        hits = inter | self._tests_covering_lines(rel, unit.old_lines)
+                        candidates.update(hits)
+                        spec = ("dialect_readers", (subs, base_cls, readers))
+                        for rnum in hits:
+                            if rnum in has_sub:
+                                deferred_subtests.setdefault(rnum, []).append(spec)
+                        return
 
-                candidates.update(dialect_hits)
+                all_hits = dialect_hits | non_rt_extra_c | self._tests_covering_lines(rel, unit.old_lines)
+                candidates.update(all_hits)
                 spec = ("dialect", (subs, base_cls))
-                for rnum in dialect_hits:
-                    if rnum in has_sub:
+                for rnum in all_hits:
+                    if rnum in non_rt_extra_c:
+                        for tag in has_sub.get(rnum, ()):
+                            self._add_subtest_filter(subtest_filters, rnum, tag, None)
+                    elif rnum in has_sub:
                         deferred_subtests.setdefault(rnum, []).append(spec)
                 return
 
         # Fallback: module_attr / module_other / non-dialect class_attr
         sym = unit.symbol_name or "*"
         hits = set()
+        has_non_rt_fb = False
         if sym != "*" and sym in self.maps["name_readers"]:
             for rfile, rline in self.maps["name_readers"][sym]:
                 hits.update(self._tests_covering_lines(rfile, {rline}))
+                if rline in self._get_non_runtime_info(rfile)[0]:
+                    has_non_rt_fb = True
+                    hits.update(self._tests_for_broken_import(rfile))
         if sym != "*" and sym in self.maps["attr_readers"]:
             for rfile, rline in self.maps["attr_readers"][sym]:
                 hits.update(self._tests_covering_lines(rfile, {rline}))
-        if not hits or sym == "*":
+                if rline in self._get_non_runtime_info(rfile)[0]:
+                    has_non_rt_fb = True
+                    hits.update(self._tests_for_broken_import(rfile))
+        if unit.class_name:
+            expanded = self._expand_class_and_copiers(unit.class_name, sym)
+            hits.update(self._dialect_hits_for_owners(expanded))
+        # Never trust reader lookup alone for module_other, wildcard "*", lowercase names (skipped in build_maps),
+        # empty hits, or non-runtime readers!
+        if (
+            unit.kind == "module_other"
+            or sym == "*"
+            or not sym[0].isupper()
+            or not hits
+            or has_non_rt_fb
+        ):
             hits.update(self._to_rnums(self.maps["file_cov"].get(rel, [])))
             hits.update(self._tests_for_broken_import(rel))
         else:
@@ -708,15 +1423,43 @@ class CandidateEngine:
                     patched_files[rel] = new_text
                 py_analyses[rel] = ana
 
-                if rel.startswith(("sqlglot/executor/", "sqlglot/planner.py", "tests/test_executor.py", "tests/helpers.py")):
+                if rel.startswith((
+                    "sqlglot/executor/",
+                    "sqlglot/planner.py",
+                    "sqlglot/optimizer/annotate_types.py",
+                    "sqlglot/typing/",
+                    "sqlglot/generators/python.py",
+                    "sqlglot/generator.py",
+                    "sqlglot/optimizer/scope.py",
+                    "sqlglot/optimizer/eliminate_joins.py",
+                    "tests/test_executor.py",
+                    "tests/helpers.py",
+                )) or (
+                    rel == "sqlglot/dialects/dialect.py"
+                    and any(
+                        u.symbol_name in (
+                            "*", "EXPRESSION_METADATA", "COERCES_TO",
+                            "DEFAULT_NULL_TYPE", "PRIORITIZE_NON_LITERAL_TYPES", "SUPPORTS_NULL_TYPE",
+                        )
+                        for u in ana.units
+                    )
+                ):
                     exec_engine_touched = True
 
                 if (
                     rel in ("tests/test_parser.py", "sqlglot/parsers/athena.py")
-                    or (rel == "sqlglot/parser.py" and any(fn in ("Parser.expression", "Parser.__init__") for fn in ana.changed_funcs))
+                    or (
+                        rel == "sqlglot/parser.py"
+                        and any(fn in ("Parser.validate_expression", "Parser.reset") for fn in ana.changed_funcs)
+                    )
                     or any(
                         hl.startswith(("+", "-"))
-                        and ("max_nodes" in hl or "_node_count" in hl or "1_000_000" in hl or "1000000" in hl)
+                        and (
+                            "max_nodes" in hl.lower()
+                            or "_node_count" in hl
+                            or "1_000_000" in hl
+                            or "1000000" in hl
+                        )
                         for h in fp.hunks
                         for hl in h.lines
                     )
@@ -728,13 +1471,34 @@ class CandidateEngine:
                     syntax_error_files.append(rel)
                     all_hot_func = False
 
-                if rel.startswith(("tests/", "sqlglotc/", "sqlglot/typing/")):
+                if rel.startswith(("tests/", "sqlglotc/")):
                     all_hot_func = False
 
+                file_has_non_hot = False
                 for unit in ana.units:
-                    if unit.kind != "func_body":
+                    meth_name = (unit.symbol_name or "").rsplit(".", 1)[-1]
+                    if (
+                        unit.kind != "func_body"
+                        or not unit.class_name
+                        or unit.has_nested_func
+                        or unit.is_cached_func
+                        or meth_name in (
+                            "__new__", "__init_subclass__", "__set_name__", "__class_getitem__",
+                            "_generate_next_value_", "_build_dispatch", "sql_names",
+                        )
+                    ):
                         all_hot_func = False
+                        file_has_non_hot = True
                     self._handle_change_unit(unit, candidates, subtest_filters, deferred_subtests)
+
+                # Include test_lazy_load whenever an eager-imported sqlglot file has a module/class/dict/import-time edit!
+                if (
+                    self.lazy_load_test_num is not None
+                    and file_has_non_hot
+                    and self.lazy_load_test_num in self._to_rnums(self.maps["dyn_import_to_tests"].get(rel, []))
+                ):
+                    candidates.add(self.lazy_load_test_num)
+                    all_hot_func = False
             else:
                 f_hits = self._to_rnums(self.maps["fixture_to_tests"].get(rel, []))
                 if not f_hits:
@@ -765,21 +1529,28 @@ class CandidateEngine:
 
                     candidates.update(f_hits)
                     for rnum in f_hits:
-                        for tag in self._subtest_tags_by_num.get(rnum, []):
-                            if tag == rel or (
-                                "tpc-ds.sql" in rel and tag == "tpc-ds"
-                            ) or (
-                                "tpc-h.sql" in rel and tag in ("tpc-h", "opt-tpch")
-                            ):
-                                self._add_subtest_filter(
-                                    subtest_filters,
-                                    rnum,
-                                    tag,
-                                    None if err_or_shift else set(changed_idxs),
-                                )
-                            else:
-                                # Untouched companion fixture file (e.g. qualify_columns.sql when only qualify_columns_ddl.sql changed!)
-                                self._add_subtest_filter(subtest_filters, rnum, tag, set())
+                        tags = self._subtest_tags_by_num.get(rnum, [])
+                        matched_tags = [
+                            tag
+                            for tag in tags
+                            if tag == rel
+                            or ("tpc-ds.sql" in rel and tag == "tpc-ds")
+                            or ("tpc-h.sql" in rel and tag in ("tpc-h", "opt-tpch"))
+                        ]
+                        if matched_tags:
+                            for tag in tags:
+                                if tag in matched_tags:
+                                    self._add_subtest_filter(
+                                        subtest_filters,
+                                        rnum,
+                                        tag,
+                                        None if err_or_shift else set(changed_idxs),
+                                    )
+                                else:
+                                    self._add_subtest_filter(subtest_filters, rnum, tag, set())
+                        else:
+                            for tag in tags:
+                                self._add_subtest_filter(subtest_filters, rnum, tag, None)
                 else:
                     if old_text == new_text:
                         continue
@@ -789,6 +1560,12 @@ class CandidateEngine:
                         deleted_files.add(rel)
                     else:
                         patched_files[rel] = new_text
+                    if "tpc-ds/" in rel:
+                        tpcds_fixture_touched = True
+                        exec_engine_touched = True
+                    if "tpc-h/" in rel:
+                        tpch_fixture_touched = True
+                        exec_engine_touched = True
                     candidates.update(f_hits)
                     for rnum in f_hits:
                         for tag in self._subtest_tags_by_num.get(rnum, []):

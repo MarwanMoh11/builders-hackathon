@@ -223,6 +223,18 @@ def optimal_cost_ms(test_nums: Sequence[int] | set[int], dur_by_num: dict[int, i
     return cost
 
 
+def max_total_for_cost_ms(cost_ms: int, min_makespan_ms: int) -> int:
+    """Exact upper bound on sum(d_i) that can possibly pack into <= cost_ms with max(d_i) >= min_makespan_ms."""
+    best = 0
+    for w in range(1, MAX_WORKERS + 1):
+        rem_ms = cost_ms - WORKER_COST_MS * w
+        if rem_ms >= min_makespan_ms:
+            cap = w * rem_ms
+            if cap > best:
+                best = cap
+    return best
+
+
 def fast_cost_ms(test_nums: Sequence[int] | set[int], dur_by_num: dict[int, int]) -> int:
     """Ultra-fast O(n log n) LPT upper-bound cost query for large candidate sets."""
     n = len(test_nums)

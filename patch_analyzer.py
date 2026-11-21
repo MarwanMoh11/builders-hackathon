@@ -184,31 +184,96 @@ def apply_file_patch(old_text: str, fp: FilePatch) -> str:
     return "".join(out)
 
 
-def extract_changed_old_lines(fp: FilePatch) -> tuple[set[int], set[int]]:
-    """Return (modified_or_deleted_old_lines, pure_insertion_anchor_old_lines) 1-based."""
+_CF_KEYWORD_RE = re.compile(
+    r"\b(?:return|break|continue|raise|yield|if|elif|else|for|while|try|except|finally|with|match|case|def|class|async)\b"
+)
+_CF_BRANCH_KWS = frozenset({"elif", "else", "except", "finally", "return", "break", "continue", "raise"})
+
+
+def _leading_indent(s: str) -> str:
+    return s[: len(s) - len(s.lstrip(" \t"))]
+
+
+def _extract_hunk_lines(fp: FilePatch) -> tuple[set[int], set[int], set[int]]:
+    """Return (modified_or_deleted_old_lines, insertion_anchor_old_lines, cf_or_indent_old_lines) 1-based.
+    Only suppresses insertion anchors on exact in-place same-indent, same-count, same-control-flow replacements."""
     changed: set[int] = set()
     anchors: set[int] = set()
+    cf_lines: set[int] = set()
+
     for hunk in fp.hunks:
         old_ln = hunk.old_start
-        saw_del = False
-        for hl in hunk.lines:
+        i = 0
+        n = len(hunk.lines)
+        while i < n:
+            hl = hunk.lines[i]
             if hl.startswith("\\"):
+                i += 1
                 continue
             tag = hl[0]
             if tag == " ":
-                saw_del = False
                 old_ln += 1
-            elif tag == "-":
-                saw_del = True
-                changed.add(old_ln)
-                old_ln += 1
-            elif tag == "+":
-                # Only record insertion anchors for PURE insertions (not replacements of '-' lines,
-                # whose old lines are already in `changed`!).
-                if not saw_del:
-                    if old_ln > 1:
-                        anchors.add(old_ln - 1)
+                i += 1
+                continue
+            # Collect a contiguous change block of '-' and '+' lines
+            start_old_ln = old_ln
+            del_bodies: list[str] = []
+            add_bodies: list[str] = []
+            del_lns: list[int] = []
+            while i < n and not hunk.lines[i].startswith(" "):
+                cur = hunk.lines[i]
+                if cur.startswith("\\"):
+                    i += 1
+                    continue
+                if cur[0] == "-":
+                    del_bodies.append(cur[1:])
+                    del_lns.append(old_ln)
+                    changed.add(old_ln)
+                    old_ln += 1
+                elif cur[0] == "+":
+                    add_bodies.append(cur[1:])
+                i += 1
+
+            # Check whether this block is a strict in-place replacement (same line count, indent, blankness, CF keywords)
+            is_strict_inplace = (
+                len(del_bodies) > 0
+                and len(del_bodies) == len(add_bodies)
+                and all(
+                    _leading_indent(d) == _leading_indent(a)
+                    and (d.strip() == "") == (a.strip() == "")
+                    and _CF_KEYWORD_RE.findall(d) == _CF_KEYWORD_RE.findall(a)
+                    for d, a in zip(del_bodies, add_bodies)
+                )
+            )
+            if not is_strict_inplace:
+                # Emit insertion/boundary anchors and mark control-flow/indent lines!
+                if start_old_ln > 1:
+                    anchors.add(start_old_ln - 1)
+                if start_old_ln > 0:
+                    anchors.add(start_old_ln)
+                if old_ln > 1:
+                    anchors.add(old_ln - 1)
+                if old_ln > 0:
                     anchors.add(old_ln)
+                cf_lines.update(del_lns)
+                if start_old_ln > 1:
+                    cf_lines.add(start_old_ln - 1)
+                if start_old_ln > 0:
+                    cf_lines.add(start_old_ln)
+                if old_ln > 0:
+                    cf_lines.add(old_ln)
+            else:
+                # Even on same-indent replacement, mark branch/exit keywords
+                for d, ln in zip(del_bodies, del_lns):
+                    if any(kw in _CF_BRANCH_KWS for kw in _CF_KEYWORD_RE.findall(d)):
+                        cf_lines.add(ln)
+
+    return changed, anchors, cf_lines
+
+
+def extract_changed_old_lines(fp: FilePatch) -> tuple[set[int], set[int]]:
+    """Return (modified_or_deleted_old_lines, insertion_anchor_old_lines) 1-based."""
+    changed, anchors, _ = _extract_hunk_lines(fp)
     return changed, anchors
 
 
@@ -220,8 +285,13 @@ class ChangeUnit:
     class_name: str | None = None
     symbol_name: str | None = None  # func qualname, attr name, or dict attr name
     dict_keys: set[str] | None = None  # None means wildcard "*"
+    dict_added_keys: set[str] = field(default_factory=set)
+    dict_deleted_keys: set[str] = field(default_factory=set)
     old_lines: set[int] = field(default_factory=set)
     enclosing_lines: set[int] = field(default_factory=set)
+    has_nested_func: bool = False
+    edit_outside_nested_func: bool = False
+    is_cached_func: bool = False
 
 
 @dataclass
@@ -240,28 +310,6 @@ def _strip_docstrings_and_type_checking(tree: ast.AST) -> str:
     return ast.dump(tree, include_attributes=False)
 
 
-def _is_sound_cmp_pair(
-    left: ast.AST,
-    right: ast.AST,
-    allow_none: bool,
-    pure_enums: set[str],
-    strict_enum_attrs: set[tuple[str, str]],
-) -> bool:
-    if allow_none and (
-        (isinstance(right, ast.Constant) and right.value is None)
-        or (isinstance(left, ast.Constant) and left.value is None)
-    ):
-        return True
-    for lhs, rhs in ((left, right), (right, left)):
-        if isinstance(rhs, ast.Attribute) and isinstance(rhs.value, ast.Name):
-            enum_name = rhs.value.id
-            if enum_name in pure_enums:
-                return True
-            if isinstance(lhs, ast.Attribute) and (lhs.attr, enum_name) in strict_enum_attrs:
-                return True
-    return False
-
-
 def _strip_leading_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
     """Return body without a leading bare string-literal docstring statement."""
     if (
@@ -277,89 +325,37 @@ def _strip_leading_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
 def _ast_nodes_equiv(
     a: Any,
     b: Any,
-    allow_none: bool,
-    pure_enums: set[str],
-    strict_enum_attrs: set[tuple[str, str]],
     ignore_docstrings: bool = False,
+    ignore_type_checking: bool = False,
 ) -> bool:
-    """Zero-copy recursive AST equivalence checker allowing provably sound is/== swaps
-    and (when no doctest runner exists in tests.json) pure docstring changes."""
+    """Strict zero-copy recursive AST equivalence checker.
+    Never treats semantic operator swaps (e.g. `is` <-> `==`) as equivalent!"""
     if type(a) is not type(b):
         return False
     if isinstance(a, list):
         if len(a) != len(b):
             return False
         return all(
-            _ast_nodes_equiv(x, y, allow_none, pure_enums, strict_enum_attrs, ignore_docstrings)
+            _ast_nodes_equiv(x, y, ignore_docstrings, ignore_type_checking)
             for x, y in zip(a, b)
-        )
-    if isinstance(a, ast.Compare):
-        if len(a.ops) == 1 and len(b.ops) == 1 and len(a.comparators) == 1 and len(b.comparators) == 1:
-            op_a, op_b = a.ops[0], b.ops[0]
-            if type(op_a) is not type(op_b):
-                eq_is_pair = (
-                    (isinstance(op_a, ast.Is) and isinstance(op_b, ast.Eq))
-                    or (isinstance(op_a, ast.Eq) and isinstance(op_b, ast.Is))
-                    or (isinstance(op_a, ast.IsNot) and isinstance(op_b, ast.NotEq))
-                    or (isinstance(op_a, ast.NotEq) and isinstance(op_b, ast.IsNot))
-                )
-                if not (
-                    eq_is_pair
-                    and _is_sound_cmp_pair(a.left, a.comparators[0], allow_none, pure_enums, strict_enum_attrs)
-                    and _ast_nodes_equiv(a.left, b.left, allow_none, pure_enums, strict_enum_attrs, ignore_docstrings)
-                    and _ast_nodes_equiv(a.comparators[0], b.comparators[0], allow_none, pure_enums, strict_enum_attrs, ignore_docstrings)
-                ):
-                    return False
-                return True
-        if len(a.ops) != len(b.ops) or len(a.comparators) != len(b.comparators):
-            return False
-        return (
-            _ast_nodes_equiv(a.left, b.left, allow_none, pure_enums, strict_enum_attrs, ignore_docstrings)
-            and all(type(x) is type(y) for x, y in zip(a.ops, b.ops))
-            and all(_ast_nodes_equiv(x, y, allow_none, pure_enums, strict_enum_attrs, ignore_docstrings) for x, y in zip(a.comparators, b.comparators))
         )
     if isinstance(a, ast.AST):
         is_doc_owner = ignore_docstrings and isinstance(a, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        is_tc_owner = ignore_type_checking and isinstance(a, (ast.Module, ast.ClassDef))
         for field_name in a._fields:
             va = getattr(a, field_name)
             vb = getattr(b, field_name)
-            if is_doc_owner and field_name == "body":
-                va = _strip_leading_docstring(va)
-                vb = _strip_leading_docstring(vb)
-            if not _ast_nodes_equiv(
-                va,
-                vb,
-                allow_none,
-                pure_enums,
-                strict_enum_attrs,
-                ignore_docstrings,
-            ):
+            if field_name == "body":
+                if is_doc_owner:
+                    va = _strip_leading_docstring(va)
+                    vb = _strip_leading_docstring(vb)
+                if is_tc_owner:
+                    va = [s for s in va if not _is_type_checking_if(s)]
+                    vb = [s for s in vb if not _is_type_checking_if(s)]
+            if not _ast_nodes_equiv(va, vb, ignore_docstrings, ignore_type_checking):
                 return False
         return True
     return a == b
-
-
-def _diff_has_identity_or_eq_change(fp: FilePatch) -> bool:
-    for h in fp.hunks:
-        for line in h.lines:
-            if line.startswith(("+", "-")) and (" is " in line or "==" in line or "!=" in line or "None" in line):
-                return True
-    return False
-
-
-def _is_sound_cmp_equiv(
-    file: str,
-    old_ast: ast.AST,
-    new_ast: ast.AST,
-    fp: FilePatch,
-    pure_enums: set[str],
-    strict_enum_attrs: set[tuple[str, str]],
-    ignore_docstrings: bool = False,
-) -> bool:
-    if not file.startswith("sqlglot/") or not _diff_has_identity_or_eq_change(fp):
-        return False
-    allow_none = file != "sqlglot/executor/env.py"
-    return _ast_nodes_equiv(old_ast, new_ast, allow_none, pure_enums, strict_enum_attrs, ignore_docstrings)
 
 
 def _coding_cookie(src: str) -> str | None:
@@ -400,38 +396,49 @@ def _const_key_repr(node: ast.AST | None) -> str | None:
     return None
 
 
-def _diff_dict_nodes(old_dict: ast.Dict, new_dict: ast.Dict) -> set[str] | None:
-    """Return set of changed/added/removed canonical dict keys, or None for wildcard '*'."""
+def _diff_dict_nodes_detailed(
+    old_dict: ast.Dict, new_dict: ast.Dict
+) -> tuple[set[str] | None, set[str], set[str]]:
+    """Return (changed_keys_or_None_wildcard, added_keys, deleted_keys)."""
     old_unpacks: list[str] = []
-    old_map: dict[str, str] = {}
+    old_map: dict[str, tuple[int, str]] = {}
+    seg = 0
     for k, v in zip(old_dict.keys, old_dict.values):
         if k is None:
             old_unpacks.append(ast.dump(v, include_attributes=False))
+            seg += 1
         else:
             kr = _const_key_repr(k)
-            if kr is None:
-                return None
-            old_map[kr] = ast.dump(v, include_attributes=False)
+            if kr is None or kr in old_map:
+                return None, set(), set()
+            old_map[kr] = (seg, ast.dump(v, include_attributes=False))
 
     new_unpacks: list[str] = []
-    new_map: dict[str, str] = {}
+    new_map: dict[str, tuple[int, str]] = {}
+    seg = 0
     for k, v in zip(new_dict.keys, new_dict.values):
         if k is None:
             new_unpacks.append(ast.dump(v, include_attributes=False))
+            seg += 1
         else:
             kr = _const_key_repr(k)
-            if kr is None:
-                return None
-            new_map[kr] = ast.dump(v, include_attributes=False)
+            if kr is None or kr in new_map:
+                return None, set(), set()
+            new_map[kr] = (seg, ast.dump(v, include_attributes=False))
 
     if old_unpacks != new_unpacks:
-        return None
+        return None, set(), set()
 
-    changed_keys: set[str] = set()
-    for k in set(old_map) | set(new_map):
-        if old_map.get(k) != new_map.get(k):
-            changed_keys.add(k)
-    return changed_keys
+    old_keys = set(old_map)
+    new_keys = set(new_map)
+    added_keys = new_keys - old_keys
+    deleted_keys = old_keys - new_keys
+    changed_keys = {k for k in old_keys | new_keys if old_map.get(k) != new_map.get(k)}
+    # If AST differed (e.g., key reordering in TIME_MAPPING / QUOTES!)
+    # yet no individual key/value/segment changed, return wildcard None!
+    if not changed_keys:
+        return None, set(), set()
+    return changed_keys, added_keys, deleted_keys
 
 
 def _stmt_line_span(node: ast.AST) -> set[int]:
@@ -442,9 +449,105 @@ def _stmt_line_span(node: ast.AST) -> set[int]:
     return set(range(start, (end or start) + 1))
 
 
+_TRY_TYPES: tuple[type[ast.stmt], ...] = (
+    (ast.Try, ast.TryStar) if hasattr(ast, "TryStar") else (ast.Try,)
+)
+_MATCH_TYPES: tuple[type[ast.stmt], ...] = (
+    (ast.Match,) if hasattr(ast, "Match") else ()
+)
+_COMPOUND_TYPES: tuple[type[ast.stmt], ...] = (
+    ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith,
+    *_TRY_TYPES, *_MATCH_TYPES,
+)
+
+
+def _stmt_entry_lines(stmt: ast.stmt) -> set[int]:
+    """Executable entry lines of a statement (handles Python 3.13 `try:` emitting no LINE event!)."""
+    if isinstance(stmt, ast.If):
+        return _stmt_line_span(stmt.test) | {stmt.lineno}
+    if isinstance(stmt, (ast.For, ast.AsyncFor)):
+        return _stmt_line_span(stmt.target) | _stmt_line_span(stmt.iter) | {stmt.lineno}
+    if isinstance(stmt, ast.While):
+        return _stmt_line_span(stmt.test) | {stmt.lineno}
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        hdr = {stmt.lineno}
+        for item in stmt.items:
+            hdr |= _stmt_line_span(item)
+        return hdr
+    if isinstance(stmt, _TRY_TYPES):
+        # CPython 3.13 zero-cost exceptions emit NO LINE event on `try:` itself!
+        hdr = {stmt.lineno}
+        if stmt.body:
+            hdr |= _stmt_entry_lines(stmt.body[0])
+        return hdr
+    if _MATCH_TYPES and isinstance(stmt, _MATCH_TYPES):
+        return _stmt_line_span(stmt.subject) | {stmt.lineno}  # type: ignore[attr-defined]
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        first_body_ln = getattr(stmt.body[0], "lineno", stmt.lineno + 1) if stmt.body else stmt.lineno + 1
+        dec_min = min((getattr(d, "lineno", stmt.lineno) for d in stmt.decorator_list), default=stmt.lineno)
+        return set(range(dec_min, max(stmt.lineno + 1, first_body_ln)))
+    return _stmt_line_span(stmt)
+
+
+def _collect_struct_enclosing_headers(
+    old_body: list[ast.stmt],
+    new_body: list[ast.stmt],
+    stmt_lines: set[int],
+    enclosing_hdr: set[int],
+    ignore_docstrings: bool = False,
+) -> None:
+    """AST-level structural comparison of two statement blocks: if block length, statement types,
+    or compound branch presence (orelse/finalbody/handlers/cases) changed, add enclosing header entry lines!"""
+    if ignore_docstrings:
+        old_body = _strip_leading_docstring(old_body)
+        new_body = _strip_leading_docstring(new_body)
+
+    if len(old_body) != len(new_body):
+        stmt_lines |= enclosing_hdr
+
+    for o_s, n_s in zip(old_body, new_body):
+        if type(o_s) is not type(n_s):
+            stmt_lines |= enclosing_hdr | _stmt_entry_lines(o_s)
+            continue
+        if isinstance(o_s, _COMPOUND_TYPES):
+            sub_hdr = _stmt_entry_lines(o_s)
+            if hasattr(o_s, "body") and hasattr(n_s, "body"):
+                _collect_struct_enclosing_headers(o_s.body, n_s.body, stmt_lines, sub_hdr, False)
+            if hasattr(o_s, "orelse") and hasattr(n_s, "orelse"):
+                if bool(o_s.orelse) != bool(n_s.orelse):
+                    stmt_lines |= sub_hdr
+                elif o_s.orelse:
+                    _collect_struct_enclosing_headers(o_s.orelse, n_s.orelse, stmt_lines, sub_hdr, False)
+            if hasattr(o_s, "finalbody") and hasattr(n_s, "finalbody"):
+                if bool(o_s.finalbody) != bool(n_s.finalbody):
+                    stmt_lines |= sub_hdr
+                elif o_s.finalbody:
+                    _collect_struct_enclosing_headers(o_s.finalbody, n_s.finalbody, stmt_lines, sub_hdr, False)
+            if isinstance(o_s, _TRY_TYPES) and isinstance(n_s, _TRY_TYPES):
+                if len(o_s.handlers) != len(n_s.handlers):
+                    stmt_lines |= sub_hdr
+                    for oh in o_s.handlers:
+                        stmt_lines.add(oh.lineno)
+                else:
+                    for oh, nh in zip(o_s.handlers, n_s.handlers):
+                        h_hdr = sub_hdr | {oh.lineno} | (_stmt_line_span(oh.type) if oh.type is not None else set())
+                        _collect_struct_enclosing_headers(oh.body, nh.body, stmt_lines, h_hdr, False)
+            if _MATCH_TYPES and isinstance(o_s, _MATCH_TYPES) and isinstance(n_s, _MATCH_TYPES):
+                o_cases = o_s.cases  # type: ignore[attr-defined]
+                n_cases = n_s.cases  # type: ignore[attr-defined]
+                if len(o_cases) != len(n_cases):
+                    stmt_lines |= sub_hdr
+                else:
+                    for oc, nc in zip(o_cases, n_cases):
+                        _collect_struct_enclosing_headers(oc.body, nc.body, stmt_lines, sub_hdr, False)
+        elif isinstance(o_s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            sub_hdr = _stmt_entry_lines(o_s)
+            _collect_struct_enclosing_headers(o_s.body, n_s.body, stmt_lines, sub_hdr, ignore_docstrings)
+
+
 def _func_signature_dump(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
-    """Dump everything about a function EXCEPT its body statements."""
-    clone = ast.FunctionDef(
+    """Dump everything about a function EXCEPT its body statements (distinguishes def vs async def!)."""
+    clone = type(fn)(
         name=fn.name,
         args=fn.args,
         body=[],
@@ -453,6 +556,19 @@ def _func_signature_dump(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
         type_params=getattr(fn, "type_params", []),
     )
     return ast.dump(clone, include_attributes=False)
+
+
+_CACHE_DECORATORS = frozenset({"cache", "lru_cache", "cached_property"})
+
+
+def _is_cached_func(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    for dec in fn.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(target, ast.Name) and target.id in _CACHE_DECORATORS:
+            return True
+        if isinstance(target, ast.Attribute) and target.attr in _CACHE_DECORATORS:
+            return True
+    return False
 
 
 def _extract_assign_target_and_value(stmt: ast.stmt) -> tuple[str | None, ast.AST | None]:
@@ -464,13 +580,24 @@ def _extract_assign_target_and_value(stmt: ast.stmt) -> tuple[str | None, ast.AS
 
 
 def _is_type_checking_if(stmt: ast.stmt) -> bool:
-    if not isinstance(stmt, ast.If):
+    if not isinstance(stmt, ast.If) or stmt.orelse:
         return False
     test = stmt.test
     if isinstance(test, ast.Name) and test.id == "TYPE_CHECKING":
         return True
     if isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING":
         return True
+    return False
+
+
+def _is_overload_fn(stmt: ast.stmt) -> bool:
+    if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    for dec in stmt.decorator_list:
+        if isinstance(dec, ast.Name) and dec.id == "overload":
+            return True
+        if isinstance(dec, ast.Attribute) and dec.attr == "overload":
+            return True
     return False
 
 
@@ -500,6 +627,7 @@ def _compare_block(
     class_chain: list[str],
     changed_old_lines: set[int],
     anchor_old_lines: set[int],
+    cf_old_lines: set[int],
     units: list[ChangeUnit],
     changed_funcs: list[str],
     ignore_docstrings: bool = False,
@@ -524,6 +652,8 @@ def _compare_block(
     new_by_key: dict[tuple[str, str], list[ast.stmt]] = {}
     old_unkeyed: list[ast.stmt] = []
     new_unkeyed: list[ast.stmt] = []
+    old_order: list[tuple[str, str]] = []
+    new_order: list[tuple[str, str]] = []
 
     for s in old_body:
         if _is_type_checking_if(s):
@@ -531,8 +661,10 @@ def _compare_block(
         k = stmt_key(s)
         if k is None:
             old_unkeyed.append(s)
+            old_order.append(("unkeyed", ""))
         else:
             old_by_key.setdefault(k, []).append(s)
+            old_order.append(k)
 
     for s in new_body:
         if _is_type_checking_if(s):
@@ -540,20 +672,29 @@ def _compare_block(
         k = stmt_key(s)
         if k is None:
             new_unkeyed.append(s)
+            new_order.append(("unkeyed", ""))
         else:
             new_by_key.setdefault(k, []).append(s)
+            new_order.append(k)
 
     class_qual = ".".join(class_chain) if class_chain else None
 
     # Any change to unkeyed statements (imports, if-blocks, bare expressions, etc.)
-    if not _ast_nodes_equiv(old_unkeyed, new_unkeyed, False, _EMPTY_SET, _EMPTY_SET, ignore_docstrings):
+    # OR relative statement reordering of surviving statements (e.g. moving KEYWORDS.pop above KEYWORDS = {...})!
+    common_keys = set(old_order) & set(new_order)
+    old_common = [k for k in old_order if k in common_keys]
+    new_common = [k for k in new_order if k in common_keys]
+    if (
+        not _ast_nodes_equiv(old_unkeyed, new_unkeyed, ignore_docstrings)
+        or old_common != new_common
+    ):
         units.append(
             ChangeUnit(
                 kind="class_attr" if class_qual else "module_other",
                 file=file,
                 class_name=class_qual,
                 symbol_name="*",
-                old_lines=set(changed_old_lines),
+                old_lines=set(changed_old_lines | anchor_old_lines),
             )
         )
 
@@ -562,10 +703,25 @@ def _compare_block(
         n_list = new_by_key.get(key, [])
         if len(o_list) == 1 and len(n_list) == 1 and _stmt_src_equal(o_list[0], n_list[0], old_lines_arr, new_lines_arr):
             continue
-        if _ast_nodes_equiv(o_list, n_list, False, _EMPTY_SET, _EMPTY_SET, ignore_docstrings):
+        if _ast_nodes_equiv(o_list, n_list, ignore_docstrings):
             continue
 
         kind_tag, name = key
+        # Handle @t.overload functions cleanly: if all overload stubs match and only the
+        # final implementation def changed, compare the implementation def as a single func!
+        if (
+            kind_tag == "func"
+            and len(o_list) > 1
+            and len(o_list) == len(n_list)
+            and all(_is_overload_fn(s) for s in o_list[:-1])
+            and all(_is_overload_fn(s) for s in n_list[:-1])
+            and not _is_overload_fn(o_list[-1])
+            and not _is_overload_fn(n_list[-1])
+            and _ast_nodes_equiv(o_list[:-1], n_list[:-1], ignore_docstrings)
+        ):
+            o_list = [o_list[-1]]
+            n_list = [n_list[-1]]
+
         if len(o_list) != 1 or len(n_list) != 1:
             # Added, deleted, or duplicated definition
             span = set()
@@ -579,8 +735,8 @@ def _compare_block(
                         kind="class_attr" if class_qual else "module_other",
                         file=file,
                         class_name=class_qual,
-                        # Added/deleted methods (e.g. *_sql) may be dispatched dynamically via getattr!
-                        symbol_name="*" if class_qual else name,
+                        # Added/deleted methods or top-level functions use wildcard symbol "*"
+                        symbol_name="*",
                         old_lines=span & (changed_old_lines | anchor_old_lines),
                         enclosing_lines=span,
                     )
@@ -619,9 +775,9 @@ def _compare_block(
             sub_qual = ".".join(sub_chain)
             # Check bases/keywords/decorators
             if (
-                not _ast_nodes_equiv(os_node.bases, ns_node.bases, False, _EMPTY_SET, _EMPTY_SET)
-                or not _ast_nodes_equiv(os_node.keywords, ns_node.keywords, False, _EMPTY_SET, _EMPTY_SET)
-                or not _ast_nodes_equiv(os_node.decorator_list, ns_node.decorator_list, False, _EMPTY_SET, _EMPTY_SET)
+                not _ast_nodes_equiv(os_node.bases, ns_node.bases)
+                or not _ast_nodes_equiv(os_node.keywords, ns_node.keywords)
+                or not _ast_nodes_equiv(os_node.decorator_list, ns_node.decorator_list)
             ):
                 units.append(
                     ChangeUnit(
@@ -641,6 +797,7 @@ def _compare_block(
                 sub_chain,
                 changed_old_lines,
                 anchor_old_lines,
+                cf_old_lines,
                 units,
                 changed_funcs,
                 ignore_docstrings,
@@ -653,45 +810,61 @@ def _compare_block(
             changed_funcs.append(qname)
             fn_span = _stmt_line_span(os_node)
             sig_changed = _func_signature_dump(os_node) != _func_signature_dump(ns_node)
+            # Detect nested defs/lambdas & caching decorators (for import-time / closure soundness)
+            inner_defs = [
+                n for n in ast.walk(os_node)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not os_node
+            ]
+            new_inner_defs = [
+                n for n in ast.walk(ns_node)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n is not ns_node
+            ]
+            has_nested_func = bool(
+                inner_defs
+                or new_inner_defs
+                or any(isinstance(n, ast.Lambda) for n in ast.walk(os_node))
+                or any(isinstance(n, ast.Lambda) for n in ast.walk(ns_node))
+            )
+            is_cached = _is_cached_func(os_node) or _is_cached_func(ns_node)
+
             # Find the tightest changed statement spans inside old function body
             hit_lines = fn_span & (changed_old_lines | anchor_old_lines)
+            cf_hit = fn_span & cf_old_lines
+            inner_body_lines: set[int] = set()
+            for idn in inner_defs:
+                for is_stmt in idn.body:
+                    inner_body_lines |= _stmt_line_span(is_stmt)
+            edit_outside_nested = True if not inner_defs else bool((hit_lines | cf_hit) - inner_body_lines)
+
             stmt_lines: set[int] = set()
+            # AST-level structural comparison catches dedents, branch edits, elif->if, statement type swaps!
+            _collect_struct_enclosing_headers(
+                os_node.body,
+                ns_node.body,
+                stmt_lines,
+                _stmt_entry_lines(os_node.body[0]) if os_node.body else {os_node.lineno},
+                ignore_docstrings,
+            )
             for sub in ast.walk(os_node):
                 if isinstance(sub, ast.stmt) and sub is not os_node:
                     sp = _stmt_line_span(sub)
                     if sp & hit_lines:
-                        if isinstance(sub, ast.If):
-                            hdr = _stmt_line_span(sub.test) | {sub.lineno}
-                            if hdr & hit_lines:
+                        if isinstance(sub, _COMPOUND_TYPES):
+                            hdr = _stmt_entry_lines(sub)
+                            if (hdr & hit_lines) or (sp & cf_hit):
                                 stmt_lines |= hdr
-                        elif isinstance(sub, (ast.For, ast.AsyncFor)):
-                            hdr = _stmt_line_span(sub.target) | _stmt_line_span(sub.iter) | {sub.lineno}
-                            if hdr & hit_lines:
-                                stmt_lines |= hdr
-                        elif isinstance(sub, ast.While):
-                            hdr = _stmt_line_span(sub.test) | {sub.lineno}
-                            if hdr & hit_lines:
-                                stmt_lines |= hdr
-                        elif isinstance(sub, (ast.With, ast.AsyncWith)):
-                            hdr = {sub.lineno}
-                            for item in sub.items:
-                                hdr |= _stmt_line_span(item)
-                            if hdr & hit_lines:
-                                stmt_lines |= hdr
-                        elif isinstance(sub, ast.Try):
-                            if sub.lineno in hit_lines:
-                                stmt_lines.add(sub.lineno)
-                            for h in sub.handlers:
-                                h_hdr = {h.lineno} | (_stmt_line_span(h.type) if h.type is not None else set())
-                                if h_hdr & hit_lines:
-                                    stmt_lines |= h_hdr
+                            if isinstance(sub, _TRY_TYPES):
+                                for h in sub.handlers:
+                                    h_hdr = {h.lineno} | (_stmt_line_span(h.type) if h.type is not None else set())
+                                    if (h_hdr & hit_lines) or (sp & cf_hit):
+                                        stmt_lines |= h_hdr
                         elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                            if sub.lineno in hit_lines:
-                                stmt_lines.add(sub.lineno)
+                            hdr = _stmt_entry_lines(sub)
+                            if (hdr & hit_lines) or (sp & cf_hit):
+                                stmt_lines |= hdr
                         else:
                             stmt_lines |= sp
-                # Block-aware insertion anchors: if an insertion falls between statements
-                # (including before/after/inside a leading docstring!), bind to neighboring executable statements.
+                # Block-aware insertion anchors: bind to executable entry lines of neighboring statements!
                 for attr in ("body", "orelse", "finalbody"):
                     raw_blk = getattr(sub, attr, None)
                     if isinstance(raw_blk, list) and raw_blk:
@@ -702,16 +875,14 @@ def _compare_block(
                             s_start = getattr(s_item, "lineno", 0)
                             s_end = getattr(s_item, "end_lineno", s_start)
                             prev_end = getattr(blk[idx_s - 1], "end_lineno", 0) if idx_s > 0 else getattr(sub, "lineno", 0)
-                            # Insertion between previous executable statement (or def/class/if header) and s_item
                             if any(prev_end <= al <= s_start for al in anchor_old_lines):
-                                stmt_lines.add(s_start)
+                                stmt_lines |= _stmt_entry_lines(s_item)
                                 if idx_s > 0:
-                                    stmt_lines.add(getattr(blk[idx_s - 1], "lineno", s_start))
-                            # Insertion right after the last executable statement in block
+                                    stmt_lines |= _stmt_entry_lines(blk[idx_s - 1])
                             if idx_s == len(blk) - 1:
                                 block_end = getattr(sub, "end_lineno", s_end)
                                 if any(s_end <= al <= block_end + 1 for al in anchor_old_lines):
-                                    stmt_lines.add(s_start)
+                                    stmt_lines |= _stmt_entry_lines(s_item)
             if not stmt_lines or sig_changed:
                 stmt_lines = set(fn_span)
             units.append(
@@ -719,9 +890,12 @@ def _compare_block(
                     kind="class_attr" if (sig_changed and class_qual) else ("module_other" if sig_changed else "func_body"),
                     file=file,
                     class_name=class_qual,
-                    symbol_name="*" if (sig_changed and class_qual) else qname,
+                    symbol_name="*" if sig_changed else qname,
                     old_lines=hit_lines | stmt_lines,
                     enclosing_lines=fn_span,
+                    has_nested_func=has_nested_func,
+                    edit_outside_nested_func=edit_outside_nested,
+                    is_cached_func=is_cached,
                 )
             )
 
@@ -730,7 +904,7 @@ def _compare_block(
             _, n_val = _extract_assign_target_and_value(ns_node)
             span = _stmt_line_span(os_node)
             if isinstance(o_val, ast.Dict) and isinstance(n_val, ast.Dict):
-                diff_keys = _diff_dict_nodes(o_val, n_val)
+                diff_keys, added_keys, deleted_keys = _diff_dict_nodes_detailed(o_val, n_val)
                 units.append(
                     ChangeUnit(
                         kind="dict_key",
@@ -738,6 +912,8 @@ def _compare_block(
                         class_name=class_qual,
                         symbol_name=name,
                         dict_keys=diff_keys,
+                        dict_added_keys=added_keys,
+                        dict_deleted_keys=deleted_keys,
                         old_lines=span & (changed_old_lines | anchor_old_lines),
                         enclosing_lines=span,
                     )
@@ -767,7 +943,7 @@ def analyze_python_change(
     ignore_docstrings: bool = False,
 ) -> PyFileAnalysis:
     """Analyze a modified Python file into semantic ChangeUnits."""
-    changed_old, anchor_old = extract_changed_old_lines(fp)
+    changed_old, anchor_old, cf_old = _extract_hunk_lines(fp)
     if fp.is_new or fp.is_deleted:
         try:
             if not fp.is_deleted:
@@ -803,14 +979,10 @@ def analyze_python_change(
         if old_ast_cache is not None:
             old_ast_cache[file] = old_ast
 
-    # Check if AST is 100% identical (or provably sound None/Enum comparison equivalent)
-    # Zero-copy recursive comparator short-circuits on the first differing node (no 500KB ast.dump string!)
+    # ONLY treat as static no-op when exact AST is identical (comments/whitespace/docstrings only)!
+    # Never treat semantic operator changes (like `is` <-> `==`) as static no-op (verify them instead!).
     if _coding_cookie(old_src) == _coding_cookie(new_src):
-        if _ast_nodes_equiv(old_ast, new_ast, False, _EMPTY_SET, _EMPTY_SET, ignore_docstrings):
-            return PyFileAnalysis(file=file, is_noop=True)
-        if _is_sound_cmp_equiv(
-            file, old_ast, new_ast, fp, pure_enums or _EMPTY_SET, strict_enum_attrs or _EMPTY_SET, ignore_docstrings
-        ):
+        if _ast_nodes_equiv(old_ast, new_ast, ignore_docstrings):
             return PyFileAnalysis(file=file, is_noop=True)
 
     units: list[ChangeUnit] = []
@@ -824,16 +996,21 @@ def analyze_python_change(
         [],
         changed_old,
         anchor_old,
+        cf_old,
         units,
         changed_funcs,
         ignore_docstrings,
     )
 
-    # If only TYPE_CHECKING blocks changed (units is empty), check if file is in sqlglot/typing/
-    # (test_typing.py parses AST of sqlglot/typing/*.py!)
-    if not units and not file.startswith("sqlglot/typing/"):
-        return PyFileAnalysis(file=file, is_noop=True)
+    # Only treat empty `units` as no-op if the ENTIRE difference was strictly inside `if TYPE_CHECKING:`
+    # blocks (without orelse) AND file is not in sqlglot/typing/ (which test_typing.py parses!).
     if not units:
+        if (
+            not file.startswith("sqlglot/typing/")
+            and _coding_cookie(old_src) == _coding_cookie(new_src)
+            and _ast_nodes_equiv(old_ast, new_ast, ignore_docstrings, ignore_type_checking=True)
+        ):
+            return PyFileAnalysis(file=file, is_noop=True)
         units.append(ChangeUnit(kind="module_other", file=file, symbol_name="*", old_lines=changed_old))
 
     return PyFileAnalysis(
