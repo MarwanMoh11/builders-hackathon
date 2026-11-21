@@ -1,0 +1,308 @@
+"""Run sqlglot tests against a patched sqlglot, in memory, in forked children.
+
+The parent imports sqlglot and the test modules once. For each commit a child is forked; it
+applies the patch either by swapping the code of the changed functions (cheap) or by
+re-importing every sqlglot and test module from patched sources (import-time changes), runs the
+candidate tests with unittest, and reports which failed.
+"""
+
+from __future__ import annotations
+
+import builtins
+import gc
+import importlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import pickle
+import signal
+import sys
+import time
+import types
+import unittest
+from concurrent.futures import Future
+
+ROOT = os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot")
+
+
+def log(*args):
+    print(*args, file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------------ process pools, in-process
+
+
+class InlineExecutor:
+    """ProcessPoolExecutor stand-in: runs work in-process, with the pickle round trip a real
+    pool does (pickling runs sqlglot's serializer). Tests then see the patched in-memory code."""
+
+    def __init__(self, *args, initializer=None, initargs=(), **kwargs):
+        if initializer is not None:
+            initializer(*pickle.loads(pickle.dumps(initargs)))
+
+    def submit(self, fn, *args, **kwargs):
+        future = Future()
+        try:
+            fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
+            future.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
+        except BaseException as error:  # noqa: BLE001
+            future.set_exception(error)
+        return future
+
+    def map(self, fn, *iterables, **kwargs):
+        return [self.submit(fn, *args).result() for args in zip(*iterables)]
+
+    def shutdown(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def module_name(relpath: str) -> str:
+    name = relpath[:-3].replace("/", ".")
+    if name.endswith(".__init__"):
+        name = name[: -len(".__init__")]
+    return name
+
+
+def is_ours(name: str) -> bool:
+    return name in ("sqlglot", "tests") or name.startswith("sqlglot.") or name.startswith("tests.")
+
+
+# ------------------------------------------------------------------ parent setup
+
+FUNCS_BY_FILE: dict[str, list[types.FunctionType]] = {}
+TESTS: list[dict] = []
+
+
+def setup_parent(tests: list[dict], import_tests: bool = True) -> None:
+    import concurrent.futures
+
+    os.environ.setdefault("SKIP_INTEGRATION", "0")
+    concurrent.futures.ProcessPoolExecutor = InlineExecutor
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    os.chdir(ROOT)
+    TESTS[:] = tests
+
+    import pkgutil
+
+    # Import order matters: some dialects mutate shared class state at import time. pytest
+    # imports the test files first, in collection order (the order of tests.json), so do that.
+    if import_tests:
+        seen = []
+        for t in tests:
+            if t["file"] not in seen:
+                seen.append(t["file"])
+        for relpath in seen:
+            try:
+                importlib.import_module(module_name(relpath))
+            except Exception as error:  # noqa: BLE001
+                log(f"import {relpath} failed: {error!r}")
+    import sqlglot
+
+    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+        if info.name == "sqlglot.__main__":
+            continue
+        try:
+            importlib.import_module(info.name)
+        except Exception as error:  # noqa: BLE001
+            log(f"import {info.name} failed: {error!r}")
+    for obj in gc.get_objects():
+        if type(obj) is types.FunctionType:
+            filename = obj.__code__.co_filename
+            if filename.startswith(ROOT):
+                FUNCS_BY_FILE.setdefault(filename, []).append(obj)
+    gc.collect()
+    gc.freeze()
+
+
+# ------------------------------------------------------------------ applying patches in a child
+
+
+def _code_key(code: types.CodeType):
+    return (code.co_qualname, code.co_firstlineno)
+
+
+def hot_patch(filename: str, analysis) -> bool:
+    """Swap the code of changed functions in every live function object. False if some changed
+    function cannot be found alive (the caller then re-imports instead)."""
+    from pyanalyze import is_function
+
+    targets: dict = {}
+    required: set = set()
+    for change in analysis.changes:
+        if change.kind != "function":
+            continue
+        chain_old = change.path + [change.old]
+        chain_new = change.new_path + [change.new]
+        for depth, (old, new) in enumerate(zip(chain_old, chain_new)):
+            if is_function(old):
+                targets[_code_key(old)] = new
+                # a function right under a module or class body must exist as a live object
+                if depth > 0 and not is_function(chain_old[depth - 1]):
+                    required.add(_code_key(old))
+    found: set = set()
+    for func in FUNCS_BY_FILE.get(filename, ()):
+        key = _code_key(func.__code__)
+        new = targets.get(key)
+        if new is not None:
+            if len(new.co_freevars) != len(func.__code__.co_freevars):
+                return False
+            func.__code__ = new
+            found.add(key)
+    return required <= found
+
+
+class PatchedLoader(importlib.machinery.SourceFileLoader):
+    def __init__(self, fullname, path, source):
+        super().__init__(fullname, path)
+        self._source = source
+
+    def get_data(self, path):
+        if path == self.path:
+            return self._source.encode("utf-8")
+        return super().get_data(path)
+
+    def get_code(self, fullname):
+        return compile(self._source, self.path, "exec", dont_inherit=True)
+
+
+class PatchedFinder:
+    def __init__(self, sources: dict[str, str]):
+        # module name -> (absolute filename, source)
+        self.by_module = {module_name(rel): (os.path.join(ROOT, rel), src) for rel, src in sources.items()}
+
+    def find_spec(self, fullname, path=None, target=None):
+        found = self.by_module.get(fullname)
+        if found is None:
+            return None
+        filename, source = found
+        loader = PatchedLoader(fullname, filename, source)
+        is_package = filename.endswith("__init__.py")
+        return importlib.util.spec_from_file_location(
+            fullname,
+            filename,
+            loader=loader,
+            submodule_search_locations=[os.path.dirname(filename)] if is_package else None,
+        )
+
+
+def reimport(sources: dict[str, str]):
+    """Drop every sqlglot and test module and import them again, patched sources first in line.
+    Returns (old modules, new modules, names that failed to import)."""
+    old = {n: m for n, m in sys.modules.items() if is_ours(n) and m is not None}
+    for n in old:
+        del sys.modules[n]
+    importlib.invalidate_caches()
+    sys.meta_path.insert(0, PatchedFinder(sources))
+    failed = []
+    for name in old:  # first-import order, as sys.modules remembers it
+        if name in sys.modules:
+            continue
+        try:
+            importlib.import_module(name)
+        except Exception as error:  # noqa: BLE001
+            failed.append(name)
+            log(f"re-import {name} failed: {error!r}")
+    new = {n: sys.modules[n] for n in old if n in sys.modules}
+    return old, new, failed
+
+
+def install_overlays(overlays: dict[str, str]) -> None:
+    if not overlays:
+        return
+    os.makedirs("/tmp/br-overlay", exist_ok=True)
+    redirect = {}
+    for i, (rel, text) in enumerate(overlays.items()):
+        target = f"/tmp/br-overlay/{os.getpid()}-{i}"
+        with open(target, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        redirect[os.path.realpath(os.path.join(ROOT, rel))] = target
+    real_open = io.open
+
+    def opener(file, *args, **kwargs):
+        if isinstance(file, (str, os.PathLike)):
+            try:
+                key = os.path.realpath(os.fspath(file))
+            except (TypeError, ValueError):
+                key = None
+            if key in redirect:
+                file = redirect[key]
+        return real_open(file, *args, **kwargs)
+
+    builtins.open = opener
+    io.open = opener
+
+
+# ------------------------------------------------------------------ running tests
+
+
+class _Timeout(BaseException):
+    pass
+
+
+def _alarm(signum, frame):
+    raise _Timeout()
+
+
+def run_tests(numbers, budget_seconds: float | None = None) -> tuple[set[int], dict[int, float]]:
+    """Run tests by number; return (failing numbers, CPU seconds per test)."""
+    signal.signal(signal.SIGALRM, _alarm)
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for n in sorted(numbers):
+        t = TESTS[n]
+        parts = t["id"].split("::")
+        groups.setdefault((module_name(t["file"]), parts[1] if len(parts) > 2 else ""), []).append(t)
+    failing: set[int] = set()
+    cpu: dict[int, float] = {}
+    for (modname, clsname), items in groups.items():
+        try:
+            module = importlib.import_module(modname)
+            cls = getattr(module, clsname)
+        except BaseException:  # noqa: BLE001 - import errors fail every test of the file
+            failing.update(t["number"] for t in items)
+            continue
+        if getattr(cls, "__unittest_skip__", False):
+            continue
+        try:
+            cls.setUpClass()
+        except BaseException:  # noqa: BLE001
+            failing.update(t["number"] for t in items)
+            try:
+                cls.doClassCleanups()
+            except BaseException:  # noqa: BLE001
+                pass
+            continue
+        for t in items:
+            method = t["id"].split("::")[-1]
+            result = unittest.TestResult()
+            started = time.process_time()
+            limit = max(5.0, 15.0 * t["seconds"])
+            signal.setitimer(signal.ITIMER_REAL, limit)
+            try:
+                cls(method).run(result)
+            except _Timeout:
+                result.errors.append((None, "timeout"))
+            except BaseException as error:  # noqa: BLE001
+                result.errors.append((None, repr(error)))
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            cpu[t["number"]] = time.process_time() - started
+            if result.failures or result.errors or result.unexpectedSuccesses:
+                failing.add(t["number"])
+        try:
+            cls.tearDownClass()
+        except BaseException:  # noqa: BLE001
+            pass
+        try:
+            cls.doClassCleanups()
+        except BaseException:  # noqa: BLE001
+            pass
+    return failing, cpu
