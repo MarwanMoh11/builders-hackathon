@@ -474,10 +474,12 @@ class _LazyExecutorTables(dict):
         super().__init__()
         self._dir = directory
         self._schema = schema
+        self._load_cpu = 0.0
 
     def __getitem__(self, table: str) -> Any:
         if super().__contains__(table):
             return super().__getitem__(table)
+        _t0 = time.process_time()
         from sqlglot.executor.table import Table
         import csv
         import gzip
@@ -504,6 +506,7 @@ class _LazyExecutorTables(dict):
                 )
         tbl = Table(columns=col_types, rows=rows)
         super().__setitem__(table, tbl)
+        self._load_cpu += time.process_time() - _t0
         return tbl
 
     def __contains__(self, key: object) -> bool:
@@ -1309,66 +1312,6 @@ def _patch_executor_module(
         pd_mod = None
         afe_fn = None
 
-        rem_outer_init = signal.getitimer(signal.ITIMER_REAL)[0]
-        outer_has_timer = rem_outer_init > 0.0
-        outer_deadline = time.monotonic() + (rem_outer_init if outer_has_timer else 45.0)
-        cpu_budget = ACTIVE_CPU_BUDGET_SEC
-        cpu_t0 = time.process_time()
-        q_weights = [
-            (qmeta_map.get(qi, {}).get("sec_opt", 0.05) + qmeta_map.get(qi, {}).get("sec_exec", 0.25))
-            for qi in indices
-        ]
-        total_w = sum(q_weights)
-        done_w = 0.0
-        q_done = 0
-        q_opt_w = [qmeta_map.get(qi, {}).get("sec_opt", 0.05) for qi in indices]
-        # Projection state: [last cpu mark, light cpu, light weight, heavy cpu, heavy weight, light n, heavy n]
-        # "light" = query that skipped the executor (cost ~ its optimize seconds), "heavy" = ran it
-        # (cost ~ optimize + execute seconds). The first query is warm-up (lazy imports) and is skipped.
-        pj = [cpu_t0, 0.0, 0.0, 0.0, 0.0, 0, 0]
-
-        def _check_cpu_budget(q_pos_done: int, was_heavy: bool, was_exec: bool) -> None:
-            # Stop as soon as the run is PROJECTED to cost more CPU than passing could save. Rates are
-            # measured here per baseline second, so the projection calibrates itself to this machine
-            # and to how many queries take the heavy path.
-            if cpu_budget is None or cpu_budget <= 0.0:
-                return
-            now = time.process_time()
-            if q_pos_done >= 1 and was_exec:  # parse-only queries carry no baseline weight
-                dc = now - pj[0]
-                if was_heavy:
-                    pj[3] += dc
-                    pj[4] += q_weights[q_pos_done]
-                    pj[6] += 1
-                else:
-                    pj[1] += dc
-                    pj[2] += q_opt_w[q_pos_done]
-                    pj[5] += 1
-            pj[0] = now
-            cpu_spent = now - cpu_t0
-            nxt = q_pos_done + 1
-            if nxt >= len(indices):
-                return
-            n_s = pj[5] + pj[6]
-            if n_s >= 4 and cpu_spent >= 0.3:
-                # Sunk CPU is sunk: stop only when the REMAINING work costs more than passing saves.
-                # Early rates still carry warm-up, so they are discounted until enough queries ran.
-                conf = 0.72 if n_s < 6 else (0.88 if n_s < 12 else 1.0)
-                f_h = pj[6] / n_s
-                r_h = (pj[3] / pj[4]) if pj[4] > 0.0 else 0.0
-                r_l = (pj[1] / pj[2]) if pj[2] > 0.0 else r_h
-                rem_opt = sum(q_opt_w[nxt:])
-                rem_full = sum(q_weights[nxt:])
-                if conf * ((1.0 - f_h) * r_l * rem_opt + f_h * r_h * rem_full) > cpu_budget:
-                    if _PROF:
-                        print(
-                            f"[d] proj-abort {tag} done={nxt}/{len(indices)} spent={cpu_spent:.3f} budget={cpu_budget:.2f} "
-                            f"light={pj[1]:.3f}cpu/{pj[2]:.3f}w n={pj[5]} heavy={pj[3]:.3f}cpu/{pj[4]:.3f}w n={pj[6]} "
-                            f"rem_opt={rem_opt:.2f} rem_full={rem_full:.2f}",
-                            file=sys.stderr,
-                        )
-                    _econ_abort_now()
-
         duckdb_only_tpc = (
             not tpch
             and (not helpers_patched or allow_duck_cache)
@@ -1401,6 +1344,74 @@ def _patch_executor_module(
             )
         )
         tpc_cache_ds = _load_tpc_cache().get("tpcds", {}) if tpc_opt_cache_ok else {}
+        use_exec_only_w = bool(tpc_cache_ds) and not planner_touched and not executor_init_touched
+
+        rem_outer_init = signal.getitimer(signal.ITIMER_REAL)[0]
+        outer_has_timer = rem_outer_init > 0.0
+        outer_deadline = time.monotonic() + (rem_outer_init if outer_has_timer else 45.0)
+        cpu_budget = ACTIVE_CPU_BUDGET_SEC
+        cpu_t0 = time.process_time()
+        q_weights = [
+            (
+                qmeta_map.get(qi, {}).get("sec_exec", 0.25)
+                if use_exec_only_w
+                else (qmeta_map.get(qi, {}).get("sec_opt", 0.05) + qmeta_map.get(qi, {}).get("sec_exec", 0.25))
+            )
+            for qi in indices
+        ]
+        total_w = sum(q_weights)
+        done_w = 0.0
+        q_done = 0
+        q_opt_w = [qmeta_map.get(qi, {}).get("sec_opt", 0.05) for qi in indices]
+        # Projection state: [last cpu mark, light cpu, light weight, heavy cpu, heavy weight, light n, heavy n, last csv cpu]
+        # "light" = query that skipped the executor (cost ~ its optimize seconds), "heavy" = ran it
+        # (cost ~ optimize + execute seconds). One-time CSV table loads are subtracted from per-query dc so
+        # early queries loading new tables never falsely inflate r_h and trigger premature proj-abort!
+        pj = [cpu_t0, 0.0, 0.0, 0.0, 0.0, 0, 0, getattr(tables, "_load_cpu", 0.0)]
+
+        def _check_cpu_budget(q_pos_done: int, was_heavy: bool, was_exec: bool) -> None:
+            # Stop as soon as the run is PROJECTED to cost more CPU than passing could save. Rates are
+            # measured here per baseline second, so the projection calibrates itself to this machine
+            # and to how many queries take the heavy path.
+            if cpu_budget is None or cpu_budget <= 0.0:
+                return
+            now = time.process_time()
+            cur_csv = getattr(tables, "_load_cpu", 0.0)
+            if q_pos_done >= 1 and was_exec:  # parse-only queries carry no baseline weight
+                dc = max(0.0, (now - pj[0]) - (cur_csv - pj[7]))
+                if was_heavy:
+                    pj[3] += dc
+                    pj[4] += q_weights[q_pos_done]
+                    pj[6] += 1
+                else:
+                    pj[1] += dc
+                    pj[2] += q_opt_w[q_pos_done]
+                    pj[5] += 1
+            pj[0] = now
+            pj[7] = cur_csv
+            cpu_spent = now - cpu_t0
+            nxt = q_pos_done + 1
+            if nxt >= len(indices):
+                return
+            n_s = pj[5] + pj[6]
+            if n_s >= 6 and cpu_spent >= 0.6:
+                # Sunk CPU is sunk: stop only when the REMAINING work costs more than passing saves.
+                # Early rates still carry warm-up, so they are discounted until enough queries ran.
+                conf = 0.50 if n_s < 8 else (0.75 if n_s < 16 else 1.0)
+                f_h = pj[6] / n_s
+                r_h = (pj[3] / pj[4]) if pj[4] > 0.0 else 0.0
+                r_l = (pj[1] / pj[2]) if pj[2] > 0.0 else r_h
+                rem_opt = sum(q_opt_w[nxt:])
+                rem_full = sum(q_weights[nxt:])
+                if conf * ((1.0 - f_h) * r_l * rem_opt + f_h * r_h * rem_full) > cpu_budget:
+                    if _PROF:
+                        print(
+                            f"[d] proj-abort {tag} done={nxt}/{len(indices)} spent={cpu_spent:.3f} budget={cpu_budget:.2f} "
+                            f"light={pj[1]:.3f}cpu/{pj[2]:.3f}w n={pj[5]} heavy={pj[3]:.3f}cpu/{pj[4]:.3f}w n={pj[6]} "
+                            f"rem_opt={rem_opt:.2f} rem_full={rem_full:.2f}",
+                            file=sys.stderr,
+                        )
+                    _econ_abort_now()
 
         ran_heavy = False
         q_exec = True
@@ -2535,7 +2546,7 @@ def _execute_commit_verification(
     # the buckets keep an early overshoot from condemning hundreds of cheap tests.
     cal_act = [0.0, 0.0, 0.0, 0.0]
     cal_est = [0.0, 0.0, 0.0, 0.0]
-    _CAL_PRIOR = (1.35, 1.15, 1.0, 1.05)
+    _CAL_PRIOR = (1.50, 1.25, 1.0, 1.10)
     _CAL_W0 = (250.0, 250.0, 1e12, 120.0)
 
     def _rho(c: int) -> float:
@@ -2853,7 +2864,7 @@ def _execute_commit_verification(
         t_limit_sec: float | None = None
         if d_t >= 300 or e_t >= 300.0:
             if is_proj:
-                t_budget_sec = max(0.5, 0.9 * s_t / 1000.0)  # the per-query projection decides
+                t_budget_sec = max(0.5, 0.98 * s_t / 1000.0)  # the per-query projection decides
                 t_limit_sec = max(2.0, 2.0 * s_t / 1000.0)  # backstop only
             else:
                 # Never above what passing can save; the floor absorbs one-off lazy imports (pandas/duckdb).
