@@ -349,16 +349,19 @@ def _build_tpc_tables(sg_root: Path, th) -> tuple[int, int]:
 def _build_duckdb_files_subproc(sg_root: Path) -> None:
     """Build persistent read-only DuckDB databases in an isolated subprocess."""
     code = f"""
-import sys
+import pickle, sys
 from pathlib import Path
 sys.path.insert(0, {str(sg_root)!r})
 import duckdb
 import tests.helpers as th
+from sqlglot import transpile
 
 sg_root = Path({str(sg_root)!r})
-for db_name, sub, schema in [
-    ("/app/duckdb_tpcds.db", "tests/fixtures/optimizer/tpc-ds/", th.TPCDS_SCHEMA),
-    ("/app/duckdb_tpch.db", "tests/fixtures/optimizer/tpc-h/", th.TPCH_SCHEMA),
+duck_res_dir = Path("/app/tpc_duck")
+duck_res_dir.mkdir(parents=True, exist_ok=True)
+for db_name, tag, sub, schema, fix_rel in [
+    ("/app/duckdb_tpcds.db", "tpcds", "tests/fixtures/optimizer/tpc-ds/", th.TPCDS_SCHEMA, "optimizer/tpc-ds/tpc-ds.sql"),
+    ("/app/duckdb_tpch.db", "tpch", "tests/fixtures/optimizer/tpc-h/", th.TPCH_SCHEMA, "optimizer/tpc-h/tpc-h.sql"),
 ]:
     p = Path(db_name)
     if p.exists():
@@ -372,6 +375,16 @@ for db_name, sub, schema in [
                     f"CREATE TABLE {{table}} AS SELECT * FROM READ_CSV('{{fn}}', delim='|', header=True, columns={{col_types}})"
                 )
         conn.execute("CHECKPOINT")
+        for qi, (qargs, qsql, _) in enumerate(th.load_sql_fixture_pairs(fix_rel), start=1):
+            if tag == "tpcds" and not qargs.get("execute"):
+                continue
+            dsql = transpile(qsql, write="duckdb")[0]
+            cur = conn.execute(dsql)
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+            (duck_res_dir / f"{{tag}}_{{qi}}.pkl").write_bytes(
+                pickle.dumps((cols, rows), protocol=pickle.HIGHEST_PROTOCOL)
+            )
     finally:
         conn.close()
 
