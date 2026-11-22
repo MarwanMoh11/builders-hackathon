@@ -70,6 +70,10 @@ class CandidateEngine:
             if num is not None:
                 self.map_tid_to_num[mtid] = num
                 self.num_to_map_tid[num] = mtid
+        self._identity_map: bool = (
+            len(self.map_tid_to_num) == len(map_test_ids)
+            and all(k == v for k, v in self.map_tid_to_num.items())
+        )
 
         self.file_to_test_nums: dict[str, list[int]] = {}
         for t in tests_list:
@@ -731,6 +735,8 @@ class CandidateEngine:
         return txt
 
     def _to_rnums(self, mtids: list[int] | set[int]) -> set[int]:
+        if self._identity_map:
+            return set(mtids)
         m = self.map_tid_to_num
         out: set[int] = set()
         for t in mtids:
@@ -1338,11 +1344,15 @@ class CandidateEngine:
                 if need_meta_expand:
                     d_hits = self._dialect_hits_for_owners(owners)
                     if attr == "NUMERIC_ESCAPES":
-                        gen_lines = {1723, 3279, 3283} if has_keyset_change else {1723, 3283}
-                        meta_line_specs = [
-                            ("sqlglot/tokenizer_core.py", {1219, 1240, 1250, 1362, 1363}),
-                            ("sqlglot/generator.py", gen_lines),
-                        ]
+                        if has_keyset_change or unit.dict_keys is None:
+                            meta_line_specs = [
+                                ("sqlglot/tokenizer_core.py", {1219, 1240, 1250, 1362, 1363}),
+                                ("sqlglot/generator.py", {1723, 3279, 3283}),
+                            ]
+                        else:
+                            meta_line_specs = [
+                                ("sqlglot/tokenizer_core.py", {1219, 1240, 1250, 1363}),
+                            ]
                     elif attr == "NUMERIC_LITERALS":
                         meta_line_specs = [("sqlglot/tokenizer_core.py", {1047})]
                     elif attr == "CREATABLE_KIND_MAPPING":
@@ -1485,6 +1495,49 @@ class CandidateEngine:
                         spec = ("dialect_readers", (subs, base_cls, readers))
                         for rnum in hits:
                             if rnum in has_sub:
+                                deferred_subtests.setdefault(rnum, []).append(spec)
+                        return
+
+                cls_meta_specs: list[tuple[str, set[int]]] | None = None
+                if attr in ("TIME_MAPPING", "FORMAT_MAPPING", "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING"):
+                    ml_by_file_c: dict[str, set[int]] = {"sqlglot/time.py": set(range(1, 120))}
+                    for ta in (
+                        "TIME_MAPPING", "FORMAT_MAPPING", "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING",
+                        "TIME_TRIE", "FORMAT_TRIE", "INVERSE_TIME_TRIE", "INVERSE_FORMAT_TRIE",
+                    ):
+                        for rf, rl in self.maps["attr_readers"].get(ta, []):
+                            if rl not in self._get_non_runtime_info(rf)[0]:
+                                ml_by_file_c.setdefault(rf, set()).add(rl)
+                    cls_meta_specs = list(ml_by_file_c.items())
+                elif attr == "NUMERIC_ESCAPES":
+                    cls_meta_specs = [
+                        ("sqlglot/tokenizer_core.py", {1219, 1240, 1250, 1362, 1363}),
+                        ("sqlglot/generator.py", {1723, 3279, 3283}),
+                    ]
+                elif attr == "NUMERIC_LITERALS":
+                    cls_meta_specs = [("sqlglot/tokenizer_core.py", {1047})]
+                elif attr == "CREATABLE_KIND_MAPPING":
+                    cls_meta_specs = [
+                        ("sqlglot/parser.py", {2557, 2848}),
+                        ("sqlglot/generator.py", {1403, 1932}),
+                    ]
+
+                if cls_meta_specs is not None:
+                    rt_hits_c: set[int] = set()
+                    for lf, lset in cls_meta_specs:
+                        rt_hits_c.update(self._tests_covering_lines(lf, lset))
+                    inter_cm = dialect_hits & rt_hits_c
+                    if inter_cm:
+                        hits_cm = inter_cm | non_rt_extra_c | self._tests_covering_lines(rel, unit.old_lines)
+                        if attr in ("TIME_MAPPING", "FORMAT_MAPPING", "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING"):
+                            hits_cm.update(self.file_to_test_nums.get("tests/test_time.py", []))
+                        candidates.update(hits_cm)
+                        spec = ("dict_meta_lines", (subs, cls_meta_specs))
+                        for rnum in hits_cm:
+                            if rnum in non_rt_extra_c:
+                                for tag in has_sub.get(rnum, ()):
+                                    self._add_subtest_filter(subtest_filters, rnum, tag, None)
+                            elif rnum in has_sub:
                                 deferred_subtests.setdefault(rnum, []).append(spec)
                         return
 
@@ -1715,7 +1768,7 @@ class CandidateEngine:
                         )
                         or (
                             (not unit.class_name or unit.is_cached_func or unit.has_nested_func)
-                            and self._is_func_called_at_import(rel, unit.symbol_name or "")
+                            and any(self._is_func_called_at_import(rel, meth_name)[:2])
                         )
                     ):
                         all_hot_func = False
