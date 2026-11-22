@@ -4930,25 +4930,10 @@ def verify_batch(
             pure_tail_map[tail_cid] = orig_cid
             py_plans_all.append(tail_p)
 
-    # Tier 2: Pure-Python /sqlglot (Probe D2: skip ONLY the 10 compiled optimizer/* commits)
+    # Tier 2: Pure-Python /sqlglot (compiled-file commits + pure-only tails; eager forks + Pure-Warm Zygote)
     if py_plans_all:
-        _opt10 = {
-            "sqlglot/optimizer/scope.py", "sqlglot/optimizer/resolver.py",
-            "sqlglot/optimizer/isolate_table_selects.py", "sqlglot/optimizer/normalize_identifiers.py",
-            "sqlglot/optimizer/qualify.py", "sqlglot/optimizer/qualify_tables.py",
-            "sqlglot/optimizer/qualify_columns.py", "sqlglot/optimizer/simplify.py",
-            "sqlglot/optimizer/annotate_types.py", "sqlglot/optimizer/canonicalize_internal_names.py",
-        }
-        _d2_keep = []
-        for _pp in py_plans_all:
-            _t = set(_pp.patched_files) | set(_pp.deleted_files)
-            if not _pp.commit.startswith("__pure_tail__") and any(r in _opt10 for r in _t):
-                results[_pp.commit] = _safe_fallback_tests(_pp)
-            else:
-                _d2_keep.append(_pp)
-        if _d2_keep:
-            py_eager, py_lazy, py_hot, py_fix = _split_plans(_d2_keep)
-            _run_tier(sqlglot_root, py_eager, py_lazy, py_hot, py_fix)
+        py_eager, py_lazy, py_hot, py_fix = _split_plans(py_plans_all)
+        _run_tier(sqlglot_root, py_eager, py_lazy, py_hot, py_fix)
 
     for tail_cid, orig_cid in pure_tail_map.items():
         t_fail = results.pop(tail_cid, [])
