@@ -4930,10 +4930,10 @@ def verify_batch(
             pure_tail_map[tail_cid] = orig_cid
             py_plans_all.append(tail_p)
 
-    # Tier 2: Pure-Python /sqlglot (compiled-file commits + pure-only tails; eager forks + Pure-Warm Zygote)
+    # Tier 2: Pure-Python /sqlglot (diagnostic Probe C: report unverified to measure Pure-Python vs C-104 CPU split)
     if py_plans_all:
-        py_eager, py_lazy, py_hot, py_fix = _split_plans(py_plans_all)
-        _run_tier(sqlglot_root, py_eager, py_lazy, py_hot, py_fix)
+        for _pp in py_plans_all:
+            results[_pp.commit] = _safe_fallback_tests(_pp)
 
     for tail_cid, orig_cid in pure_tail_map.items():
         t_fail = results.pop(tail_cid, [])
