@@ -32,6 +32,12 @@ COPY build_sqlglotc.py /tmp/build_sqlglotc.py
 RUN python /tmp/build_sqlglotc.py /sqlglot-c full && \
     rm -f /tmp/build_sqlglotc.py
 
+COPY _fast_join_c.c /tmp/_fast_join_c.c
+RUN PY_INC=$(python -c "import sysconfig; print(sysconfig.get_path('include'))") && \
+    EXT=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX') or '.so')") && \
+    clang -O3 -fPIC -shared -I"$PY_INC" /tmp/_fast_join_c.c -o "/opt/_fast_join_c${EXT}" && \
+    rm -f /tmp/_fast_join_c.c
+
 # Stage 2: clean runtime image (no clang, no mypy)
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 
@@ -57,6 +63,7 @@ COPY --from=builder /sqlglot /sqlglot
 COPY --from=builder /sqlglot-c /sqlglot-c
 
 WORKDIR /app
+COPY --from=builder /opt/_fast_join_c*.so /app/
 COPY packer.py patch_analyzer.py candidate_engine.py runner.py selector.py build_caches.py /app/
 COPY maps /app/maps
 

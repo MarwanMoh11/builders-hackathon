@@ -1470,6 +1470,11 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
             env_untouched = "sqlglot/executor/env.py" not in all_touched
             pygen_untouched = "sqlglot/generators/python.py" not in all_touched
             from sqlglot.executor.table import TableIter as _TableIter
+            try:
+                import _fast_join_c as _FJC
+            except Exception:
+                _FJC = None
+            _row_fn_cache: dict[Any, Any] = {}
 
             _PURE_BOOL_CALLS = frozenset({
                 "AND", "OR", "NOT", "EQ", "NEQ", "LT", "LTE", "GT", "GTE",
@@ -1500,11 +1505,15 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                 Strictly maps ONLY tables in `ctx_tables` (never outer correlated scope readers!)."""
                 if not src or not (env_untouched and pygen_untouched):
                     return None
+                col_map = {tname: tbl.reader.columns for tname, tbl in ctx_tables.items()}
+                cache_key = (src, mode, tuple((tn, tuple(cm.items())) for tn, cm in col_map.items()))
+                if cache_key in _row_fn_cache:
+                    return _row_fn_cache[cache_key]
                 try:
                     tree = ast.parse(src, mode="eval")
                 except Exception:
+                    _row_fn_cache[cache_key] = None
                     return None
-                col_map = {tname: tbl.reader.columns for tname, tbl in ctx_tables.items()}
 
                 class _ScopeToRow(ast.NodeTransformer):
                     def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
@@ -1529,6 +1538,7 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                 tree = _ScopeToRow().visit(tree)
                 for n in ast.walk(tree):
                     if isinstance(n, ast.Name) and n.id == "scope":
+                        _row_fn_cache[cache_key] = None
                         return None
 
                 if mode == "tuple_idxs" and isinstance(tree.body, ast.Tuple):
@@ -1546,7 +1556,9 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                             idxs = []
                             break
                     if idxs:
-                        return ("idxs", tuple(idxs))
+                        res_idx = ("idxs", tuple(idxs))
+                        _row_fn_cache[cache_key] = res_idx
+                        return res_idx
 
                 fs_env: dict[str, Any] = {}
                 if mode in ("filter", "join_cond"):
@@ -1682,8 +1694,11 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                 try:
                     code_obj = compile(lam_expr, "<row>", "eval", optimize=2)
                     eval_env = {**env_dict, **fs_env} if fs_env else env_dict
-                    return eval(code_obj, eval_env)
+                    res_fn = eval(code_obj, eval_env)
+                    _row_fn_cache[cache_key] = res_fn
+                    return res_fn
                 except Exception:
+                    _row_fn_cache[cache_key] = None
                     return None
 
             if "PythonExecutor.generate" not in py_changed:
@@ -1732,6 +1747,12 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                     c_call = callable(condition)
                     p_call = callable(projections) and len(step.projections) == len(sink.columns)
                     if (not condition or c_call) and (not projections or p_call):
+                        if not condition and projections and _FJC is not None and (not has_lim or int(limit) > 0):
+                            p_idxs = _compile_row_fn(getattr(projections, "_blast_src", None), context.tables, self.env, "tuple_idxs")
+                            if isinstance(p_idxs, tuple) and p_idxs[0] == "idxs":
+                                src_rows = rows_in if not has_lim else rows_in[:int(limit)]
+                                sink.rows = _FJC.project_idxs(src_rows, p_idxs[1])
+                                return sink
                         cond_r = _compile_row_fn(getattr(condition, "_blast_src", None), context.tables, self.env, "filter") if condition else None
                         proj_r = _compile_row_fn(getattr(projections, "_blast_src", None), context.tables, self.env, "val") if projections else None
                         if (not condition or cond_r is not None) and (not projections or proj_r is not None):
@@ -1963,6 +1984,11 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                     ):
                         j_idxs = j_fast[1]
                         s_idxs = s_fast[1]
+                        if _FJC is not None and condition is None and not need_matched:
+                            if klen == 1:
+                                return _Tbl(out_cols, rows=_FJC.inner_hash_join_1(s_rows, j_rows, s_idxs[0], j_idxs[0]))
+                            if klen == 2:
+                                return _Tbl(out_cols, rows=_FJC.inner_hash_join_2(s_rows, j_rows, s_idxs[0], s_idxs[1], j_idxs[0], j_idxs[1]))
                         if klen == 1:
                             use_scalar_key = True
                             ji0 = j_idxs[0]
@@ -3956,10 +3982,13 @@ def _execute_commit_verification(
     def _priority(t: int) -> tuple[int, int, int]:
         e = est_cpu[t]
         r = dur_by_num[t]
-        if num_to_test[t]["id"].endswith("::test_lazy_load"):
+        tid = num_to_test[t]["id"]
+        if tid.endswith("::test_lazy_load"):
             return (-3, 0, e)
         if not confirmed_fail and t in home_probe_set:
             return (-2, -r, e)
+        if tid.endswith(("::test_tpcds", "::test_tpch")):
+            return (-1, -r, e)
         if e <= 800:
             bucket = 0
         elif r >= 3 * e:

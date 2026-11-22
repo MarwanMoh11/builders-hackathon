@@ -1594,31 +1594,6 @@ class CandidateEngine:
                                 non_rt_extra_c.update(self._to_rnums(self.maps["file_cov"].get(rfile, [])))
                                 non_rt_extra_c.update(self._tests_for_broken_import(rfile))
 
-                has_scoped_cb_ref = any(
-                    attr in self._get_non_runtime_info(rf)[1]
-                    for rf in (rev_cl_c | core_meta_files)
-                )
-                can_intersect = (
-                    attr != "*"
-                    and attr not in self.dialect_meta_attrs
-                    and bool(readers)
-                    and not has_non_rt_reader
-                    and not has_scoped_cb_ref
-                )
-                if can_intersect:
-                    reader_hits: set[int] = set()
-                    for rfile, rline in readers:
-                        reader_hits.update(self._tests_covering_lines(rfile, {rline}))
-                    inter = dialect_hits & reader_hits
-                    if inter:
-                        hits = inter | self._tests_covering_lines(rel, unit.old_lines)
-                        candidates.update(hits)
-                        spec = ("dialect_readers", (subs, base_cls, readers))
-                        for rnum in hits:
-                            if rnum in has_sub:
-                                deferred_subtests.setdefault(rnum, []).append(spec)
-                        return
-
                 cls_meta_specs: list[tuple[str, set[int]]] | None = None
                 if attr in ("TIME_MAPPING", "FORMAT_MAPPING", "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING"):
                     ml_by_file_c: dict[str, set[int]] = {"sqlglot/time.py": set(range(1, 120))}
@@ -1655,6 +1630,44 @@ class CandidateEngine:
                         ("sqlglot/parsers/spark.py", {64}),
                         ("sqlglot/parsers/teradata.py", {191}),
                     ]
+                elif attr == "HEREDOC_TAG_IS_IDENTIFIER":
+                    cls_meta_specs = [("sqlglot/tokenizer_core.py", {1126, 1131})]
+                elif attr == "NESTED_COMMENTS":
+                    cls_meta_specs = [("sqlglot/tokenizer_core.py", {927, 939})]
+                elif attr == "DASH_COMMENT_REQUIRES_BOUNDARY":
+                    cls_meta_specs = [("sqlglot/tokenizer_core.py", {908})]
+                elif attr == "COMMENTS_TERMINATE_AT_NEWLINE_ONLY":
+                    cls_meta_specs = [("sqlglot/tokenizer_core.py", {950})]
+                elif attr == "NUMBERS_CAN_HAVE_DECIMALS":
+                    cls_meta_specs = [("sqlglot/tokenizer_core.py", {1009})]
+                elif attr == "DROP_UNKNOWN_ESCAPES":
+                    cls_meta_specs = [
+                        ("sqlglot/tokenizer_core.py", {1388}),
+                        ("sqlglot/generator.py", {1724}),
+                    ]
+                elif attr == "STRING_ESCAPES_ALLOWED_IN_RAW_STRINGS":
+                    cls_meta_specs = [("sqlglot/tokenizer_core.py", {1405})]
+                elif attr == "BYTE_STRING_IS_BYTES_TYPE":
+                    cls_meta_specs = [
+                        ("sqlglot/tokenizer_core.py", {1155, 1354, 1393}),
+                        ("sqlglot/parser.py", {1263}),
+                        ("sqlglot/generator.py", {1734, 1738}),
+                    ]
+                elif attr == "TOKENS_PRECEDING_HINT":
+                    cls_meta_specs = [("sqlglot/tokenizer_core.py", {963})]
+                elif attr == "HEREDOC_STRING_ALTERNATIVE":
+                    cls_meta_specs = [("sqlglot/tokenizer_core.py", {1138})]
+                elif attr == "NUMBERS_CAN_BE_UNDERSCORE_SEPARATED":
+                    cls_meta_specs = [("sqlglot/tokenizer_core.py", {1024, 1033})]
+                elif attr == "IDENTIFIERS_CAN_START_WITH_DIGIT":
+                    cls_meta_specs = [
+                        ("sqlglot/tokenizer_core.py", {1051}),
+                        ("sqlglot/generator.py", {2182}),
+                    ]
+                elif attr == "LONE_SURROGATE_REPLACEMENT":
+                    cls_meta_specs = [("sqlglot/tokenizer_core.py", {1267, 1270})]
+                elif attr == "NUMERIC_ESCAPES_ARE_BYTES":
+                    cls_meta_specs = [("sqlglot/tokenizer_core.py", {1219, 1240, 1250, 1362, 1363})]
 
                 if cls_meta_specs is not None:
                     rt_hits_c: set[int] = set()
@@ -1672,6 +1685,31 @@ class CandidateEngine:
                                 for tag in has_sub.get(rnum, ()):
                                     self._add_subtest_filter(subtest_filters, rnum, tag, None)
                             elif rnum in has_sub:
+                                deferred_subtests.setdefault(rnum, []).append(spec)
+                        return
+
+                has_scoped_cb_ref = any(
+                    attr in self._get_non_runtime_info(rf)[1]
+                    for rf in (rev_cl_c | core_meta_files)
+                )
+                can_intersect = (
+                    attr != "*"
+                    and attr not in self.dialect_meta_attrs
+                    and bool(readers)
+                    and not has_non_rt_reader
+                    and not has_scoped_cb_ref
+                )
+                if can_intersect:
+                    reader_hits: set[int] = set()
+                    for rfile, rline in readers:
+                        reader_hits.update(self._tests_covering_lines(rfile, {rline}))
+                    inter = dialect_hits & reader_hits
+                    if inter:
+                        hits = inter | self._tests_covering_lines(rel, unit.old_lines)
+                        candidates.update(hits)
+                        spec = ("dialect_readers", (subs, base_cls, readers))
+                        for rnum in hits:
+                            if rnum in has_sub:
                                 deferred_subtests.setdefault(rnum, []).append(spec)
                         return
 
