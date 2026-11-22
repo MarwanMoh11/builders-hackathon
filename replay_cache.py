@@ -195,7 +195,7 @@ class ReplayScope:
     __slots__ = (
         "dirty_dials", "dirty_pars", "dirty_gens", "dirty_opt_dials", "dirty_typing_dials",
         "dirty_files", "is_gen_only", "fine_tokens", "is_opt_only", "is_tok_only",
-        "opt_dirty_files", "opt_dirty_rules", "opt_func_only",
+        "opt_dirty_files", "opt_dirty_rules", "opt_func_only", "has_transforms",
     )
 
     def __init__(
@@ -213,6 +213,7 @@ class ReplayScope:
         opt_dirty_rules: frozenset[int] = frozenset(),
         opt_func_only: bool = False,
         dirty_typing_dials: frozenset[str] = frozenset(),
+        has_transforms: bool = False,
     ) -> None:
         self.dirty_dials = dirty_dials
         self.dirty_pars = dirty_pars
@@ -227,6 +228,7 @@ class ReplayScope:
         self.opt_dirty_files = opt_dirty_files
         self.opt_dirty_rules = opt_dirty_rules
         self.opt_func_only = opt_func_only
+        self.has_transforms = has_transforms
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +676,7 @@ def classify_replay_scope(
     core_gen_file: bool = False
     core_par_file: bool = False
     core_tok_files: set[str] = set()
+    transforms_file: bool = False
 
     for rel in commit_plan.patched_files:
         if rel.startswith("tests/") and rel not in ("tests/helpers.py", "tests/dialects/test_dialect.py"):
@@ -699,6 +702,8 @@ def classify_replay_scope(
                 dial_files.add(rel)
         elif rel.startswith("sqlglot/typing/") and rel.endswith(".py"):
             typing_files.add(rel)
+        elif rel == "sqlglot/transforms.py":
+            transforms_file = True
         elif rel == "sqlglot/generator.py":
             if not all(
                 u.class_name == "Generator"
@@ -743,6 +748,7 @@ def classify_replay_scope(
     if not (
         gen_files or par_files or dial_files or dial_tok_only_files
         or typing_files or opt_files or core_gen_file or core_par_file or core_tok_files
+        or transforms_file
     ):
         return None
 
@@ -760,7 +766,7 @@ def classify_replay_scope(
     dirty_files: set[str] = set(commit_plan.patched_files)
     opt_dirty_rules: set[int] = set()
 
-    # 0. Core generator.py / parser.py / tokens.py / tokenizer_core.py
+    # 0. Core generator.py / parser.py / tokens.py / tokenizer_core.py / transforms.py
     if core_gen_file:
         dirty_gens.update(all_gens)
     if core_par_file:
@@ -769,6 +775,70 @@ def classify_replay_scope(
         dirty_pars.add("Tokenizer")
         for d in all_dials:
             dirty_pars.add(f"TOK:{d}")
+    tx_opt_files: set[str] = set()
+    if transforms_file:
+        # sqlglot/generator.py lazily imports sqlglot.transforms inside Generator, and 21 sqlglot/generators/*.py
+        # import sqlglot.transforms -> marking "Generator" and all dialects dirty guarantees fine_tokens/dirty_mids
+        # are ALWAYS consulted even for tests that call sqlglot.transforms.* without calling .sql()!
+        dirty_files.add("sqlglot/transforms.py")
+        dirty_gens.add("Generator")
+        dirty_dials.update(all_dials)
+        tx_gen_q: list[str] = []
+        tx_seen_g: set[str] = set()
+        for imp_f in rev_imp.get("sqlglot/transforms.py", ()):
+            if imp_f == "sqlglot/generator.py":
+                dirty_files.add(imp_f)
+                dirty_gens.update(all_gens)
+            elif imp_f in ("sqlglot/parser.py", "sqlglot/parsers/base.py"):
+                dirty_files.add(imp_f)
+                dirty_pars.update(all_pars)
+            elif imp_f == "sqlglot/dialects/dialect.py":
+                dirty_files.add(imp_f)
+                dirty_dials.update(all_dials)
+            elif imp_f.startswith("sqlglot/generators/") and imp_f != "sqlglot/generators/__init__.py":
+                if imp_f not in tx_seen_g:
+                    tx_seen_g.add(imp_f)
+                    tx_gen_q.append(imp_f)
+            elif imp_f.startswith("sqlglot/parsers/") and imp_f != "sqlglot/parsers/__init__.py":
+                dirty_files.add(imp_f)
+                for cname in file_classes.get(imp_f, ()):
+                    if cname in all_pars:
+                        dirty_pars.add(cname)
+            elif imp_f.startswith("sqlglot/dialects/") and imp_f != "sqlglot/dialects/__init__.py":
+                dirty_files.add(imp_f)
+                for cname in file_classes.get(imp_f, ()):
+                    if cname in all_dials:
+                        dirty_dials.add(cname)
+            elif imp_f.startswith("sqlglot/optimizer/") and imp_f != "sqlglot/optimizer/__init__.py":
+                if imp_f not in OPT_FILE_RULES:
+                    return None
+                dirty_files.add(imp_f)
+                tx_opt_files.add(imp_f)
+            elif imp_f.startswith("tests/"):
+                continue
+            else:
+                return None
+        while tx_gen_q:
+            f = tx_gen_q.pop()
+            dirty_files.add(f)
+            for cname in file_classes.get(f, ()):
+                if cname in all_gens:
+                    dirty_gens.add(cname)
+            for imp_f in rev_imp.get(f, ()):
+                if imp_f.startswith("sqlglot/generators/") and imp_f != "sqlglot/generators/__init__.py":
+                    if imp_f not in tx_seen_g:
+                        tx_seen_g.add(imp_f)
+                        tx_gen_q.append(imp_f)
+                elif imp_f.startswith("sqlglot/dialects/") or imp_f == "sqlglot/executor/python.py" or imp_f.startswith("tests/"):
+                    continue
+                else:
+                    return None
+        if tx_opt_files:
+            for f in tx_opt_files:
+                opt_dirty_rules.update(OPT_FILE_RULES.get(f, _ALL_OPT_RULES))
+            dirty_opt_dials.update(all_dials)
+            if tx_opt_files & _OPT_TYPING_CALLER_FILES:
+                dirty_typing_dials.update(all_dials)
 
     # 1. Generator files
     q = list(gen_files)
@@ -1022,6 +1092,7 @@ def classify_replay_scope(
             gen_files | par_files | dial_files | dial_tok_only_files | typing_files | opt_files
             | ({"sqlglot/generator.py"} if core_gen_file else set())
             | ({"sqlglot/parser.py"} if core_par_file else set())
+            | ({"sqlglot/transforms.py"} if transforms_file else set())
         )
         for rel in fine_src_files:
             ana = commit_plan.py_analyses.get(rel)
@@ -1030,6 +1101,9 @@ def classify_replay_scope(
                 break
             mod_name = rel.removesuffix("/__init__.py").removesuffix(".py").replace("/", ".")
             for u in ana.units:
+                if rel == "sqlglot/transforms.py" and u.kind != "func_body":
+                    all_fine_ok = False
+                    break
                 if u.kind == "func_body":
                     cname = u.class_name
                     mname = u.symbol_name.rsplit(".", 1)[-1] if u.symbol_name else None
@@ -1207,7 +1281,7 @@ def classify_replay_scope(
         fine_tokens=frozenset(fine_tokens) if fine_tokens is not None else None,
         is_opt_only=is_opt_only,
         is_tok_only=is_tok_only,
-        opt_dirty_files=frozenset(opt_files),
+        opt_dirty_files=frozenset(opt_files | tx_opt_files),
         opt_dirty_rules=frozenset(opt_dirty_rules),
         opt_func_only=opt_func_only,
         dirty_typing_dials=frozenset(dirty_typing_dials),
@@ -1231,42 +1305,56 @@ def _write_ast_table(asts: list[Any], ast_path: Path) -> list[tuple[int, int]]:
     return offsets
 
 
+_AST_MMAP_CACHE: dict[str, tuple[int, mmap.mmap] | None] = {}
+
+
+def _get_ast_mmap(ast_path: Path) -> mmap.mmap | None:
+    key = str(ast_path)
+    entry = _AST_MMAP_CACHE.get(key)
+    if entry is not None:
+        return entry[1]
+    if key in _AST_MMAP_CACHE:
+        return None
+    if not ast_path.is_file():
+        _AST_MMAP_CACHE[key] = None
+        return None
+    try:
+        if ast_path.stat().st_size == 0:
+            _AST_MMAP_CACHE[key] = None
+            return None
+        fd = os.open(ast_path, os.O_RDONLY)
+        try:
+            mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+        except Exception:
+            os.close(fd)
+            raise
+        _AST_MMAP_CACHE[key] = (fd, mm)
+        return mm
+    except Exception:
+        _AST_MMAP_CACHE[key] = None
+        return None
+
+
 class _MmapAstStore:
-    __slots__ = ("_path", "_offsets", "_fd", "_mm")
+    __slots__ = ("_path", "_offsets", "_mm")
 
     def __init__(self, path: Path, offsets: list[tuple[int, int]]) -> None:
         self._path = path
         self._offsets = offsets
-        self._fd: int = -1
         self._mm: mmap.mmap | None = None
 
     def get_expr(self, ast_idx: int, exp_mod: Any) -> Any:
         mm = self._mm
         if mm is None:
-            fd = os.open(self._path, os.O_RDONLY)
-            try:
-                mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
-            except Exception:
-                os.close(fd)
-                raise
-            self._fd = fd
+            mm = _get_ast_mmap(self._path)
+            if mm is None:
+                raise OSError(f"Failed to mmap AST file: {self._path}")
             self._mm = mm
         off, ln = self._offsets[ast_idx]
         return unpack_expr(marshal.loads(mm[off : off + ln]), exp_mod)
 
     def close(self) -> None:
-        if self._mm is not None:
-            try:
-                self._mm.close()
-            except Exception:
-                pass
-            self._mm = None
-        if self._fd >= 0:
-            try:
-                os.close(self._fd)
-            except Exception:
-                pass
-            self._fd = -1
+        self._mm = None
 
 
 _RAW_VAL_IDX: dict[str, tuple[list, dict, dict, list[tuple[int, int]]] | None] = {}
@@ -1365,7 +1453,7 @@ def preload_all_replay_indices(
     opt_names: set[str] | None = None,
     need_ftoc: bool = True,
 ) -> None:
-    """Preload uncompressed .idx & .ftoc marshal tables ONCE in parent before os.fork() (0ms in children via CoW!)."""
+    """Preload uncompressed .idx, .ftoc, and read-only .ast/.fdat mmaps ONCE in parent before os.fork()."""
     if VAL_REPLAY_DIR.is_dir():
         for p in VAL_REPLAY_DIR.glob("*.idx"):
             stem = p.stem
@@ -1376,6 +1464,8 @@ def preload_all_replay_indices(
                     _RAW_VAL_IDX[stem] = marshal.loads(p.read_bytes())
                 except Exception:
                     _RAW_VAL_IDX[stem] = None
+            if stem != "val_methods":
+                _get_ast_mmap(VAL_REPLAY_DIR / f"{stem}.ast")
         if need_ftoc:
             for p in VAL_REPLAY_DIR.glob("*.ftoc"):
                 stem = p.stem
@@ -1386,6 +1476,7 @@ def preload_all_replay_indices(
                         _RAW_VAL_FTOC[stem] = marshal.loads(p.read_bytes())
                     except Exception:
                         _RAW_VAL_FTOC[stem] = None
+                _get_fdat_mmap(VAL_REPLAY_DIR / f"{stem}.fdat")
     if OPT_REPLAY_DIR.is_dir():
         for p in OPT_REPLAY_DIR.glob("*.idx"):
             name = p.stem
@@ -1396,6 +1487,8 @@ def preload_all_replay_indices(
                     _RAW_OPT_IDX[name] = marshal.loads(p.read_bytes())
                 except Exception:
                     _RAW_OPT_IDX[name] = None
+            if name not in ("opt_methods", "core_methods"):
+                _get_ast_mmap(OPT_REPLAY_DIR / f"{name}.ast")
         if need_ftoc:
             for p in OPT_REPLAY_DIR.glob("*.ftoc"):
                 name = p.stem
@@ -1406,6 +1499,7 @@ def preload_all_replay_indices(
                         _RAW_OPT_FTOC[name] = marshal.loads(p.read_bytes())
                     except Exception:
                         _RAW_OPT_FTOC[name] = None
+                _get_fdat_mmap(OPT_REPLAY_DIR / f"{name}.fdat")
 
 
 class ValReplayShard:
@@ -1613,6 +1707,7 @@ def load_val_methods_raw() -> bool:
             except Exception:
                 ftoc = None
         _RAW_VAL_FTOC["val_methods"] = ftoc
+    _get_fdat_mmap(VAL_REPLAY_DIR / "val_methods.fdat")
     return _RAW_VAL_IDX.get("val_methods") is not None
 
 
@@ -1725,6 +1820,7 @@ def load_opt_methods_raw() -> bool:
             except Exception:
                 ftoc = None
         _RAW_OPT_FTOC["opt_methods"] = ftoc
+    _get_fdat_mmap(OPT_REPLAY_DIR / "opt_methods.fdat")
     return _RAW_OPT_IDX.get("opt_methods") is not None
 
 
@@ -1860,6 +1956,7 @@ def load_core_methods_raw() -> bool:
             except Exception:
                 ftoc = None
         _RAW_OPT_FTOC["core_methods"] = ftoc
+    _get_fdat_mmap(OPT_REPLAY_DIR / "core_methods.fdat")
     return _RAW_OPT_IDX.get("core_methods") is not None
 
 

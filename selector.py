@@ -91,6 +91,8 @@ def main() -> None:
         f"wall={t_end-t0:.3f}s (load={t_load-t0:.3f}s plan={t_plan-t_load:.3f}s verify={t_verify-t_plan:.3f}s)",
         file=sys.stderr,
     )
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

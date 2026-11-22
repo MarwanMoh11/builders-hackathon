@@ -716,7 +716,11 @@ def install_spies(
         if issubclass(_cls_g, Generator) and _cls_g not in _DISPATCH_CACHE:
             _DISPATCH_CACHE[_cls_g] = _build_dispatch(_cls_g)
 
-    # Preload all sqlglot.typing.* and sqlglot.optimizer.* modules so cross-module imports are visible to GC!
+    # Preload sqlglot.transforms and all sqlglot.typing.*/sqlglot.optimizer.* modules so cross-module imports are visible to GC!
+    try:
+        importlib.import_module("sqlglot.transforms")
+    except Exception:
+        pass
     if sg_root is not None:
         for subpkg in ("typing", "optimizer"):
             pdir = sg_root / "sqlglot" / subpkg
@@ -739,16 +743,17 @@ def install_spies(
 
     allowed_plain_dicts: dict[int, dict] = {}
     for mname, mobj in list(sys.modules.items()):
-        if mobj is not None and mname.startswith("sqlglot."):
+        if mobj is not None and mname.startswith(("sqlglot.", "tests.")):
             md = getattr(mobj, "__dict__", None)
             if type(md) is dict:
                 allowed_plain_dicts[id(md)] = md
-                em = md.get("EXPRESSION_METADATA")
-                if type(em) is dict:
-                    allowed_plain_dicts[id(em)] = em
-                    for inner in em.values():
-                        if type(inner) is dict:
-                            allowed_plain_dicts[id(inner)] = inner
+                if mname.startswith("sqlglot."):
+                    em = md.get("EXPRESSION_METADATA")
+                    if type(em) is dict:
+                        allowed_plain_dicts[id(em)] = em
+                        for inner in em.values():
+                            if type(inner) is dict:
+                                allowed_plain_dicts[id(inner)] = inner
     for cls in all_classes:
         for attr_v in cls.__dict__.values():
             if type(attr_v) is dict:
@@ -770,6 +775,8 @@ def install_spies(
         if mn.startswith("sqlglot.typing."):
             return True
         if mn.startswith("sqlglot.optimizer.") and mn not in ("sqlglot.optimizer.optimizer", "sqlglot.optimizer.__init__"):
+            return True
+        if mn == "sqlglot.transforms":
             return True
         return False
 

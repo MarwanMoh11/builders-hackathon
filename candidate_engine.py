@@ -2632,11 +2632,12 @@ class CandidateEngine:
 
                 file_has_non_hot = False
                 for unit in ana.units:
-                    meth_name = (unit.symbol_name or "").rsplit(".", 1)[-1]
+                    sym = unit.symbol_name or ""
+                    meth_name = sym.rsplit(".", 1)[-1]
                     if (
                         rel in _COMPILED_C_FILES
                         or unit.kind != "func_body"
-                        or unit.sig_changed
+                        or "." not in sym
                         or meth_name in (
                             "__new__", "__init_subclass__", "__set_name__", "__class_getitem__",
                             "_generate_next_value_", "_build_dispatch", "sql_names",
