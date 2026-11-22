@@ -4353,6 +4353,13 @@ def verify_batch(
     for p in plans:
         if p.is_noop:
             results[p.commit] = []
+        elif len(p.candidates) >= 150:
+            out = set(p.candidates) | set(p.force_report)
+            if engine is not None:
+                for rel in list(p.patched_files) + list(p.deleted_files):
+                    if rel.endswith(".py"):
+                        out.update(engine._tests_for_broken_import(rel))
+            results[p.commit] = sorted(out)
         else:
             active_plans.append(p)
 
