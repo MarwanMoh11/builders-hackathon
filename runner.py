@@ -4907,26 +4907,9 @@ def verify_batch(
                 except Exception:
                     results[cid] = _safe_fallback_tests(plan)
 
-    # Tier 1: C-accelerated /sqlglot-c (Probe F: skip py_plans_all AND sqlglot/dialects/* to split C-104 dialects/* vs opt/exec/other!)
+    # Tier 1: C-accelerated /sqlglot-c (94 mods, pure-Python optimizer/*; eager forks + C-Warm Zygote)
     if has_sqlglot_c and c_plans_all:
-        _f_keep = []
-        for _cp in c_plans_all:
-            _ct = set(_cp.patched_files) | set(_cp.deleted_files)
-            if _ct and any(r.startswith("sqlglot/dialects/") for r in _ct):
-                results[_cp.commit] = _safe_fallback_tests(_cp)
-            else:
-                _f_keep.append(_cp)
-        if _f_keep:
-            _fe, _fl, _fh, _fx = _split_plans(_f_keep)
-            _run_tier(_SQLGLOT_C_ROOT, _fe, _fl, _fh, _fx)
-
-    # Skip py_plans_all in Probe F
-    for _pp in py_plans_all:
-        results[_pp.commit] = _safe_fallback_tests(_pp)
-    for _p in active_plans:
-        if _p.commit not in results:
-            results[_p.commit] = _safe_fallback_tests(_p)
-    return results
+        _run_tier(_SQLGLOT_C_ROOT, c_eager, c_lazy, c_hot, c_fix)
 
     # Tier 2: C-base /sqlglot-c-base (22 core mods; covers parsers/*, generators/*, parser.py, generator.py!)
     if has_sqlglot_cb and cb_plans_all:
