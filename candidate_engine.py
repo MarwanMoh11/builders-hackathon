@@ -44,6 +44,7 @@ class CommitPlan:
     tpch_fixture_touched: bool = False
     has_max_nodes_edit: bool = False
     force_report: set[int] = field(default_factory=set)
+    dict_factory_files: set[str] = field(default_factory=set)
 
 
 class CandidateEngine:
@@ -512,6 +513,176 @@ class CandidateEngine:
 
         return bool(called_files), bool(ref_files), called_files if called_files else ref_files
 
+    def _find_dict_only_import_sites(
+        self, rel: str, meth_name: str, ref_files: set[str]
+    ) -> list[tuple[str, str, str, str]] | None:
+        """If EVERY import-time reference to module-level helper `meth_name` across `ref_files`
+        lies strictly inside a value of a class-body dict literal `Cls.ATTR = {key: ...meth_name...}`
+        on a dialect-family class (tracked dict or TRANSFORMS), return `[(rf, Cls, ATTR, key_repr), ...]`.
+        Otherwise return None (fall back to full `_tests_for_broken_import`)."""
+        if not meth_name or not ref_files:
+            return None
+        sites: list[tuple[str, str, str, str]] = []
+        meta_hooks = frozenset({
+            "__new__", "__init_subclass__", "__set_name__", "__class_getitem__",
+            "_generate_next_value_", "_build_dispatch", "sql_names",
+        })
+
+        def _has_name(node: ast.AST) -> bool:
+            for n in ast.walk(node):
+                if isinstance(n, ast.Name) and n.id == meth_name:
+                    return True
+                if isinstance(n, ast.Attribute) and n.attr == meth_name:
+                    return True
+            return False
+
+        for rf in sorted(ref_files):
+            tree = self._parse_base_ast(rf)
+            if tree is None:
+                return None
+            for stmt in tree.body:
+                if isinstance(stmt, ast.ClassDef):
+                    for d in stmt.decorator_list:
+                        if _has_name(d):
+                            return None
+                    cls_name = stmt.name
+                    for cstmt in stmt.body:
+                        if isinstance(cstmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            for d in cstmt.decorator_list:
+                                if _has_name(d):
+                                    return None
+                            for df in cstmt.args.defaults:
+                                if _has_name(df):
+                                    return None
+                            for df in cstmt.args.kw_defaults:
+                                if df is not None and _has_name(df):
+                                    return None
+                            if cstmt.name in meta_hooks and _has_name(cstmt):
+                                return None
+                        elif isinstance(cstmt, (ast.Assign, ast.AnnAssign)):
+                            val = cstmt.value
+                            if val is None or not _has_name(val):
+                                continue
+                            if not isinstance(val, ast.Dict):
+                                return None
+                            attr_name: str | None = None
+                            if isinstance(cstmt, ast.Assign) and len(cstmt.targets) == 1 and isinstance(cstmt.targets[0], ast.Name):
+                                attr_name = cstmt.targets[0].id
+                            elif isinstance(cstmt, ast.AnnAssign) and isinstance(cstmt.target, ast.Name):
+                                attr_name = cstmt.target.id
+                            if not attr_name or cls_name not in self.all_dialect_family:
+                                return None
+                            for k, v in zip(val.keys, val.values):
+                                if k is None:
+                                    if _has_name(v):
+                                        return None
+                                    continue
+                                if _has_name(k):
+                                    return None
+                                if _has_name(v):
+                                    sites.append((rf, cls_name, attr_name, ast.unparse(k)))
+                        elif _has_name(cstmt):
+                            return None
+                elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for d in stmt.decorator_list:
+                        if _has_name(d):
+                            return None
+                    for df in stmt.args.defaults:
+                        if _has_name(df):
+                            return None
+                    for df in stmt.args.kw_defaults:
+                        if df is not None and _has_name(df):
+                            return None
+                elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                    continue
+                elif isinstance(stmt, ast.If):
+                    test = stmt.test
+                    is_tc = (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+                        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+                    )
+                    if not is_tc and _has_name(stmt):
+                        return None
+                    if is_tc and any(_has_name(s2) for s2 in stmt.orelse):
+                        return None
+                elif _has_name(stmt):
+                    return None
+        if not sites:
+            return None
+        # Ensure every target (cls, attr) is either TRANSFORMS or a tracked dict in dict_keys_by_oa
+        for _, cls_name, attr_name, _ in sites:
+            if attr_name == "TRANSFORMS":
+                continue
+            owners = self._expand_class_and_copiers(cls_name, attr_name)
+            if cls_name not in owners:
+                owners.append(cls_name)
+            if not any(attr_name in self.dict_keys_by_oa.get(o, {}) for o in owners):
+                return None
+        return sites
+
+    def _guarded_isinstance_exprs(self, attr: str, readers: list[tuple[str, int]]) -> list[str] | None:
+        """If EVERY reader line `(rfile, rline)` of `attr` is an `if` statement whose test is a
+        top-level `and` conjunction containing BOTH `self.<attr>` (non-negated) AND
+        `isinstance(..., exp.<Cls> | (exp.<Cls1>, ...))`, return sorted subclasses of all `<Cls>`."""
+        if not readers or len(readers) > 4:
+            return None
+        expr_classes: set[str] = set()
+        for rfile, rline in readers:
+            tree = self._parse_base_ast(rfile)
+            if tree is None:
+                return None
+            matched_if: ast.If | None = None
+            for node in ast.walk(tree):
+                if isinstance(node, ast.If):
+                    t_start = getattr(node.test, "lineno", 0)
+                    t_end = getattr(node.test, "end_lineno", t_start)
+                    if t_start <= rline <= t_end:
+                        matched_if = node
+                        break
+            if matched_if is None or not isinstance(matched_if.test, ast.BoolOp) or not isinstance(matched_if.test.op, ast.And):
+                return None
+            has_self_attr = False
+            found_cls: set[str] = set()
+            for part in matched_if.test.values:
+                if (
+                    isinstance(part, ast.Attribute)
+                    and part.attr == attr
+                    and isinstance(part.value, ast.Name)
+                    and part.value.id == "self"
+                ):
+                    has_self_attr = True
+                elif (
+                    isinstance(part, ast.Call)
+                    and isinstance(part.func, ast.Name)
+                    and part.func.id == "isinstance"
+                    and len(part.args) == 2
+                ):
+                    arg2 = part.args[1]
+                    items = arg2.elts if isinstance(arg2, ast.Tuple) else [arg2]
+                    local_cls: set[str] = set()
+                    all_exp = bool(items)
+                    for it in items:
+                        if (
+                            isinstance(it, ast.Attribute)
+                            and isinstance(it.value, ast.Name)
+                            and it.value.id == "exp"
+                            and it.attr in self.all_expr_classes
+                        ):
+                            local_cls.add(it.attr)
+                        else:
+                            all_exp = False
+                            break
+                    if all_exp and local_cls:
+                        found_cls.update(local_cls)
+            if not (has_self_attr and found_cls):
+                return None
+            expr_classes.update(found_cls)
+        if not expr_classes:
+            return None
+        subs: set[str] = set()
+        for ec in expr_classes:
+            subs.update(self._subclasses_of(ec))
+        return sorted(subs)
+
     def _rev_import_closure(self, rel: str) -> set[str]:
         rev_graph = self._get_rev_import_graph()
         closure: set[str] = {rel}
@@ -976,6 +1147,44 @@ class CandidateEngine:
                             if not matched_d:
                                 untracked_empty_tags.add(sg["tag"])
                             self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], matched_d)
+                    elif kind == "dialect_readers_exprs":
+                        subs, base_cls, readers, g_exprs = payload
+                        for sg in sgs:
+                            d_cases: set[Any] = set()
+                            for sc in subs:
+                                d_cases.update(sg["dialects"].get(sc, []))
+                                if "." in sc:
+                                    d_cases.update(sg["dialects"].get(sc.split(".")[0], []))
+                            d_cases.update(sg["dialects"].get(base_cls, []))
+                            r_cases: set[Any] = set()
+                            for rfile, rline in readers:
+                                r_cases.update(self._subtest_match_lines(sg, rfile, {rline}))
+                            e_cases: set[Any] = set()
+                            for ec in g_exprs:
+                                e_cases.update(sg["exprs"].get(ec, []))
+                            if d_cases and r_cases and e_cases:
+                                inter = d_cases & r_cases & e_cases
+                                if not inter:
+                                    proven_empty_tags.add(sg["tag"])
+                                self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], inter)
+                            elif d_cases and e_cases:
+                                inter = d_cases & e_cases
+                                if not inter:
+                                    proven_empty_tags.add(sg["tag"])
+                                self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], inter)
+                            elif d_cases and r_cases:
+                                inter = d_cases & r_cases
+                                if not inter:
+                                    proven_empty_tags.add(sg["tag"])
+                                self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], inter)
+                            else:
+                                fb_dre = d_cases or r_cases or e_cases
+                                if not fb_dre:
+                                    untracked_empty_tags.add(sg["tag"])
+                                self._add_subtest_filter(
+                                    commit_plan.subtest_filters, rnum, sg["tag"],
+                                    fb_dre if (fb_dre or len(sgs) > 1) else None,
+                                )
                     elif kind == "dialect_readers":
                         subs, base_cls, readers = payload
                         for sg in sgs:
@@ -1128,6 +1337,7 @@ class CandidateEngine:
         candidates: set[int],
         subtest_filters: dict[int, dict[str, set[Any] | None]],
         deferred_subtests: dict[int, list[tuple[str, Any]]],
+        dict_factory_files: set[str] | None = None,
     ) -> None:
         rel = unit.file
         has_sub = self._subtest_tags_by_num
@@ -1214,6 +1424,37 @@ class CandidateEngine:
                 is_meta_hook
                 or (is_import_called and (unit.edit_outside_nested_func or not hits))
             ):
+                if (
+                    not is_meta_hook
+                    and is_import_called
+                    and dict_factory_files is not None
+                ):
+                    factory_sites = self._find_dict_only_import_sites(rel, meth_name, import_ref_files)
+                    if factory_sites:
+                        dict_factory_files.add(rel)
+                        dict_factory_files.update(import_ref_files)
+                        candidates.update(hits)
+                        spec_f = ("lines", (rel, target_lines))
+                        for rnum in hits:
+                            if rnum in has_sub:
+                                deferred_subtests.setdefault(rnum, []).append(spec_f)
+                        grouped_sites: dict[tuple[str, str, str], set[str]] = {}
+                        for rf, cname, aname, k_repr in factory_sites:
+                            grouped_sites.setdefault((rf, cname, aname), set()).add(k_repr)
+                        for (rf, cname, aname), k_set in grouped_sites.items():
+                            synth_unit = ChangeUnit(
+                                kind="dict_key",
+                                file=rf,
+                                class_name=cname,
+                                symbol_name=aname,
+                                dict_keys=k_set,
+                                old_lines=set(),
+                                enclosing_lines=set(),
+                            )
+                            self._handle_change_unit(
+                                synth_unit, candidates, subtest_filters, deferred_subtests, dict_factory_files
+                            )
+                        return
                 extra = self._tests_for_broken_import(rel) if is_meta_hook else set()
                 for rf in import_ref_files:
                     extra.update(self._tests_for_broken_import(rf))
@@ -1635,6 +1876,24 @@ class CandidateEngine:
                             return
 
                 readers = self.maps["attr_readers"].get(attr, []) if attr != "*" else []
+                # Filter out cross-family `self.<attr>` readers (e.g., Parser.JOIN_HINTS vs Generator.JOIN_HINTS)!
+                is_gen_cls = (unit.class_name or "").endswith("Generator") or base_cls.endswith("Generator")
+                is_par_cls = (unit.class_name or "").endswith("Parser") or base_cls.endswith("Parser")
+                if readers and (is_gen_cls ^ is_par_cls):
+                    filtered_readers: list[tuple[str, int]] = []
+                    for rfile, rline in readers:
+                        if is_gen_cls and (rfile == "sqlglot/parser.py" or rfile.startswith("sqlglot/parsers/")):
+                            r_lines = self._read_base_file(rfile).splitlines()
+                            r_txt = r_lines[rline - 1] if 0 < rline <= len(r_lines) else ""
+                            if f"self.{attr}" in r_txt and "dialect" not in r_txt.lower() and "generator" not in r_txt.lower():
+                                continue
+                        elif is_par_cls and (rfile == "sqlglot/generator.py" or rfile.startswith("sqlglot/generators/")):
+                            r_lines = self._read_base_file(rfile).splitlines()
+                            r_txt = r_lines[rline - 1] if 0 < rline <= len(r_lines) else ""
+                            if f"self.{attr}" in r_txt and "dialect" not in r_txt.lower() and "parser" not in r_txt.lower():
+                                continue
+                        filtered_readers.append((rfile, rline))
+                    readers = filtered_readers
                 non_rt_extra_c: set[int] = set()
                 has_non_rt_reader = False
                 rev_cl_c = self._rev_import_closure(rel)
@@ -1794,9 +2053,22 @@ class CandidateEngine:
                         reader_hits.update(self._tests_covering_lines(rfile, {rline}))
                     inter = dialect_hits & reader_hits
                     if inter:
+                        g_exprs = self._guarded_isinstance_exprs(attr, readers)
+                        use_g_exprs = False
+                        if g_exprs:
+                            g_hits: set[int] = set()
+                            for ec in g_exprs:
+                                g_hits.update(self._to_rnums(self.maps["expr_to_tests"].get(ec, [])))
+                            if inter & g_hits:
+                                inter = inter & g_hits
+                                use_g_exprs = True
                         hits = inter | self._tests_covering_lines(rel, unit.old_lines)
                         candidates.update(hits)
-                        spec = ("dialect_readers", (subs, base_cls, readers))
+                        spec = (
+                            ("dialect_readers_exprs", (subs, base_cls, readers, g_exprs))
+                            if use_g_exprs
+                            else ("dialect_readers", (subs, base_cls, readers))
+                        )
                         for rnum in hits:
                             if rnum in has_sub:
                                 deferred_subtests.setdefault(rnum, []).append(spec)
@@ -1857,6 +2129,7 @@ class CandidateEngine:
         py_analyses: dict[str, PyFileAnalysis] = {}
         candidates: set[int] = set()
         force_report: set[int] = set()
+        dict_factory_files: set[str] = set()
         subtest_filters: dict[int, dict[str, set[Any] | None]] = {}
         deferred_subtests: dict[int, list[tuple[str, Any]]] = {}
 
@@ -2035,7 +2308,7 @@ class CandidateEngine:
                     ):
                         all_hot_func = False
                         file_has_non_hot = True
-                    self._handle_change_unit(unit, candidates, subtest_filters, deferred_subtests)
+                    self._handle_change_unit(unit, candidates, subtest_filters, deferred_subtests, dict_factory_files)
 
                 # Include test_lazy_load on eager-imported files ONLY when import behavior could change!
                 if (
@@ -2171,4 +2444,5 @@ class CandidateEngine:
             tpch_fixture_touched=tpch_fixture_touched,
             has_max_nodes_edit=has_max_nodes_edit,
             force_report=force_report,
+            dict_factory_files=dict_factory_files,
         )

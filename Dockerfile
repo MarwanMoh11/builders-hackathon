@@ -29,7 +29,7 @@ RUN python -c "import tarfile, urllib.request, io; \
     cp -a /sqlglot /sqlglot-c
 
 COPY build_sqlglotc.py /tmp/build_sqlglotc.py
-RUN python /tmp/build_sqlglotc.py /sqlglot-c full && \
+RUN python /tmp/build_sqlglotc.py /sqlglot-c no_dialects && \
     rm -f /tmp/build_sqlglotc.py
 
 COPY _fast_join_c.c /tmp/_fast_join_c.c

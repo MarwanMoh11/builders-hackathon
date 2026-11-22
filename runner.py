@@ -3447,6 +3447,29 @@ def _execute_commit_verification(
                     else:
                         _add_remaining(x)
 
+    # Soundness guard for dict-factory narrowed commits: verify every narrowed module imports cleanly!
+    # If an edit breaks module import time (e.g. raises inside a _build_* factory call at class-body time),
+    # immediately widen `remaining` to `_tests_for_broken_import(rf)` with full (unfiltered) subtests!
+    if commit_plan.dict_factory_files and engine is not None:
+        for _df_rel in sorted(commit_plan.dict_factory_files):
+            if not _df_rel.endswith(".py"):
+                continue
+            _df_mod = _df_rel.removesuffix("/__init__.py").removesuffix(".py").replace("/", ".")
+            try:
+                if _df_mod in sys.modules:
+                    importlib.reload(sys.modules[_df_mod])
+                else:
+                    importlib.import_module(_df_mod)
+            except BaseException:
+                _broken_df = engine._tests_for_broken_import(_df_rel)
+                for _bt in _broken_df:
+                    commit_plan.deferred_subtests.pop(_bt, None)
+                    if _bt in commit_plan.subtest_filters:
+                        for _k in list(commit_plan.subtest_filters[_bt].keys()):
+                            commit_plan.subtest_filters[_bt][_k] = None
+                    if _bt not in confirmed_fail and _bt not in remaining:
+                        _add_remaining(_bt)
+
     # Precompute estimated verification costs (pre-resolve TPC-DS / TPC-H deferred filters up front
     # so the very first plan knows the real query count instead of a 15-query placeholder!)
     _helpers_p = "tests/helpers.py" in commit_plan.patched_files

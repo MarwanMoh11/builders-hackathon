@@ -10,6 +10,7 @@ Modes:
 
 from __future__ import annotations
 
+import ast
 import concurrent.futures
 import os
 import shutil
@@ -69,14 +70,110 @@ def _subpkg_files(sg_dir: Path, sub: str, files: list[str] | None = None) -> lis
     return [f"sqlglot/{sub}/{f}" for f in files]
 
 
+def _patch_for_interpreted_subclasses(path: Path, class_name: str, fix_i64: bool = False) -> None:
+    """Annotate every class-body attribute on Parser/Generator as t.ClassVar and add
+    @mypyc_attr(allow_interpreted_subclasses=True) so pure-Python sqlglot/parsers/* and
+    sqlglot/generators/* subclasses override class attributes & methods seamlessly!"""
+    src = path.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    cls_node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)
+    lines = src.splitlines(keepends=True)
+    replacements: list[tuple[int, str]] = []
+    n_cv = 0
+    for stmt in cls_node.body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            name = stmt.targets[0].id
+            if name == "__slots__":
+                continue
+            ln = stmt.lineno - 1
+            orig = lines[ln]
+            idx = orig.find(name)
+            eq_idx = orig.find("=", idx + len(name))
+            if eq_idx > idx:
+                replacements.append((ln, orig[: idx + len(name)] + ": t.ClassVar[t.Any]" + orig[idx + len(name) :]))
+                n_cv += 1
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            name = stmt.target.id
+            if name == "__slots__":
+                continue
+            if "ClassVar" in ast.unparse(stmt.annotation):
+                continue
+            ln = stmt.lineno - 1
+            orig = lines[ln]
+            idx = orig.find(name)
+            col_idx = orig.find(":", idx + len(name))
+            eq_idx = orig.find("=", col_idx + 1)
+            if col_idx > idx and eq_idx > col_idx:
+                ann_raw = orig[col_idx + 1 : eq_idx].strip()
+                replacements.append((ln, orig[: col_idx + 1] + f" t.ClassVar[{ann_raw}] " + orig[eq_idx:]))
+                n_cv += 1
+    for ln, new_line in replacements:
+        lines[ln] = new_line
+    new_src = "".join(lines)
+    assert "from __future__ import annotations\n" in new_src
+    new_src = new_src.replace(
+        "from __future__ import annotations\n",
+        "from __future__ import annotations\nfrom mypy_extensions import mypyc_attr as _mypyc_attr\n",
+        1,
+    )
+    new_src = new_src.replace(
+        f"class {class_name}:",
+        f"@_mypyc_attr(allow_interpreted_subclasses=True)\nclass {class_name}:",
+        1,
+    )
+    if fix_i64:
+        # Work around mypyc codegen bug: default-valued i64 parameters on allow_interpreted_subclasses
+        # pass 0 instead of default value through interpreted-subclass dispatch wrappers!
+        assert "def _advance(self, times: i64 = 1) -> None:" in new_src
+        new_src = new_src.replace("def _advance(self, times: i64 = 1) -> None:", "def _advance(self, times: int = 1) -> None:", 1)
+        new_src = new_src.replace("def _retreat(self, index: i64) -> None:", "def _retreat(self, index: int) -> None:", 1)
+    path.write_text(new_src, encoding="utf-8")
+    print(f"[sqlglotc] patched {path.name}:{class_name} ({n_cv} ClassVars)", flush=True)
+
+
 def main() -> None:
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/sqlglot-c")
-    mode = sys.argv[2] if len(sys.argv) > 2 else "no_opt"
+    mode = sys.argv[2] if len(sys.argv) > 2 else "no_dialects"
     os.chdir(root)
     os.environ["MYPYPATH"] = str(root)
     sg_dir = root / "sqlglot"
 
-    if mode == "base":
+    extra_mypy_flags: list[str] = []
+    if mode == "no_dialects":
+        _patch_for_interpreted_subclasses(sg_dir / "parser.py", "Parser", fix_i64=True)
+        _patch_for_interpreted_subclasses(sg_dir / "generator.py", "Generator", fix_i64=False)
+        extra_mypy_flags = ["--disable-error-code=misc"]
+        source_files = [
+            "sqlglot/anonymize.py",
+            "sqlglot/errors.py",
+            "sqlglot/generator.py",
+            "sqlglot/helper.py",
+            "sqlglot/lineage.py",
+            "sqlglot/parser.py",
+            "sqlglot/serde.py",
+            "sqlglot/time.py",
+            "sqlglot/tokenizer_core.py",
+            "sqlglot/trie.py",
+            *_subpkg_files(sg_dir, "expressions"),
+            *_subpkg_files(
+                sg_dir,
+                "optimizer",
+                [
+                    "scope.py",
+                    "resolver.py",
+                    "isolate_table_selects.py",
+                    "normalize_identifiers.py",
+                    "qualify.py",
+                    "qualify_tables.py",
+                    "qualify_columns.py",
+                    "simplify.py",
+                    "annotate_types.py",
+                    "canonicalize_internal_names.py",
+                ],
+            ),
+            *_subpkg_files(sg_dir, "executor", ["table.py"]),
+        ]
+    elif mode == "base":
         source_files = [
             "sqlglot/errors.py",
             "sqlglot/helper.py",
@@ -182,7 +279,7 @@ def main() -> None:
         ]
 
     t0 = time.time()
-    exts = mypycify(source_files, opt_level="1", debug_level="0", separate=True, verbose=False)
+    exts = mypycify([*extra_mypy_flags, *source_files], opt_level="1", debug_level="0", separate=True, verbose=False)
     t_gen = time.time() - t0
     print(
         f"[sqlglotc:{mode}] mypyc codegen ({len(source_files)} files -> {len(exts)} exts): {t_gen:.1f}s",
