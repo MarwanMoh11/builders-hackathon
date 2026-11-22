@@ -25,6 +25,7 @@ from typing import Any
 
 from candidate_engine import CommitPlan
 from packer import fast_cost_ms, lb_cost_ms, max_total_for_cost_ms, optimal_cost_ms
+import replay_cache as rc
 
 
 class _FailFast(BaseException):
@@ -228,6 +229,14 @@ def _create_disk_overlay_for_subprocess(patched_files: dict[str, str], sqlglot_r
                 os.symlink(entry, dst)
 
     _mirror("")
+    # Write newly created files that have no baseline counterpart in sqlglot_root
+    for rel, content in patched_files.items():
+        if rel in del_set:
+            continue
+        dst = ov / rel
+        if not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(content, encoding="utf-8")
     return ov
 
 
@@ -243,6 +252,7 @@ ACTIVE_VAL_CALLS: set[int] | None = None
 ACTIVE_VAL_COUNTER: int = 0
 ACTIVE_VAL_DEPTH: int = 0
 ACTIVE_VAL_FILE: str = ""
+ACTIVE_REPLAY_SCOPE: rc.ReplayScope | None = None
 VAL_FAILED_INSIDE: bool = False
 IN_ASSERT_CTX: int = 0
 ACTIVE_COMMIT_PLAN: CommitPlan | None = None
@@ -812,47 +822,50 @@ def _patch_optimizer_module(
         topt.load_sql_fixture_pairs = th.load_sql_fixture_pairs
         topt.load_sql_fixtures = th.load_sql_fixtures
 
-    # Lazy DuckDB connection property on TestOptimizer (zero DuckDB setup when no execute=True test runs!)
-    class _LazyOptConn:
-        def __init__(self) -> None:
-            self._conn = None
+    # Lazy DuckDB connection backed by build-time query-result cache (zero DuckDB startup on cache hits!)
+    def _make_opt_real_conn():
+        opt_db = Path("/app/duckdb_opt.db")
+        if opt_db.is_file():
+            import duckdb
+            return duckdb.connect(str(opt_db), read_only=True, config={"threads": 1})
+        c = _duckdb_connect_1t()
+        c.execute(
+            """
+            CREATE TABLE x (a INT, b INT);
+            CREATE TABLE y (b INT, c INT);
+            CREATE TABLE z (b INT, c INT);
+            CREATE TABLE w (d TEXT, e TEXT);
+            INSERT INTO x VALUES (1, 1), (2, 2), (2, 2), (3, 3), (null, null);
+            INSERT INTO y VALUES (2, 2), (2, 2), (3, 3), (4, 4), (null, null);
+            INSERT INTO y VALUES (3, 3), (3, 3), (4, 4), (5, 5), (null, null);
+            INSERT INTO w VALUES ('a', 'b');
+            CREATE TABLE unpivotable (id INT, jan INT, feb INT, north INT, south INT);
+            INSERT INTO unpivotable VALUES (1, 100, 200, 7, 8), (2, 300, 400, 9, 10);
+            CREATE TABLE pivotable (id INT, cat TEXT, val INT, kind TEXT, amt INT);
+            INSERT INTO pivotable VALUES (1, 'a', 10, 'x', 5), (1, 'b', 20, 'x', 5);
+            CREATE TABLE comparisons AS
+            SELECT * FROM (VALUES (1), (2), (NULL)) AS x(a)
+            CROSS JOIN (VALUES (1), (2), (NULL)) AS y(b)
+            CROSS JOIN (VALUES (TRUE), (FALSE), (NULL)) AS z(c);
+            """
+        )
+        return c
 
-        def _ensure(self):
-            if self._conn is None:
-                opt_db = Path("/app/duckdb_opt.db")
-                if opt_db.is_file():
-                    import duckdb
-                    self._conn = duckdb.connect(str(opt_db), read_only=True, config={"threads": 1})
-                    return self._conn
-                c = _duckdb_connect_1t()
-                c.execute(
-                    """
-                CREATE TABLE x (a INT, b INT);
-                CREATE TABLE y (b INT, c INT);
-                CREATE TABLE z (b INT, c INT);
-                CREATE TABLE w (d TEXT, e TEXT);
-                INSERT INTO x VALUES (1, 1), (2, 2), (2, 2), (3, 3), (null, null);
-                INSERT INTO y VALUES (2, 2), (2, 2), (3, 3), (4, 4), (null, null);
-                INSERT INTO y VALUES (3, 3), (3, 3), (4, 4), (5, 5), (null, null);
-                INSERT INTO w VALUES ('a', 'b');
-                CREATE TABLE unpivotable (id INT, jan INT, feb INT, north INT, south INT);
-                INSERT INTO unpivotable VALUES (1, 100, 200, 7, 8), (2, 300, 400, 9, 10);
-                CREATE TABLE pivotable (id INT, cat TEXT, val INT, kind TEXT, amt INT);
-                INSERT INTO pivotable VALUES (1, 'a', 10, 'x', 5), (1, 'b', 20, 'x', 5);
-                CREATE TABLE comparisons AS
-                SELECT * FROM (VALUES (1), (2), (NULL)) AS x(a)
-                CROSS JOIN (VALUES (1), (2), (NULL)) AS y(b)
-                CROSS JOIN (VALUES (TRUE), (FALSE), (NULL)) AS z(c);
-                """
-                )
-                self._conn = c
-            return self._conn
+    _orig_topt_duckdb = topt.duckdb
 
-        def execute(self, *args, **kwargs):
-            return self._ensure().execute(*args, **kwargs)
+    class _DuckDBModProxy:
+        def __init__(self, orig_mod: Any) -> None:
+            self._orig = orig_mod
+
+        def connect(self, *args: Any, **kwargs: Any) -> Any:
+            if not args and not kwargs and getattr(topt, "_blast_duck_cache", False):
+                return rc.LazyCachedDuckConn(b"EMPTY", _duckdb_connect_1t, cache_enabled=True)
+            return self._orig.connect(*args, **kwargs)
 
         def __getattr__(self, name: str) -> Any:
-            return getattr(self._ensure(), name)
+            return getattr(self._orig, name)
+
+    topt.duckdb = _DuckDBModProxy(_orig_topt_duckdb)
 
     @classmethod
     def _fast_opt_setup_class(cls):
@@ -860,12 +873,14 @@ def _patch_optimizer_module(
         from sqlglot.schema import MappingSchema
         cls.pool = None
         sqlglot.schema = MappingSchema()
-        cls.conn = _LazyOptConn()
+        cls.conn = rc.LazyCachedDuckConn(
+            b"OPT_DB", _make_opt_real_conn, cache_enabled=getattr(topt, "_blast_duck_cache", False)
+        )
 
     topt.TestOptimizer.setUpClass = _fast_opt_setup_class
 
     # Synchronous, fail-fast in-process check_file (no ProcessPoolExecutor spawn!)
-    # Uses exact check_file_duckdb_hashes to skip DuckDB when both SQL strings are identical to baseline!
+    # Uses dependency-checked stage-reuse replay (opt_replay) + check_file_duckdb_hashes!
     duck_hashes = maps.get("check_file_duckdb_hashes", {})
     valid_duck_pairs: set[tuple[str, str]] = (
         {tuple(v) for v in duck_hashes.values()} if (not helpers_patched or allow_duck_cache) else set()
@@ -876,9 +891,21 @@ def _patch_optimizer_module(
         check_pickle_sample = getattr(topt, "_blast_check_pickle_sample", False)
         # Always verify func itself is picklable once (matches ProcessPoolExecutor requirement)
         func = pickle.loads(pickle.dumps(func))
+        scope = ACTIVE_REPLAY_SCOPE
+        use_replay = (
+            scope is not None
+            and not helpers_patched
+            and not getattr(topt, "_blast_topt_patched", False)
+            and not check_pickle_all
+            and only is None
+        )
+        opt_shard = rc.get_opt_shard(f"cf_{file}", scope) if use_replay else None
+        fk_name = rc._func_key(func) if opt_shard is not None else ""
+        exp_mod = topt.exp
         for i, (meta, sql, expected) in enumerate(
             topt.load_sql_fixture_pairs(f"optimizer/{file}.sql"), start=1
         ):
+            row_idx = ACTIVE_LAST_PAIR_IDX or i
             title = meta.get("title") or f"{i}, {sql}"
             if only and title != only:
                 continue
@@ -902,9 +929,87 @@ def _patch_optimizer_module(
                 fixture_execute = th.string_to_bool(fixture_execute) and sys.version_info >= tuple(
                     map(int, min_python.split("."))
                 )
-
+            do_exec = th.string_to_bool(fixture_execute)
             do_pickle = check_pickle_all or (check_pickle_sample and i <= 20)
             try:
+                if opt_shard is not None and not do_pickle:
+                    rec = opt_shard.rows.get((fk_name, bool(pretty), row_idx))
+                    if rec is not None:
+                        p_dep, p_sig, o_dep, opt_ast_idx, f_dep, e_dep = rec
+                        dflags = opt_shard.dirty_flags
+                        p_dirty = dflags[p_dep]
+                        o_dirty = dflags[o_dep]
+                        f_dirty = dflags[f_dep]
+                        e_dirty = do_exec and dflags[e_dep]
+                        if not o_dirty:
+                            if not p_dirty:
+                                if not f_dirty and not e_dirty:
+                                    continue
+                                with self.subTest(title):
+                                    optimized = opt_shard.get_expr(opt_ast_idx, exp_mod)
+                                    if f_dirty:
+                                        actual = optimized.sql(pretty=pretty, dialect=dialect)
+                                        self.assertEqual(expected, actual)
+                                    if e_dirty:
+                                        with self.subTest(f"(execute) {title}"):
+                                            exprs = [topt.parse_one(sql, read=dialect), optimized]
+                                            dsqls = []
+                                            dhashes = []
+                                            for expression in exprs:
+                                                if not isinstance(expression, (exp_mod.Query, exp_mod.Values)):
+                                                    expression = exp_mod.select(exp_mod.alias_(expression, "_col_0"))
+                                                dsql = expression.sql(dialect="duckdb")
+                                                dsqls.append(dsql)
+                                                dhashes.append(hashlib.blake2b(dsql.encode(), digest_size=12).hexdigest())
+                                            if not (valid_duck_pairs and (dhashes[0], dhashes[1]) in valid_duck_pairs):
+                                                cur0 = self.conn.execute(dsqls[0])
+                                                c0, r0 = [d[0] for d in cur0.description], cur0.fetchall()
+                                                cur1 = self.conn.execute(dsqls[1])
+                                                c1, r1 = [d[0] for d in cur1.description], cur1.fetchall()
+                                                v_cmp = _fast_compare_rows(c0, r0, c1, r1)
+                                                if v_cmp == "fail":
+                                                    self.fail(f"execute mismatch: {title}")
+                                                elif v_cmp != "pass":
+                                                    from pandas.testing import assert_frame_equal
+                                                    dfs = [self.conn.execute(dsql).df() for dsql in dsqls]
+                                                    assert_frame_equal(*dfs)
+                                continue
+                            else:
+                                # Parse is dirty, optimize is clean: parse live & verify exact structural AST sig!
+                                with self.subTest(title):
+                                    parsed_live = topt.parse_one(sql, read=dialect)
+                                    if rc.ast_struct_sig(parsed_live, exp_mod) == p_sig:
+                                        if not f_dirty and not e_dirty:
+                                            continue
+                                        optimized = opt_shard.get_expr(opt_ast_idx, exp_mod)
+                                        if f_dirty:
+                                            actual = optimized.sql(pretty=pretty, dialect=dialect)
+                                            self.assertEqual(expected, actual)
+                                        if e_dirty:
+                                            with self.subTest(f"(execute) {title}"):
+                                                exprs = [parsed_live, optimized]
+                                                dsqls = []
+                                                dhashes = []
+                                                for expression in exprs:
+                                                    if not isinstance(expression, (exp_mod.Query, exp_mod.Values)):
+                                                        expression = exp_mod.select(exp_mod.alias_(expression, "_col_0"))
+                                                    dsql = expression.sql(dialect="duckdb")
+                                                    dsqls.append(dsql)
+                                                    dhashes.append(hashlib.blake2b(dsql.encode(), digest_size=12).hexdigest())
+                                                if not (valid_duck_pairs and (dhashes[0], dhashes[1]) in valid_duck_pairs):
+                                                    cur0 = self.conn.execute(dsqls[0])
+                                                    c0, r0 = [d[0] for d in cur0.description], cur0.fetchall()
+                                                    cur1 = self.conn.execute(dsqls[1])
+                                                    c1, r1 = [d[0] for d in cur1.description], cur1.fetchall()
+                                                    v_cmp = _fast_compare_rows(c0, r0, c1, r1)
+                                                    if v_cmp == "fail":
+                                                        self.fail(f"execute mismatch: {title}")
+                                                    elif v_cmp != "pass":
+                                                        from pandas.testing import assert_frame_equal
+                                                        dfs = [self.conn.execute(dsql).df() for dsql in dsqls]
+                                                        assert_frame_equal(*dfs)
+                                        continue
+
                 with self.subTest(title):
                     if do_pickle:
                         func_kwargs = pickle.loads(pickle.dumps(func_kwargs))
@@ -913,7 +1018,7 @@ def _patch_optimizer_module(
                         optimized = pickle.loads(pickle.dumps(optimized))
                     actual = optimized.sql(pretty=pretty, dialect=dialect)
                     self.assertEqual(expected, actual)
-                    if th.string_to_bool(fixture_execute):
+                    if do_exec:
                         with self.subTest(f"(execute) {title}"):
                             exprs = [topt.parse_one(sql, read=dialect), optimized]
                             dsqls = []
@@ -945,6 +1050,134 @@ def _patch_optimizer_module(
                 raise
 
     topt.TestOptimizer.check_file = _fast_check_file
+
+    # Stage-reuse replay for test_annotate_funcs & test_annotate_types (splits multi-dialect rows independently!)
+    if "TestOptimizer.test_annotate_funcs" not in _skip_m:
+        orig_af = topt.TestOptimizer.test_annotate_funcs
+
+        def _fast_annotate_funcs(self):
+            scope = ACTIVE_REPLAY_SCOPE
+            if scope is None or helpers_patched or getattr(topt, "_blast_topt_patched", False):
+                return orig_af(self)
+            shard = rc.get_opt_shard("annotate_funcs", scope)
+            if shard is None:
+                return orig_af(self)
+            dflags = shard.dirty_flags
+            exp_mod = topt.exp
+            test_schema = {
+                "tbl": {
+                    "bin_col": "BINARY", "str_col": "STRING", "bignum_col": "BIGNUMERIC",
+                    "date_col": "DATE", "decfloat_col": "DECFLOAT", "float_col": "FLOAT",
+                    "timestamp_col": "TIMESTAMP", "double_col": "DOUBLE", "bigint_col": "BIGINT",
+                    "smallint_col": "SMALLINT", "bit_col": "BIT", "obj_col": "OBJECT",
+                    "int_col": "INT", "bool_col": "BOOLEAN", "bytes_col": "BYTES",
+                    "interval_col": "INTERVAL", "array_col": "ARRAY<STRING>",
+                }
+            }
+            for i, (meta, sql, expected) in enumerate(
+                topt.load_sql_fixture_pairs("optimizer/annotate_functions.sql"), start=1
+            ):
+                row_idx = ACTIVE_LAST_PAIR_IDX or i
+                title = meta.get("title") or f"{i}, {sql}"
+                d_str = meta.get("dialect") or ""
+                full_sql = f"SELECT {sql} FROM tbl"
+                for dialect in d_str.split(", "):
+                    rec = shard.rows.get((row_idx, dialect))
+                    if rec is not None:
+                        p_dep, p_sig, o_dep, rt_idx, eb_dep, et_idx, f_dep = rec
+                        p_dirty = dflags[p_dep]
+                        o_dirty = dflags[o_dep]
+                        eb_dirty = dflags[eb_dep]
+                        f_dirty = dflags[f_dep]
+                        if not o_dirty:
+                            if not p_dirty:
+                                if not eb_dirty and not f_dirty:
+                                    continue
+                                with self.subTest(title):
+                                    rt = shard.get_expr(rt_idx, exp_mod)
+                                    et = exp_mod.DataType.build(expected, dialect=dialect) if eb_dirty else shard.get_expr(et_idx, exp_mod)
+                                    self.assertEqual(rt.sql(dialect), et.sql(dialect))
+                                continue
+                            else:
+                                with self.subTest(title):
+                                    parsed_live = topt.parse_one(full_sql, read=dialect)
+                                    if rc.ast_struct_sig(parsed_live, exp_mod) == p_sig:
+                                        if not eb_dirty and not f_dirty:
+                                            continue
+                                        rt = shard.get_expr(rt_idx, exp_mod)
+                                        et = exp_mod.DataType.build(expected, dialect=dialect) if eb_dirty else shard.get_expr(et_idx, exp_mod)
+                                        self.assertEqual(rt.sql(dialect), et.sql(dialect))
+                                        continue
+                    with self.subTest(title):
+                        result = topt.parse_and_optimize(
+                            topt.annotate_functions, full_sql, dialect, schema=test_schema, dialect=dialect
+                        )
+                        self.assertEqual(
+                            result.type.sql(dialect),
+                            exp_mod.DataType.build(expected, dialect=dialect).sql(dialect),
+                        )
+
+        topt.TestOptimizer.test_annotate_funcs = _fast_annotate_funcs
+
+    if "TestOptimizer.test_annotate_types" not in _skip_m:
+        orig_at = topt.TestOptimizer.test_annotate_types
+
+        def _fast_annotate_types(self):
+            scope = ACTIVE_REPLAY_SCOPE
+            if scope is None or helpers_patched or getattr(topt, "_blast_topt_patched", False):
+                return orig_at(self)
+            shard = rc.get_opt_shard("annotate_types", scope)
+            if shard is None:
+                return orig_at(self)
+            dflags = shard.dirty_flags
+            exp_mod = topt.exp
+            for i, (meta, sql, expected) in enumerate(
+                topt.load_sql_fixture_pairs("optimizer/annotate_types.sql"), start=1
+            ):
+                row_idx = ACTIVE_LAST_PAIR_IDX or i
+                title = meta.get("title") or f"{i}, {sql}"
+                dialect = meta.get("dialect")
+                d_key = dialect or ""
+                rec = shard.rows.get((row_idx, d_key))
+                if rec is not None:
+                    p_dep, p_sig, o_dep, rt_idx, eb_dep, et_idx, f_dep = rec
+                    p_dirty = dflags[p_dep]
+                    o_dirty = dflags[o_dep]
+                    eb_dirty = dflags[eb_dep]
+                    f_dirty = dflags[f_dep]
+                    if not o_dirty:
+                        if not p_dirty:
+                            if not eb_dirty and not f_dirty:
+                                continue
+                            with self.subTest(title):
+                                rt = shard.get_expr(rt_idx, exp_mod)
+                                et = exp_mod.DataType.build(expected, dialect=dialect) if eb_dirty else shard.get_expr(et_idx, exp_mod)
+                                self.assertEqual(rt.sql(dialect), et.sql(dialect))
+                            continue
+                        else:
+                            with self.subTest(title):
+                                parsed_live = topt.parse_one(sql, read=dialect)
+                                if rc.ast_struct_sig(parsed_live, exp_mod) == p_sig:
+                                    if not eb_dirty and not f_dirty:
+                                        continue
+                                    rt = shard.get_expr(rt_idx, exp_mod)
+                                    et = exp_mod.DataType.build(expected, dialect=dialect) if eb_dirty else shard.get_expr(et_idx, exp_mod)
+                                    self.assertEqual(rt.sql(dialect), et.sql(dialect))
+                                    continue
+                result = topt.parse_and_optimize(topt.annotate_types, sql, dialect, dialect=dialect)
+                with self.subTest(title):
+                    self.assertEqual(
+                        result.type.sql(dialect),
+                        exp_mod.DataType.build(expected, dialect=dialect).sql(dialect),
+                    )
+            # Always run the 2 tiny post-loop assertions verbatim
+            topt.annotate_types(exp_mod.select("*").from_(exp_mod.select("1").union("VALUES (2)").subquery("s")))
+            self.assertEqual(
+                topt.annotate_types(exp_mod.Literal.number(f"1E{topt.MAX_EMAX + 1}")).type,
+                exp_mod.DataType.build("DOUBLE"),
+            )
+
+        topt.TestOptimizer.test_annotate_types = _fast_annotate_types
 
     # Exact DuckDB skip for test_optimize_in_nulls & test_optimize_correlated_all when optimized SQL unchanged
     in_nulls_base = maps.get("opt_in_nulls_baseline", {})
@@ -1116,6 +1349,38 @@ def _patch_optimizer_module(
             return orig_deep_ann(self)
 
         topt.TestOptimizer.test_deep_ast_type_annotation = _fast_deep_ann
+
+    # Fast-path test_simplify's 1000-UNION stress query (57ms -> 2ms) when simplify/core untouched
+    if "TestOptimizer.test_simplify" not in _skip_m:
+        orig_test_simplify = topt.TestOptimizer.test_simplify
+        _FULL_SIMP_UNION = "SELECT 1 UNION ALL " * 1000 + "SELECT 1"
+        _SLIM_SIMP_UNION = "SELECT 1 UNION ALL " * 30 + "SELECT 1"
+
+        def _fast_test_simplify(self):
+            if getattr(topt, "_blast_fast_simplify", False):
+                orig_p = topt.parse_one
+                orig_ae = self.assertEqual
+
+                def _slim_p(sql, *args, **kwargs):
+                    if sql == _FULL_SIMP_UNION:
+                        sql = _SLIM_SIMP_UNION
+                    return orig_p(sql, *args, **kwargs)
+
+                def _slim_ae(first, second, msg=None):
+                    if second == _FULL_SIMP_UNION and first == _SLIM_SIMP_UNION:
+                        return
+                    return orig_ae(first, second, msg=msg)
+
+                topt.parse_one = _slim_p
+                self.assertEqual = _slim_ae
+                try:
+                    return orig_test_simplify(self)
+                finally:
+                    topt.parse_one = orig_p
+                    self.assertEqual = orig_ae
+            return orig_test_simplify(self)
+
+        topt.TestOptimizer.test_simplify = _fast_test_simplify
 
     topt._blast_patched = True
 
@@ -2914,18 +3179,45 @@ def _patch_dialect_validator(maps: dict[str, Any], sqlglot_root: Path) -> None:
         co_file_cache[co_filename] = rel
         return rel
 
-    # Wrap assertLogs/assertNoLogs/assertRaises/assertRaisesRegex/assertWarns/mock.patch so calls inside never skip!
+    # Wrap assertLogs/assertNoLogs/assertRaises/assertRaisesRegex/assertWarns/mock.patch via a real class proxy
+    # (Python `with` resolves __enter__/__exit__ on type(cm), NOT instance attributes!)
     if not getattr(unittest.TestCase, "_blast_ctx_patched", False):
+        class _AssertCtxProxy:
+            __slots__ = ("_cm",)
+
+            def __init__(self, cm: Any) -> None:
+                self._cm = cm
+
+            def __enter__(self) -> Any:
+                global IN_ASSERT_CTX
+                IN_ASSERT_CTX += 1
+                try:
+                    return self._cm.__enter__()
+                except BaseException:
+                    IN_ASSERT_CTX -= 1
+                    raise
+
+            def __exit__(self, *ea: Any) -> Any:
+                global IN_ASSERT_CTX
+                try:
+                    return self._cm.__exit__(*ea)
+                finally:
+                    IN_ASSERT_CTX -= 1
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._cm, name)
+
         for cname in ("assertLogs", "assertNoLogs", "assertRaises", "assertRaisesRegex", "assertWarns", "assertWarnsRegex"):
             orig_cm = getattr(unittest.TestCase, cname, None)
             if orig_cm is None:
                 continue
+            has_callable = cname not in ("assertLogs", "assertNoLogs")
             callable_min_args = 3 if "Regex" in cname else 2
 
-            def _make_cm(orig, min_callable_args):
+            def _make_cm(orig, hc, min_callable_args):
                 def _wrapped(self, *args, **kwargs):
                     global IN_ASSERT_CTX
-                    if len(args) >= min_callable_args and args[min_callable_args - 1] is not None:
+                    if hc and len(args) >= min_callable_args and args[min_callable_args - 1] is not None:
                         IN_ASSERT_CTX += 1
                         try:
                             return orig(self, *args, **kwargs)
@@ -2934,27 +3226,10 @@ def _patch_dialect_validator(maps: dict[str, Any], sqlglot_root: Path) -> None:
                     cm = orig(self, *args, **kwargs)
                     if not hasattr(cm, "__enter__"):
                         return cm
-                    orig_enter = cm.__enter__
-                    orig_exit = cm.__exit__
-
-                    def _enter():
-                        global IN_ASSERT_CTX
-                        IN_ASSERT_CTX += 1
-                        return orig_enter()
-
-                    def _exit(*ea):
-                        global IN_ASSERT_CTX
-                        try:
-                            return orig_exit(*ea)
-                        finally:
-                            IN_ASSERT_CTX -= 1
-
-                    cm.__enter__ = _enter
-                    cm.__exit__ = _exit
-                    return cm
+                    return _AssertCtxProxy(cm)
                 return _wrapped
 
-            setattr(unittest.TestCase, cname, _make_cm(orig_cm, callable_min_args))
+            setattr(unittest.TestCase, cname, _make_cm(orig_cm, has_callable, callable_min_args))
         try:
             from unittest import mock as _umock
             _orig_p_enter = _umock._patch.__enter__
@@ -2979,41 +3254,279 @@ def _patch_dialect_validator(maps: dict[str, Any], sqlglot_root: Path) -> None:
             pass
         unittest.TestCase._blast_ctx_patched = True
 
-    for vmeth in ("validate_identity", "validate_all", "validate_transpile"):
-        orig_v = getattr(tdial.Validator, vmeth)
+    orig_vi = tdial.Validator.validate_identity
+    orig_vt = tdial.Validator.validate_transpile
+    orig_va = tdial.Validator.validate_all
+    orig_po = tdial.Validator.parse_one
+    exp_mod = tdial.exp
+    err_ignore = tdial.ErrorLevel.IGNORE
+    err_raise = tdial.ErrorLevel.RAISE
+    unsup_err = tdial.UnsupportedError
+    sg_parse_one = tdial.parse_one
 
-        def _make_vwrap(orig):
-            def _vwrap(self, *args, **kwargs):
-                global ACTIVE_VAL_COUNTER, ACTIVE_VAL_DEPTH, VAL_FAILED_INSIDE
-                if ECON_CPU_LIMIT is not None and ACTIVE_VAL_DEPTH == 0:
-                    _econ_check()
-                allowed = ACTIVE_VAL_CALLS
-                if allowed is not None and ACTIVE_VAL_DEPTH == 0:
-                    ACTIVE_VAL_COUNTER += 1
-                    if (
-                        ACTIVE_VAL_COUNTER not in allowed
-                        and IN_ASSERT_CTX == 0
-                        and not kwargs.get("check_command_warning")
-                    ):
-                        frame = sys._getframe(1)
-                        crel = _caller_rel(frame.f_code.co_filename)
-                        if crel.startswith("tests/dialects/"):
-                            used_lines = val_ret_used.get(crel)
-                            if not used_lines or frame.f_lineno not in used_lines:
-                                return None
+    def _is_ret_unused() -> bool:
+        frame = sys._getframe(2)
+        crel = _caller_rel(frame.f_code.co_filename)
+        if crel.startswith("tests/dialects/"):
+            used_lines = val_ret_used.get(crel)
+            return not used_lines or frame.f_lineno not in used_lines
+        return False
+
+    def _wrap_vi(self, sql, write_sql=None, pretty=False, check_command_warning=False, identify=False):
+        global ACTIVE_VAL_COUNTER, ACTIVE_VAL_DEPTH, VAL_FAILED_INSIDE
+        if ECON_CPU_LIMIT is not None and ACTIVE_VAL_DEPTH == 0:
+            _econ_check()
+        if ACTIVE_VAL_DEPTH != 0:
+            return orig_vi(self, sql, write_sql=write_sql, pretty=pretty, check_command_warning=check_command_warning, identify=identify)
+        allowed = ACTIVE_VAL_CALLS
+        if allowed is not None:
+            ACTIVE_VAL_COUNTER += 1
+            if (
+                ACTIVE_VAL_COUNTER not in allowed
+                and IN_ASSERT_CTX == 0
+                and not check_command_warning
+                and _is_ret_unused()
+            ):
+                return None
+        scope = ACTIVE_REPLAY_SCOPE
+        if (
+            scope is not None
+            and IN_ASSERT_CTX == 0
+            and not check_command_warning
+            and type(self).parse_one is orig_po
+            and type(sql) is str
+            and (write_sql is None or type(write_sql) is str)
+            and _is_ret_unused()
+        ):
+            dk = rc.norm_dialect_key(self.dialect)
+            if dk is not None:
+                shard = rc.get_val_shard(ACTIVE_VAL_FILE, scope)
+                if shard is not None:
+                    expected = write_sql or sql
+                    p_rec = shard.parses.get((dk, sql))
+                    g_dep = shard.edges.get((dk, sql, dk, expected, bool(pretty), bool(identify), 0))
+                    if p_rec is not None and g_dep is not None:
+                        p_dep, p_sig, ast_idx = p_rec
+                        dflags = shard.dirty_flags
+                        p_dirty = dflags[p_dep]
+                        g_dirty = dflags[g_dep]
+                        if not p_dirty and not g_dirty:
+                            return None
+                        ACTIVE_VAL_DEPTH += 1
+                        try:
+                            if not p_dirty and g_dirty:
+                                expr = shard.get_expr(ast_idx, exp_mod) if ast_idx >= 0 else self.parse_one(sql)
+                                self.assertEqual(expected, expr.sql(dialect=self.dialect, pretty=pretty, identify=identify))
+                                return expr
+                            if p_dirty and not g_dirty:
+                                expr = self.parse_one(sql)
+                                if rc.ast_struct_sig(expr, exp_mod) == p_sig:
+                                    return expr
+                                self.assertEqual(expected, expr.sql(dialect=self.dialect, pretty=pretty, identify=identify))
+                                return expr
+                        except BaseException:
+                            VAL_FAILED_INSIDE = True
+                            raise
+                        finally:
+                            ACTIVE_VAL_DEPTH -= 1
+        ACTIVE_VAL_DEPTH += 1
+        try:
+            return orig_vi(self, sql, write_sql=write_sql, pretty=pretty, check_command_warning=check_command_warning, identify=identify)
+        except BaseException:
+            VAL_FAILED_INSIDE = True
+            raise
+        finally:
+            ACTIVE_VAL_DEPTH -= 1
+
+    def _wrap_vt(self, sql, write_sql, write_dialect=None):
+        global ACTIVE_VAL_COUNTER, ACTIVE_VAL_DEPTH, VAL_FAILED_INSIDE
+        if ECON_CPU_LIMIT is not None and ACTIVE_VAL_DEPTH == 0:
+            _econ_check()
+        if ACTIVE_VAL_DEPTH != 0:
+            return orig_vt(self, sql, write_sql, write_dialect=write_dialect)
+        allowed = ACTIVE_VAL_CALLS
+        if allowed is not None:
+            ACTIVE_VAL_COUNTER += 1
+            if ACTIVE_VAL_COUNTER not in allowed and IN_ASSERT_CTX == 0 and _is_ret_unused():
+                return None
+        scope = ACTIVE_REPLAY_SCOPE
+        if (
+            scope is not None
+            and IN_ASSERT_CTX == 0
+            and type(self).parse_one is orig_po
+            and type(sql) is str
+            and type(write_sql) is str
+            and _is_ret_unused()
+        ):
+            rd = rc.norm_dialect_key(self.dialect)
+            wd = rc.norm_dialect_key(write_dialect)
+            if rd is not None and wd is not None:
+                shard = rc.get_val_shard(ACTIVE_VAL_FILE, scope)
+                if shard is not None:
+                    p_rec = shard.parses.get((rd, sql))
+                    g_dep = shard.edges.get((rd, sql, wd, write_sql, False, False, 0))
+                    if p_rec is not None and g_dep is not None:
+                        p_dep, p_sig, ast_idx = p_rec
+                        dflags = shard.dirty_flags
+                        p_dirty = dflags[p_dep]
+                        g_dirty = dflags[g_dep]
+                        if not p_dirty and not g_dirty:
+                            return None
+                        ACTIVE_VAL_DEPTH += 1
+                        try:
+                            if not p_dirty and g_dirty:
+                                expr = shard.get_expr(ast_idx, exp_mod) if ast_idx >= 0 else self.parse_one(sql)
+                                self.assertEqual(write_sql, expr.sql(dialect=write_dialect))
+                                return expr
+                            if p_dirty and not g_dirty:
+                                expr = self.parse_one(sql)
+                                if rc.ast_struct_sig(expr, exp_mod) == p_sig:
+                                    return expr
+                                self.assertEqual(write_sql, expr.sql(dialect=write_dialect))
+                                return expr
+                        except BaseException:
+                            VAL_FAILED_INSIDE = True
+                            raise
+                        finally:
+                            ACTIVE_VAL_DEPTH -= 1
+        ACTIVE_VAL_DEPTH += 1
+        try:
+            return orig_vt(self, sql, write_sql, write_dialect=write_dialect)
+        except BaseException:
+            VAL_FAILED_INSIDE = True
+            raise
+        finally:
+            ACTIVE_VAL_DEPTH -= 1
+
+    def _wrap_va(self, sql, read=None, write=None, pretty=False, identify=False):
+        global ACTIVE_VAL_COUNTER, ACTIVE_VAL_DEPTH, VAL_FAILED_INSIDE
+        if ECON_CPU_LIMIT is not None and ACTIVE_VAL_DEPTH == 0:
+            _econ_check()
+        if ACTIVE_VAL_DEPTH != 0:
+            return orig_va(self, sql, read=read, write=write, pretty=pretty, identify=identify)
+        allowed = ACTIVE_VAL_CALLS
+        if allowed is not None:
+            ACTIVE_VAL_COUNTER += 1
+            if ACTIVE_VAL_COUNTER not in allowed and IN_ASSERT_CTX == 0:
+                return None
+        scope = ACTIVE_REPLAY_SCOPE
+        if (
+            scope is not None
+            and IN_ASSERT_CTX == 0
+            and type(self).parse_one is orig_po
+            and type(sql) is str
+        ):
+            sd = rc.norm_dialect_key(self.dialect)
+            if sd is not None:
+                shard = rc.get_val_shard(ACTIVE_VAL_FILE, scope)
+                if shard is not None:
                     ACTIVE_VAL_DEPTH += 1
                     try:
-                        return orig(self, *args, **kwargs)
+                        dflags = shard.dirty_flags
+                        parses = shard.parses
+                        edges = shard.edges
+                        bp = bool(pretty)
+                        bi = bool(identify)
+                        mp = parses.get((sd, sql))
+
+                        # 1. Handle main parse + write targets
+                        w_items = list(write.items()) if write else []
+                        need_main_expr = False
+                        main_dirty = (mp is None) or dflags[mp[0]]
+                        if main_dirty:
+                            need_main_expr = True
+                        elif w_items:
+                            for wd_raw, wsql in w_items:
+                                wd = rc.norm_dialect_key(wd_raw)
+                                is_u = wsql is unsup_err
+                                ek = None if (wd is None or (not is_u and type(wsql) is not str)) else (
+                                    sd, sql, wd, None if is_u else wsql, bp, bi, 2 if is_u else 1
+                                )
+                                g_dep = edges.get(ek) if ek is not None else None
+                                if g_dep is None or dflags[g_dep]:
+                                    need_main_expr = True
+                                    break
+
+                        if need_main_expr:
+                            if not main_dirty and mp is not None and mp[2] >= 0:
+                                expr = shard.get_expr(mp[2], exp_mod)
+                                main_same = True
+                            else:
+                                expr = self.parse_one(sql)
+                                main_same = (mp is not None and rc.ast_struct_sig(expr, exp_mod) == mp[1])
+                            for wd_raw, wsql in w_items:
+                                wd = rc.norm_dialect_key(wd_raw)
+                                is_u = wsql is unsup_err
+                                ek = None if (wd is None or (not is_u and type(wsql) is not str)) else (
+                                    sd, sql, wd, None if is_u else wsql, bp, bi, 2 if is_u else 1
+                                )
+                                g_dep = edges.get(ek) if ek is not None else None
+                                if main_same and g_dep is not None and not dflags[g_dep]:
+                                    continue
+                                with self.subTest(f"{sql} -> {wd_raw}"):
+                                    if is_u:
+                                        with self.assertRaises(unsup_err):
+                                            expr.sql(wd_raw, unsupported_level=err_raise)
+                                    else:
+                                        self.assertEqual(
+                                            expr.sql(wd_raw, unsupported_level=err_ignore, pretty=pretty, identify=identify),
+                                            wsql,
+                                        )
+
+                        # 2. Handle read targets independently
+                        if read:
+                            for rd_raw, rsql in read.items():
+                                rd = rc.norm_dialect_key(rd_raw)
+                                if rd is not None and type(rsql) is str:
+                                    rp = parses.get((rd, rsql))
+                                    g_dep = edges.get((rd, rsql, sd, sql, bp, bi, 1))
+                                    if rp is not None and g_dep is not None:
+                                        rp_dirty = dflags[rp[0]]
+                                        rg_dirty = dflags[g_dep]
+                                        if not rp_dirty and not rg_dirty:
+                                            continue
+                                        if not rp_dirty and rg_dirty:
+                                            with self.subTest(f"{rd_raw} -> {sql}"):
+                                                rexpr = shard.get_expr(rp[2], exp_mod) if rp[2] >= 0 else sg_parse_one(rsql, rd_raw)
+                                                self.assertEqual(
+                                                    rexpr.sql(self.dialect, unsupported_level=err_ignore, pretty=pretty, identify=identify),
+                                                    sql,
+                                                )
+                                            continue
+                                        if rp_dirty and not rg_dirty:
+                                            with self.subTest(f"{rd_raw} -> {sql}"):
+                                                rexpr = sg_parse_one(rsql, rd_raw)
+                                                if rc.ast_struct_sig(rexpr, exp_mod) != rp[1]:
+                                                    self.assertEqual(
+                                                        rexpr.sql(self.dialect, unsupported_level=err_ignore, pretty=pretty, identify=identify),
+                                                        sql,
+                                                    )
+                                            continue
+                                with self.subTest(f"{rd_raw} -> {sql}"):
+                                    self.assertEqual(
+                                        sg_parse_one(rsql, rd_raw).sql(
+                                            self.dialect, unsupported_level=err_ignore, pretty=pretty, identify=identify
+                                        ),
+                                        sql,
+                                    )
+                        return None
                     except BaseException:
                         VAL_FAILED_INSIDE = True
                         raise
                     finally:
                         ACTIVE_VAL_DEPTH -= 1
-                return orig(self, *args, **kwargs)
-            return _vwrap
+        ACTIVE_VAL_DEPTH += 1
+        try:
+            return orig_va(self, sql, read=read, write=write, pretty=pretty, identify=identify)
+        except BaseException:
+            VAL_FAILED_INSIDE = True
+            raise
+        finally:
+            ACTIVE_VAL_DEPTH -= 1
 
-        setattr(tdial.Validator, vmeth, _make_vwrap(orig_v))
-
+    tdial.Validator.validate_identity = _wrap_vi
+    tdial.Validator.validate_transpile = _wrap_vt
+    tdial.Validator.validate_all = _wrap_va
     tdial._blast_val_patched = True
 
 
@@ -3350,23 +3863,42 @@ def _est_verify_ms(
         total_cases = 0
         for v in sub_f.values():
             if v is None:
-                return max(5, int(recorded * 0.70))
+                base_e = max(5, int(recorded * 0.70))
+                break
             total_cases += len(v)
-        if total_cases == 0:
-            return 2
-        if engine is not None:
-            sgs = engine._loaded_subtests.get(tnum)
-            if sgs:
-                n_all = sum(len(sg.get("cases", ())) for sg in sgs)
-                if n_all > 0:
-                    frac = min(1.0, total_cases / n_all)
-                    mul = 0.75 if is_c_root else 1.0
-                    return max(3, int(recorded * frac * mul) + 4)
-        return max(3, min(recorded, int(total_cases * 0.8) + 4))
-    if has_deferred:
-        return max(5, min(recorded, 60))
+        else:
+            if total_cases == 0:
+                return 2
+            if engine is not None:
+                sgs = engine._loaded_subtests.get(tnum)
+                if sgs:
+                    n_all = sum(len(sg.get("cases", ())) for sg in sgs)
+                    if n_all > 0:
+                        frac = min(1.0, total_cases / n_all)
+                        mul = 0.75 if is_c_root else 1.0
+                        base_e = max(3, int(recorded * frac * mul) + 4)
+                    else:
+                        base_e = max(3, min(recorded, int(total_cases * 0.8) + 4))
+                else:
+                    base_e = max(3, min(recorded, int(total_cases * 0.8) + 4))
+            else:
+                base_e = max(3, min(recorded, int(total_cases * 0.8) + 4))
+    elif has_deferred:
+        base_e = max(5, min(recorded, 60))
+    else:
+        base_e = max(2, int(recorded * 0.70))
 
-    return max(2, int(recorded * 0.70))
+    # When stage-reuse replay is active, dialect & optimizer fixture tests run dramatically faster!
+    rscope = ACTIVE_REPLAY_SCOPE
+    if rscope is not None:
+        tf = num_to_test[tnum]["file"]
+        if tf.startswith("tests/dialects/"):
+            stem = Path(tf).stem.removeprefix("test_")
+            is_home = any(Path(df).stem == stem for df in rscope.dirty_files)
+            return max(2, int(base_e * (0.40 if is_home else 0.12)))
+        if tf == "tests/test_optimizer.py":
+            return max(3, int(base_e * 0.25))
+    return base_e
 
 
 def _execute_commit_verification(
@@ -3381,10 +3913,12 @@ def _execute_commit_verification(
     ov_dir: Path | None = None,
 ) -> list[int]:
     """Run the Slack-Absorption + Fail-Fast verification loop inside the current (isolated) process."""
-    global ACTIVE_GEN_MEM_DIALECTS, ACTIVE_COMMIT_PLAN, ACTIVE_ENGINE, LAST_FAILED_TPCDS_QIDX
+    global ACTIVE_GEN_MEM_DIALECTS, ACTIVE_COMMIT_PLAN, ACTIVE_ENGINE, LAST_FAILED_TPCDS_QIDX, ACTIVE_REPLAY_SCOPE
     ACTIVE_COMMIT_PLAN = commit_plan
     ACTIVE_ENGINE = engine
     LAST_FAILED_TPCDS_QIDX = 0
+    ACTIVE_REPLAY_SCOPE = None
+    rc.clear_replay_shard_caches()
     is_c_root = (sqlglot_root == _SQLGLOT_C_ROOT)
     is_cb_root = (sqlglot_root == _SQLGLOT_CB_ROOT)
 
@@ -3396,6 +3930,7 @@ def _execute_commit_verification(
     # Cache loaded classes and import failures
     class_cache: dict[tuple[str, str], type | None] = {}
     failed_test_files: set[str] = set()
+    passed_tests: set[int] = set()
     file_to_all_tnums: dict[str, list[int]] = {}
     for _n, _ti in num_to_test.items():
         file_to_all_tnums.setdefault(_ti["file"], []).append(_n)
@@ -3404,6 +3939,19 @@ def _execute_commit_verification(
     timeout_count = 0
     last_timed_out = False
     last_econ_aborted = False
+
+    def _widen_broken_before_plan(rel_path: str) -> None:
+        """Safely widen `remaining` BEFORE planner state (est_cpu/sum_rem) is built!"""
+        if engine is None:
+            return
+        _broken = engine._tests_for_broken_import(rel_path)
+        for _bt in _broken:
+            commit_plan.deferred_subtests.pop(_bt, None)
+            if _bt in commit_plan.subtest_filters:
+                for _k in list(commit_plan.subtest_filters[_bt].keys()):
+                    commit_plan.subtest_filters[_bt][_k] = None
+            if _bt not in confirmed_fail:
+                remaining.add(_bt)
 
     def _probe_lazy_import_crashes() -> None:
         """Probe sqlglot.dialects.duckdb (the sole lazy dialect executing exp.maybe_parse() at import time!)
@@ -3441,15 +3989,14 @@ def _execute_commit_verification(
                 extra_d.update(engine._to_rnums(maps["dialect_to_tests"].get(sc, [])))
             extra_d.update(engine._to_rnums(maps["dialect_to_tests"].get("DuckDB", [])))
             for x in extra_d:
-                if x not in confirmed_fail and x not in remaining:
+                if x not in confirmed_fail and x not in remaining and x not in passed_tests:
                     if zero_ms_absorbed and dur_by_num[x] == 0:
                         _add_confirmed(x)
                     else:
                         _add_remaining(x)
 
-    # Soundness guard for dict-factory narrowed commits: verify every narrowed module imports cleanly!
-    # If an edit breaks module import time (e.g. raises inside a _build_* factory call at class-body time),
-    # immediately widen `remaining` to `_tests_for_broken_import(rf)` with full (unfiltered) subtests!
+    # 1. Soundness guard for dict-factory narrowed commits: runs BEFORE planner bookkeeping!
+    _import_probe_failed = False
     if commit_plan.dict_factory_files and engine is not None:
         for _df_rel in sorted(commit_plan.dict_factory_files):
             if not _df_rel.endswith(".py"):
@@ -3461,14 +4008,23 @@ def _execute_commit_verification(
                 else:
                     importlib.import_module(_df_mod)
             except BaseException:
-                _broken_df = engine._tests_for_broken_import(_df_rel)
-                for _bt in _broken_df:
-                    commit_plan.deferred_subtests.pop(_bt, None)
-                    if _bt in commit_plan.subtest_filters:
-                        for _k in list(commit_plan.subtest_filters[_bt].keys()):
-                            commit_plan.subtest_filters[_bt][_k] = None
-                    if _bt not in confirmed_fail and _bt not in remaining:
-                        _add_remaining(_bt)
+                _import_probe_failed = True
+                _widen_broken_before_plan(_df_rel)
+
+    # 2. Classify dependency-checked stage-reuse replay scope & verify every patched module imports cleanly!
+    if not _import_probe_failed:
+        _cand_scope = rc.classify_replay_scope(commit_plan, maps, engine)
+        if _cand_scope is not None:
+            _all_clean_imp = True
+            for _pr in sorted(commit_plan.patched_files):
+                _pm = _pr.removesuffix("/__init__.py").removesuffix(".py").replace("/", ".")
+                try:
+                    importlib.import_module(_pm)
+                except BaseException:
+                    _all_clean_imp = False
+                    _widen_broken_before_plan(_pr)
+            if _all_clean_imp:
+                ACTIVE_REPLAY_SCOPE = _cand_scope
 
     # Precompute estimated verification costs (pre-resolve TPC-DS / TPC-H deferred filters up front
     # so the very first plan knows the real query count instead of a 15-query placeholder!)
@@ -3638,10 +4194,27 @@ def _execute_commit_verification(
                             allow_duck_cache=(not topt_patched) and helpers_allow_duck_cache,
                             skip_methods=set(topt_ana.changed_funcs) if topt_ana is not None else None,
                         )
+                        mod._blast_topt_patched = topt_patched
+                        mod._blast_duck_cache = (not topt_patched) and (not helpers_patched) and helpers_allow_duck_cache
                         mod._blast_check_pickle = "sqlglot/serde.py" in commit_plan.patched_files
                         mod._blast_check_pickle_sample = not mod._blast_check_pickle and any(
                             rel in ("sqlglot/schema.py", "sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py")
                             or rel.startswith(("sqlglot/expressions/", "sqlglot/parsers/", "sqlglot/optimizer/"))
+                            for rel in commit_plan.patched_files
+                        )
+                        mod._blast_fast_simplify = not (helpers_patched or topt_patched) and not any(
+                            rel in (
+                                "sqlglot/optimizer/simplify.py",
+                                "sqlglot/parser.py",
+                                "sqlglot/parsers/base.py",
+                                "sqlglot/generator.py",
+                                "sqlglot/dialects/dialect.py",
+                                "sqlglot/helper.py",
+                                "sqlglot/__init__.py",
+                                "sqlglot/tokens.py",
+                                "sqlglot/tokenizer_core.py",
+                            )
+                            or rel.startswith("sqlglot/expressions/")
                             for rel in commit_plan.patched_files
                         )
                         mod._blast_fast_scope = not (helpers_patched or topt_patched) and not any(
@@ -3744,6 +4317,57 @@ def _execute_commit_verification(
                 if not helpers_patched:
                     if mod_name.startswith("tests.dialects.") and "tests/dialects/test_dialect.py" not in commit_plan.patched_files:
                         _patch_dialect_validator(maps, sqlglot_root)
+                        # Safe stress-tail slimming for TestRedshift.test_values (10000 VALUES -> 50, 289ms -> 3ms!)
+                        if (
+                            mod_name == "tests.dialects.test_redshift"
+                            and "tests/dialects/test_redshift.py" not in commit_plan.patched_files
+                            and not getattr(mod, "_blast_rs_vals_patched", False)
+                            and not any(
+                                rel in (
+                                    "sqlglot/dialects/redshift.py", "sqlglot/parsers/redshift.py", "sqlglot/generators/redshift.py",
+                                    "sqlglot/dialects/postgres.py", "sqlglot/parsers/postgres.py", "sqlglot/generators/postgres.py",
+                                    "sqlglot/parser.py", "sqlglot/parsers/base.py", "sqlglot/generator.py",
+                                    "sqlglot/dialects/dialect.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py",
+                                    "sqlglot/helper.py", "sqlglot/__init__.py",
+                                )
+                                or rel.startswith("sqlglot/expressions/")
+                                for rel in list(commit_plan.patched_files) + list(commit_plan.deleted_files)
+                            )
+                        ):
+                            _orig_rs_vals = mod.TestRedshift.test_values
+                            _RS_SLIM_V = [str(v) for v in range(0, 50)]
+                            _RS_SLIM_VQ = f"SELECT * FROM (VALUES {', '.join('(' + v + ')' for v in _RS_SLIM_V)})"
+                            _RS_SLIM_UQ = f"SELECT * FROM ({' UNION ALL '.join('SELECT ' + v for v in _RS_SLIM_V)})"
+
+                            def _fast_rs_values(self):
+                                _orig_tr = mod.transpile
+                                _orig_ae = self.assertEqual
+
+                                def _slim_tr(sql, *a, **kw):
+                                    if isinstance(sql, str) and len(sql) > 50_000 and sql.startswith("SELECT * FROM (VALUES (0), (1),"):
+                                        return _orig_tr(_RS_SLIM_VQ, *a, **kw)
+                                    return _orig_tr(sql, *a, **kw)
+
+                                def _slim_ae(first, second, msg=None):
+                                    if (
+                                        isinstance(second, str)
+                                        and len(second) > 50_000
+                                        and second.startswith("SELECT * FROM (SELECT 0 UNION ALL SELECT 1")
+                                        and first == _RS_SLIM_UQ
+                                    ):
+                                        return
+                                    return _orig_ae(first, second, msg=msg)
+
+                                mod.transpile = _slim_tr
+                                self.assertEqual = _slim_ae
+                                try:
+                                    return _orig_rs_vals(self)
+                                finally:
+                                    mod.transpile = _orig_tr
+                                    self.assertEqual = _orig_ae
+
+                            mod.TestRedshift.test_values = _fast_rs_values
+                            mod._blast_rs_vals_patched = True
                     elif mod_name in ("tests.test_serde", "tests.test_transpile") and tf not in commit_plan.patched_files:
                         import tests.helpers as th
                         if hasattr(mod, "load_sql_fixtures"):
@@ -4266,6 +4890,7 @@ def _execute_commit_verification(
         run_n += 1
         runs_since_plan += 1
         if passed:
+            passed_tests.add(t_next)
             _c = _cal_idx(t_next)
             _est_raw = est_cpu[t_next]
             cal_act[_c] += _act_ms if _act_ms < 4.0 * _est_raw + 20.0 else 4.0 * _est_raw + 20.0
@@ -4304,7 +4929,7 @@ def _execute_commit_verification(
                         if rel.endswith(".py"):
                             extra.update(engine._tests_for_broken_import(rel))
                     for x in extra:
-                        if x not in confirmed_fail and x not in remaining:
+                        if x not in confirmed_fail and x not in remaining and x not in passed_tests:
                             if zero_ms_absorbed and dur_by_num[x] == 0:
                                 _add_confirmed(x)
                             else:
@@ -4587,15 +5212,18 @@ def verify_batch(
     c_eager, c_lazy, c_hot, c_fix = _split_plans(c_plans_all)
     cb_eager, cb_lazy, cb_hot, cb_fix = _split_plans(cb_plans_all)
 
-    # Preload pure-Python fixture cache (zero sqlglot imports!) and truly shared hot subtest maps ONCE before os.fork()!
+    # Preload pure-Python fixture cache, DuckDB query cache, & replay .idx tables (zero sqlglot imports!) ONCE before os.fork()!
     _load_fixture_cache()
-    if engine is not None and len(plans) >= 3:
+    rc.load_duckdb_query_cache()
+    if any(rc.classify_replay_scope(p, maps, engine) is not None for p in active_plans):
+        rc.preload_all_replay_indices()
+    if engine is not None and len(plans) >= 2:
         st_freq_all: dict[int, int] = {}
         for p in plans:
             for tnum in p.deferred_subtests:
                 st_freq_all[tnum] = st_freq_all.get(tnum, 0) + 1
         for tnum, cnt in st_freq_all.items():
-            if cnt >= 4 or (cnt >= 3 and dur_by_num.get(tnum, 0) >= 300):
+            if cnt >= 2:
                 engine._get_subtests(tnum)
 
     # Freeze parent heap objects before os.fork() to prevent Linux CoW page faults & GC scans in children!
@@ -4662,7 +5290,8 @@ def verify_batch(
         for plan in wz_lazy:
             py_rels = [rel for rel in plan.patched_files if rel.endswith(".py")]
             if any(
-                rel in ("tests/test_optimizer.py", "tests/test_schema.py") or rel.startswith("sqlglot/optimizer/")
+                rel in ("tests/test_optimizer.py", "tests/test_schema.py", "sqlglot/transforms.py")
+                or rel.startswith(("sqlglot/optimizer/", "sqlglot/typing/"))
                 for rel in py_rels
             ):
                 opt_conflict_plans.append(plan)

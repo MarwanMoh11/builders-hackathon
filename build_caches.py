@@ -242,9 +242,17 @@ print(cnt)
     res_r = subprocess.run([sys.executable, "-c", rows_code], capture_output=True, text=True, check=True)
     n_rows = int(res_r.stdout.strip().splitlines()[-1])
 
+    # 6. Build-time Validator replay index, Optimizer fixture replay index, and Lazy DuckDB Query Cache!
+    t_rc = time.perf_counter()
+    import replay_cache as rc
+    vp, ve, vb = rc.build_val_replay(sg_root)
+    orows, obytes, dq, dbytes = rc.build_opt_replay_and_duckdb_cache(sg_root)
+
     print(
         f"[build_caches] fixtures={len(fixture_pairs)}p/{len(fixture_singles)}s ({len(fix_blob)/1024:.1f} KB), "
-        f"tpc_tables={n_tbl} ({tbl_bytes/1024:.1f} KB), tpc_cache py={n_py} c={n_c} cb={n_cb} rows={n_rows} "
+        f"tpc_tables={n_tbl} ({tbl_bytes/1024:.1f} KB), tpc_cache py={n_py} c={n_c} cb={n_cb} rows={n_rows}, "
+        f"val_replay={vp}p/{ve}e ({vb/1024:.1f} KB), opt_replay={orows}r ({obytes/1024:.1f} KB), "
+        f"duckdb_cache={dq}q ({dbytes/1024:.1f} KB) [replay={time.perf_counter()-t_rc:.2f}s] "
         f"in {time.perf_counter() - t0:.2f}s",
         flush=True,
     )

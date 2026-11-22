@@ -64,7 +64,7 @@ COPY --from=builder /sqlglot-c /sqlglot-c
 
 WORKDIR /app
 COPY --from=builder /opt/_fast_join_c*.so /app/
-COPY packer.py patch_analyzer.py candidate_engine.py runner.py selector.py build_caches.py /app/
+COPY packer.py patch_analyzer.py candidate_engine.py replay_cache.py runner.py selector.py build_caches.py /app/
 COPY maps /app/maps
 
 # Precompute bit-exact fixture cache, TPC-DS/H table pickles, read-only DuckDB DBs, per-query TPC-DS caches (py/c), baseline rows, and bytecode
