@@ -28,12 +28,19 @@ from pathlib import Path
 from typing import Any
 
 import dep_index as _di
+try:
+    import _fast_join_c as _FJC
+    _FJC_SIG = getattr(_FJC, "ast_struct_sig", None)
+except Exception:
+    _FJC_SIG = None
 
 VAL_REPLAY_DIR = Path("/app/val_replay")
 OPT_REPLAY_DIR = Path("/app/opt_replay")
-DUCKDB_CACHE_PATH = Path("/app/duckdb_query_cache.pkl.zlib")
-SQLITE_CACHE_PATH = Path("/app/sqlite_query_cache.pkl.zlib")
-EXEC_REPLAY_PATH = Path("/app/exec_replay.pkl.zlib")
+DUCKDB_CACHE_PATH = Path("/app/duckdb_query_cache.pkl")
+SQLITE_CACHE_PATH = Path("/app/sqlite_query_cache.pkl")
+EXEC_REPLAY_PATH = Path("/app/exec_replay.pkl")
+TOK_TRIE_CACHE_PATH = Path("/app/tok_trie_cache.marshal")
+CROSS_JOINS_PQ_PATH = Path("/app/cross_joins_pq.marshal")
 
 _UNPACKABLE = object()
 
@@ -129,6 +136,8 @@ def _hash_scalar(upd: Any, v: Any) -> bool:
 
 def ast_struct_sig(root: Any, exp_mod: Any) -> bytes | None:
     """Compute a 16-byte exact structural AST fingerprint including parent/arg_key/index integrity."""
+    if _FJC_SIG is not None:
+        return _FJC_SIG(root, exp_mod.Expr, Enum)
     Expr = exp_mod.Expr
     if not isinstance(root, Expr):
         return None
@@ -334,6 +343,87 @@ def norm_dialect_key(d: Any) -> str | None:
     if type(val) is str:
         return val
     return None
+
+
+def norm_opt_kwargs(kw: dict[str, Any]) -> bytes | None:
+    """Deterministic 16-byte fingerprint of primitive/dict/MappingSchema kwargs for inline opt replay."""
+    if not kw:
+        return b""
+    h = hashlib.blake2b(digest_size=16)
+    upd = h.update
+
+    def _w(v: Any) -> bool:
+        if v is None:
+            upd(b"N;")
+            return True
+        t = type(v)
+        if t is bool:
+            upd(b"B1;" if v else b"B0;")
+            return True
+        if t is int:
+            upd(b"I"); upd(str(v).encode()); upd(b";")
+            return True
+        if t is float:
+            upd(b"F"); upd(repr(v).encode()); upd(b";")
+            return True
+        if t is str:
+            b = v.encode("utf-8", "surrogatepass")
+            upd(b"S"); upd(str(len(b)).encode()); upd(b":"); upd(b); upd(b";")
+            return True
+        if isinstance(v, Enum):
+            upd(b"M"); upd(t.__qualname__.encode()); upd(b"."); upd(v.name.encode()); upd(b";")
+            return True
+        if t is dict:
+            try:
+                items = sorted(v.items(), key=lambda kv: (type(kv[0]).__name__, str(kv[0])))
+            except Exception:
+                return False
+            upd(b"{"); upd(str(len(items)).encode()); upd(b":")
+            for dk, dv in items:
+                if not _w(dk) or not _w(dv):
+                    return False
+            upd(b"}")
+            return True
+        if t in (list, tuple):
+            upd(b"[" if t is list else b"("); upd(str(len(v)).encode()); upd(b":")
+            for item in v:
+                if not _w(item):
+                    return False
+            upd(b"]" if t is list else b")")
+            return True
+        if t.__name__ == "MappingSchema":
+            dk = norm_dialect_key(getattr(v, "dialect", None))
+            if dk is None:
+                return False
+            upd(b"MS(")
+            if not _w(getattr(v, "mapping", None)):
+                return False
+            if not _w(dk):
+                return False
+            if not _w(bool(getattr(v, "normalize", True))):
+                return False
+            vis = getattr(v, "visible", None)
+            if vis is not None and not _w(vis):
+                return False
+            upd(b")")
+            return True
+        dk = norm_dialect_key(v)
+        if dk is not None:
+            upd(b"D"); upd(dk.encode("utf-8")); upd(b";")
+            return True
+        return False
+
+    try:
+        items = sorted(kw.items())
+    except Exception:
+        return None
+    for k, v in items:
+        if type(k) is not str:
+            return None
+        upd(k.encode("utf-8")); upd(b"=")
+        if not _w(v):
+            return None
+    return h.digest()
 
 
 # ---------------------------------------------------------------------------
@@ -752,42 +842,59 @@ def _query_fine_tables(
     return sets
 
 
-def preload_all_replay_indices() -> None:
+def preload_all_replay_indices(
+    val_stems: set[str] | None = None,
+    opt_names: set[str] | None = None,
+    need_ftoc: bool = True,
+) -> None:
     """Preload uncompressed .idx & .ftoc marshal tables ONCE in parent before os.fork() (0ms in children via CoW!)."""
     if VAL_REPLAY_DIR.is_dir():
         for p in VAL_REPLAY_DIR.glob("*.idx"):
             stem = p.stem
+            if val_stems is not None and stem not in val_stems:
+                continue
             if stem not in _RAW_VAL_IDX:
                 try:
                     _RAW_VAL_IDX[stem] = marshal.loads(p.read_bytes())
                 except Exception:
                     _RAW_VAL_IDX[stem] = None
-        for p in VAL_REPLAY_DIR.glob("*.ftoc"):
-            stem = p.stem
-            if stem not in _RAW_VAL_FTOC:
-                try:
-                    _RAW_VAL_FTOC[stem] = marshal.loads(p.read_bytes())
-                except Exception:
-                    _RAW_VAL_FTOC[stem] = None
+        if need_ftoc:
+            for p in VAL_REPLAY_DIR.glob("*.ftoc"):
+                stem = p.stem
+                if val_stems is not None and stem not in val_stems:
+                    continue
+                if stem not in _RAW_VAL_FTOC:
+                    try:
+                        _RAW_VAL_FTOC[stem] = marshal.loads(p.read_bytes())
+                    except Exception:
+                        _RAW_VAL_FTOC[stem] = None
     if OPT_REPLAY_DIR.is_dir():
         for p in OPT_REPLAY_DIR.glob("*.idx"):
             name = p.stem
+            if opt_names is not None and name not in opt_names:
+                continue
             if name not in _RAW_OPT_IDX:
                 try:
                     _RAW_OPT_IDX[name] = marshal.loads(p.read_bytes())
                 except Exception:
                     _RAW_OPT_IDX[name] = None
-        for p in OPT_REPLAY_DIR.glob("*.ftoc"):
-            name = p.stem
-            if name not in _RAW_OPT_FTOC:
-                try:
-                    _RAW_OPT_FTOC[name] = marshal.loads(p.read_bytes())
-                except Exception:
-                    _RAW_OPT_FTOC[name] = None
+        if need_ftoc:
+            for p in OPT_REPLAY_DIR.glob("*.ftoc"):
+                name = p.stem
+                if opt_names is not None and name not in opt_names:
+                    continue
+                if name not in _RAW_OPT_FTOC:
+                    try:
+                        _RAW_OPT_FTOC[name] = marshal.loads(p.read_bytes())
+                    except Exception:
+                        _RAW_OPT_FTOC[name] = None
 
 
 class ValReplayShard:
-    __slots__ = ("stem", "deps_table", "parses", "edges", "dirty_flags", "dirty_pids", "dirty_eids", "_store")
+    __slots__ = (
+        "stem", "deps_table", "parses", "edges", "method_ops",
+        "dirty_flags", "dirty_pids", "dirty_eids", "_store",
+    )
 
     def __init__(
         self,
@@ -796,6 +903,7 @@ class ValReplayShard:
         parses: dict,
         edges: dict,
         ast_offsets: list[tuple[int, int]],
+        method_ops: dict[str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]],
         ast_path: Path,
         ftoc: dict[Any, tuple[int, ...]] | None,
         fdat_path: Path,
@@ -805,6 +913,7 @@ class ValReplayShard:
         self.deps_table = deps_table
         self.parses = parses
         self.edges = edges
+        self.method_ops = method_ops
         self._store = _MmapAstStore(ast_path, ast_offsets)
         dd = scope.dirty_dials
         dp = scope.dirty_pars
@@ -827,6 +936,22 @@ class ValReplayShard:
             except Exception:
                 pass
 
+    def is_pure_method_clean(self, cls_name: str, meth: str) -> bool:
+        """Return True iff this pure validate_* method has ZERO dirty ops (skip module import + exec!)."""
+        mrec = self.method_ops.get(f"{cls_name}::{meth}")
+        if mrec is None:
+            return False
+        m_pids, m_eids, m_deps = mrec
+        dflags = self.dirty_flags
+        if not any(dflags[d] for d in m_deps):
+            return True
+        dp = self.dirty_pids
+        de = self.dirty_eids
+        if dp is not None and de is not None:
+            if not any(p in dp for p in m_pids) and not any(e in de for e in m_eids):
+                return True
+        return False
+
     def get_expr(self, ast_idx: int, exp_mod: Any) -> Any:
         return self._store.get_expr(ast_idx, exp_mod)
 
@@ -836,9 +961,93 @@ class ValReplayShard:
 
 _VAL_SHARD_CACHE: dict[str, ValReplayShard | None] = {}
 _OPT_SHARD_CACHE: dict[str, OptReplayShard | None] = {}
+_OPT_METHODS_SHARD_CACHE: OptMethodsShard | None = None
+_OPT_METHODS_LOADED: bool = False
+
+
+class OptMethodsShard:
+    """Whole-method coarse+fine dependency shard for TestOptimizer direct-jump (~0.003ms!)."""
+    __slots__ = ("deps_table", "methods", "dirty_opt_flags", "dirty_mids")
+
+    def __init__(
+        self,
+        deps_table: list,
+        methods: dict[str, tuple[int, int]],
+        ftoc: dict[Any, tuple[int, ...]] | None,
+        fdat_path: Path,
+        scope: ReplayScope,
+    ) -> None:
+        self.deps_table = deps_table
+        self.methods = methods
+        dd = scope.dirty_dials
+        dp = scope.dirty_pars
+        dg = scope.dirty_gens
+        dod = scope.dirty_opt_dials
+        self.dirty_opt_flags: list[bool] = [
+            bool(
+                (dd and any(x in dd for x in ds))
+                or (dp and any(x in dp for x in ps))
+                or (dg and any(x in dg for x in gs))
+                or (dod and any(x in dod for x in ds))
+            )
+            for ds, ps, gs in deps_table
+        ]
+        self.dirty_mids: set[int] | None = None
+        if scope.fine_tokens is not None and any(self.dirty_opt_flags):
+            try:
+                res = _query_fine_tables(ftoc, fdat_path, scope.fine_tokens, 1)
+                if res is not None:
+                    self.dirty_mids = res[0]
+            except Exception:
+                pass
+
+    def is_method_clean(self, meth: str) -> bool:
+        rec = self.methods.get(meth)
+        if rec is None:
+            return False
+        dep_idx, mid = rec
+        if not self.dirty_opt_flags[dep_idx]:
+            return True
+        dm = self.dirty_mids
+        if dm is not None and mid not in dm:
+            return True
+        return False
+
+
+def get_opt_methods_shard(scope: ReplayScope) -> OptMethodsShard | None:
+    global _OPT_METHODS_SHARD_CACHE, _OPT_METHODS_LOADED
+    if _OPT_METHODS_LOADED:
+        return _OPT_METHODS_SHARD_CACHE
+    _OPT_METHODS_LOADED = True
+    raw = _RAW_OPT_IDX.get("opt_methods")
+    if raw is None and "opt_methods" not in _RAW_OPT_IDX:
+        idx_path = OPT_REPLAY_DIR / "opt_methods.idx"
+        if idx_path.is_file():
+            try:
+                raw = marshal.loads(idx_path.read_bytes())
+            except Exception:
+                raw = None
+        _RAW_OPT_IDX["opt_methods"] = raw
+    if raw is None:
+        _OPT_METHODS_SHARD_CACHE = None
+        return None
+    ftoc = _RAW_OPT_FTOC.get("opt_methods")
+    if ftoc is None and "opt_methods" not in _RAW_OPT_FTOC:
+        fp = OPT_REPLAY_DIR / "opt_methods.ftoc"
+        if fp.is_file():
+            try:
+                ftoc = marshal.loads(fp.read_bytes())
+            except Exception:
+                ftoc = None
+        _RAW_OPT_FTOC["opt_methods"] = ftoc
+    fdat_path = OPT_REPLAY_DIR / "opt_methods.fdat"
+    deps_table, methods = raw
+    _OPT_METHODS_SHARD_CACHE = OptMethodsShard(deps_table, methods, ftoc, fdat_path, scope)
+    return _OPT_METHODS_SHARD_CACHE
 
 
 def clear_replay_shard_caches() -> None:
+    global _OPT_METHODS_SHARD_CACHE, _OPT_METHODS_LOADED
     for sh in _VAL_SHARD_CACHE.values():
         if sh is not None:
             sh.close()
@@ -847,6 +1056,8 @@ def clear_replay_shard_caches() -> None:
             sh.close()
     _VAL_SHARD_CACHE.clear()
     _OPT_SHARD_CACHE.clear()
+    _OPT_METHODS_SHARD_CACHE = None
+    _OPT_METHODS_LOADED = False
 
 
 def get_val_shard(test_file: str, scope: ReplayScope) -> ValReplayShard | None:
@@ -877,8 +1088,12 @@ def get_val_shard(test_file: str, scope: ReplayScope) -> ValReplayShard | None:
                 ftoc = None
         _RAW_VAL_FTOC[stem] = ftoc
     fdat_path = VAL_REPLAY_DIR / f"{stem}.fdat"
-    deps_table, parses, edges, ast_offsets = raw
-    shard = ValReplayShard(stem, deps_table, parses, edges, ast_offsets, ast_path, ftoc, fdat_path, scope)
+    if len(raw) == 5:
+        deps_table, parses, edges, ast_offsets, method_ops = raw
+    else:
+        deps_table, parses, edges, ast_offsets = raw
+        method_ops = {}
+    shard = ValReplayShard(stem, deps_table, parses, edges, ast_offsets, method_ops, ast_path, ftoc, fdat_path, scope)
     _VAL_SHARD_CACHE[test_file] = shard
     return shard
 
@@ -984,7 +1199,35 @@ def get_opt_shard(name: str, scope: ReplayScope) -> OptReplayShard | None:
 _DUCKDB_CACHE_DATA: dict[str, Any] | None = None
 _SQLITE_CACHE_DATA: dict[str, Any] | None = None
 _EXEC_REPLAY_DATA: dict[Any, Any] | None = None
+_TOK_TRIE_CACHE_DATA: dict[str, Any] | None = None
+_CROSS_JOINS_PQ_DATA: dict[Any, Any] | None = None
 _READ_SQL_PREFIXES = ("SELECT", "WITH", "VALUES", "FROM", "TABLE", "(", "SUMMARIZE", "DESCRIBE", "EXPLAIN", "SHOW")
+
+
+def load_cross_joins_pq() -> dict[Any, Any]:
+    global _CROSS_JOINS_PQ_DATA
+    if _CROSS_JOINS_PQ_DATA is None:
+        if CROSS_JOINS_PQ_PATH.is_file():
+            try:
+                _CROSS_JOINS_PQ_DATA = marshal.loads(CROSS_JOINS_PQ_PATH.read_bytes())
+            except Exception:
+                _CROSS_JOINS_PQ_DATA = {}
+        else:
+            _CROSS_JOINS_PQ_DATA = {}
+    return _CROSS_JOINS_PQ_DATA
+
+
+def load_tok_trie_cache() -> dict[str, Any]:
+    global _TOK_TRIE_CACHE_DATA
+    if _TOK_TRIE_CACHE_DATA is None:
+        if TOK_TRIE_CACHE_PATH.is_file():
+            try:
+                _TOK_TRIE_CACHE_DATA = marshal.loads(TOK_TRIE_CACHE_PATH.read_bytes())
+            except Exception:
+                _TOK_TRIE_CACHE_DATA = {}
+        else:
+            _TOK_TRIE_CACHE_DATA = {}
+    return _TOK_TRIE_CACHE_DATA
 
 
 def load_duckdb_query_cache() -> dict[str, Any]:
@@ -992,11 +1235,18 @@ def load_duckdb_query_cache() -> dict[str, Any]:
     if _DUCKDB_CACHE_DATA is None:
         if DUCKDB_CACHE_PATH.is_file():
             try:
-                _DUCKDB_CACHE_DATA = pickle.loads(zlib.decompress(DUCKDB_CACHE_PATH.read_bytes()))
+                _DUCKDB_CACHE_DATA = pickle.loads(DUCKDB_CACHE_PATH.read_bytes())
             except Exception:
                 _DUCKDB_CACHE_DATA = {"queries": {}, "ddls": set()}
         else:
-            _DUCKDB_CACHE_DATA = {"queries": {}, "ddls": set()}
+            z = Path(str(DUCKDB_CACHE_PATH) + ".zlib")
+            if z.is_file():
+                try:
+                    _DUCKDB_CACHE_DATA = pickle.loads(zlib.decompress(z.read_bytes()))
+                except Exception:
+                    _DUCKDB_CACHE_DATA = {"queries": {}, "ddls": set()}
+            else:
+                _DUCKDB_CACHE_DATA = {"queries": {}, "ddls": set()}
     return _DUCKDB_CACHE_DATA
 
 
@@ -1005,11 +1255,18 @@ def load_sqlite_query_cache() -> dict[str, Any]:
     if _SQLITE_CACHE_DATA is None:
         if SQLITE_CACHE_PATH.is_file():
             try:
-                _SQLITE_CACHE_DATA = pickle.loads(zlib.decompress(SQLITE_CACHE_PATH.read_bytes()))
+                _SQLITE_CACHE_DATA = pickle.loads(SQLITE_CACHE_PATH.read_bytes())
             except Exception:
                 _SQLITE_CACHE_DATA = {"queries": {}, "ddls": set()}
         else:
-            _SQLITE_CACHE_DATA = {"queries": {}, "ddls": set()}
+            z = Path(str(SQLITE_CACHE_PATH) + ".zlib")
+            if z.is_file():
+                try:
+                    _SQLITE_CACHE_DATA = pickle.loads(zlib.decompress(z.read_bytes()))
+                except Exception:
+                    _SQLITE_CACHE_DATA = {"queries": {}, "ddls": set()}
+            else:
+                _SQLITE_CACHE_DATA = {"queries": {}, "ddls": set()}
     return _SQLITE_CACHE_DATA
 
 
@@ -1018,11 +1275,18 @@ def load_exec_replay() -> dict[Any, Any]:
     if _EXEC_REPLAY_DATA is None:
         if EXEC_REPLAY_PATH.is_file():
             try:
-                _EXEC_REPLAY_DATA = pickle.loads(zlib.decompress(EXEC_REPLAY_PATH.read_bytes()))
+                _EXEC_REPLAY_DATA = pickle.loads(EXEC_REPLAY_PATH.read_bytes())
             except Exception:
                 _EXEC_REPLAY_DATA = {}
         else:
-            _EXEC_REPLAY_DATA = {}
+            z = Path(str(EXEC_REPLAY_PATH) + ".zlib")
+            if z.is_file():
+                try:
+                    _EXEC_REPLAY_DATA = pickle.loads(zlib.decompress(z.read_bytes()))
+                except Exception:
+                    _EXEC_REPLAY_DATA = {}
+            else:
+                _EXEC_REPLAY_DATA = {}
     return _EXEC_REPLAY_DATA
 
 
@@ -1372,6 +1636,7 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
     g_fine_inv: dict[tuple[Any, ...], set[int]] = {}
     next_pid = [0]
     next_eid = [0]
+    cur_m_rec: list[Any] = [None]  # [pids, eids, deps, ok_flag] when collecting a pure validate_* method!
 
     def _intern_deps(dset: set[str], pset: set[str], gset: set[str]) -> int:
         key = (tuple(sorted(dset)), tuple(sorted(pset)), tuple(sorted(gset)))
@@ -1392,11 +1657,15 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
     def _record_parse(d_key: str, sql: str, expr: Any, dset: set[str], pset: set[str], gset: set[str], ftoks: set[tuple[Any, ...]]) -> bool:
         pk = (d_key, sql)
         if pk in bad_parses:
+            if cur_m_rec[0] is not None:
+                cur_m_rec[0][3] = False
             return False
         sig = ast_struct_sig(expr, exp)
         if sig is None:
             bad_parses.add(pk)
             parses.pop(pk, None)
+            if cur_m_rec[0] is not None:
+                cur_m_rec[0][3] = False
             return False
         dep_id = _intern_deps(dset, pset, gset)
         prev = parses.get(pk)
@@ -1404,6 +1673,8 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
             if prev[1] != sig:
                 bad_parses.add(pk)
                 parses.pop(pk, None)
+                if cur_m_rec[0] is not None:
+                    cur_m_rec[0][3] = False
                 return False
             pid = prev[3]
             merged = _merge_dep_ids(prev[0], dep_id)
@@ -1411,6 +1682,9 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
                 parses[pk] = (merged, sig, prev[2], pid)
             for tok in ftoks:
                 p_fine_inv.setdefault(tok, set()).add(pid)
+            if cur_m_rec[0] is not None:
+                cur_m_rec[0][0].add(pid)
+                cur_m_rec[0][2].add(merged)
             return True
         packed = pack_expr(expr, exp)
         if packed is _UNPACKABLE:
@@ -1423,6 +1697,9 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
         parses[pk] = (dep_id, sig, ast_idx, pid)
         for tok in ftoks:
             p_fine_inv.setdefault(tok, set()).add(pid)
+        if cur_m_rec[0] is not None:
+            cur_m_rec[0][0].add(pid)
+            cur_m_rec[0][2].add(dep_id)
         return True
 
     def _record_edge(
@@ -1436,11 +1713,16 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
             eid = next_eid[0]
             next_eid[0] += 1
             edges[ek] = (dep_id, eid)
+            eff_dep = dep_id
         else:
             eid = prev[1]
-            edges[ek] = (_merge_dep_ids(prev[0], dep_id), eid)
+            eff_dep = _merge_dep_ids(prev[0], dep_id)
+            edges[ek] = (eff_dep, eid)
         for tok in ftoks:
             g_fine_inv.setdefault(tok, set()).add(eid)
+        if cur_m_rec[0] is not None:
+            cur_m_rec[0][1].add(eid)
+            cur_m_rec[0][2].add(eff_dep)
 
     in_ctx = [0]
 
@@ -1506,6 +1788,8 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
             in_ctx[0] > 0 or check_command_warning or type(self).parse_one is not orig_po
             or type(sql) is not str or dk is None or (write_sql is not None and type(write_sql) is not str)
         ):
+            if cur_m_rec[0] is not None:
+                cur_m_rec[0][3] = False
             return orig_vi(self, sql, write_sql=write_sql, pretty=pretty, check_command_warning=check_command_warning, identify=identify)
         p_d, p_p, p_g, pf = set(), set(), set(), set()
         rec_stack.append((p_d, p_p, p_g)); fine_stack.append(pf)
@@ -1532,6 +1816,8 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
             in_ctx[0] > 0 or type(self).parse_one is not orig_po
             or type(sql) is not str or type(write_sql) is not str or rd is None or wd is None
         ):
+            if cur_m_rec[0] is not None:
+                cur_m_rec[0][3] = False
             return orig_vt(self, sql, write_sql, write_dialect=write_dialect)
         p_d, p_p, p_g, pf = set(), set(), set(), set()
         rec_stack.append((p_d, p_p, p_g)); fine_stack.append(pf)
@@ -1553,6 +1839,8 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
     def _rec_va(self, sql, read=None, write=None, pretty=False, identify=False):
         sd = norm_dialect_key(self.dialect)
         if in_ctx[0] > 0 or type(self).parse_one is not orig_po or type(sql) is not str or sd is None:
+            if cur_m_rec[0] is not None:
+                cur_m_rec[0][3] = False
             return orig_va(self, sql, read=read, write=write, pretty=pretty, identify=identify)
         p_d, p_p, p_g, pf = set(), set(), set(), set()
         rec_stack.append((p_d, p_p, p_g)); fine_stack.append(pf)
@@ -1582,6 +1870,8 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
                     if _record_parse(rd, read_sql, rexpr, rp_d, rp_p, rp_g, rpf):
                         _record_edge(rd, read_sql, sd, sql, bool(pretty), bool(identify), 1, rg_d, rg_p, rg_g, rgf)
                 else:
+                    if cur_m_rec[0] is not None:
+                        cur_m_rec[0][3] = False
                     self.assertEqual(
                         sg_parse_one(read_sql, read_dialect).sql(
                             self.dialect, unsupported_level=ErrorLevel.IGNORE, pretty=pretty, identify=identify
@@ -1602,6 +1892,8 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
                         rec_stack.pop(); fine_stack.pop()
                     if main_ok and wd is not None:
                         _record_edge(sd, sql, wd, None, bool(pretty), bool(identify), 2, wg_d, wg_p, wg_g, wgf)
+                    elif cur_m_rec[0] is not None:
+                        cur_m_rec[0][3] = False
                 else:
                     wg_d, wg_p, wg_g, wgf = set(), set(), set(), set()
                     rec_stack.append((wg_d, wg_p, wg_g)); fine_stack.append(wgf)
@@ -1614,23 +1906,63 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
                     self.assertEqual(out, write_sql)
                     if main_ok and wd is not None and type(write_sql) is str:
                         _record_edge(sd, sql, wd, write_sql, bool(pretty), bool(identify), 1, wg_d, wg_p, wg_g, wgf)
+                    elif cur_m_rec[0] is not None:
+                        cur_m_rec[0][3] = False
 
     tdial.Validator.validate_identity = _rec_vi
     tdial.Validator.validate_transpile = _rec_vt
     tdial.Validator.validate_all = _rec_va
 
+    method_ops: dict[str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = {}
+    pure_methods: set[str] = set()
+    try:
+        import ast as _ast
+        _VAL_N = {"validate_identity", "validate_all", "validate_transpile"}
+
+        def _is_pv(st: Any) -> bool:
+            if isinstance(st, _ast.Expr) and isinstance(st.value, _ast.Call):
+                f = st.value.func
+                if isinstance(f, _ast.Attribute) and isinstance(f.value, _ast.Name) and f.value.id == "self" and f.attr in _VAL_N:
+                    return not any(kw.arg == "check_command_warning" for kw in st.value.keywords)
+            if isinstance(st, _ast.For) and not st.orelse:
+                return all(_is_pv(s) for s in st.body)
+            if isinstance(st, _ast.Assign):
+                return not any(isinstance(n, _ast.Call) for n in _ast.walk(st.value))
+            return False
+
+        _tree = _ast.parse((Path(sg_root) / test_file).read_text(encoding="utf-8"))
+        for _node in _tree.body:
+            if isinstance(_node, _ast.ClassDef) and _node.name.startswith("Test"):
+                for _item in _node.body:
+                    if isinstance(_item, _ast.FunctionDef) and _item.name.startswith("test_"):
+                        _body = _item.body
+                        if _body and isinstance(_body[0], _ast.Expr) and isinstance(_body[0].value, _ast.Constant) and isinstance(_body[0].value.value, str):
+                            _body = _body[1:]
+                        if _body and all(_is_pv(s) for s in _body):
+                            pure_methods.add(f"{_node.name}::{_item.name}")
+    except Exception:
+        pure_methods = set()
+
     try:
         mod_name = test_file.removesuffix(".py").replace("/", ".")
         mod = importlib.import_module(mod_name)
         suite = unittest.defaultTestLoader.loadTestsFromModule(mod)
-        filtered = unittest.TestSuite()
+        res = unittest.TestResult()
         for grp in suite:
             for tc in grp:
-                if getattr(tc, "_testMethodName", "") == "test_lazy_load":
+                mname = getattr(tc, "_testMethodName", "")
+                if mname == "test_lazy_load":
                     continue
-                filtered.addTest(tc)
-        res = unittest.TestResult()
-        filtered.run(res)
+                mkey = f"{tc.__class__.__name__}::{mname}"
+                if mkey in pure_methods:
+                    cur_m_rec[0] = [set(), set(), set(), True]
+                else:
+                    cur_m_rec[0] = None
+                tc.run(res)
+                rec_m = cur_m_rec[0]
+                cur_m_rec[0] = None
+                if rec_m is not None and rec_m[3] and (rec_m[0] or rec_m[1]):
+                    method_ops[mkey] = (tuple(sorted(rec_m[0])), tuple(sorted(rec_m[1])), tuple(sorted(rec_m[2])))
         if not res.wasSuccessful():
             raise RuntimeError(f"val_replay collection failed in {test_file}: {res.failures[:2]} {res.errors[:2]}")
     finally:
@@ -1641,7 +1973,7 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
     stem = Path(test_file).stem
     ast_path = out_dir / f"{stem}.ast"
     ast_offsets = _write_ast_table(asts, ast_path)
-    idx_blob = marshal.dumps((deps_list, parses, edges, ast_offsets))
+    idx_blob = marshal.dumps((deps_list, parses, edges, ast_offsets, method_ops))
     (out_dir / f"{stem}.idx").write_bytes(idx_blob)
     fine_bytes = _write_fine_tables(
         (p_fine_inv, g_fine_inv),
@@ -1679,11 +2011,11 @@ def build_opt_replay_and_duckdb_cache(
     opt_dir: Path = OPT_REPLAY_DIR,
     duck_path: Path = DUCKDB_CACHE_PATH,
 ) -> tuple[int, int, int, int]:
-    """Collect Optimizer fixture replay shards (check_file + annotate_funcs + annotate_types +
-    in_nulls + corr_all, WITH fine-grained .fine inverted indices!) AND Lazy DuckDB Query Cache."""
+    """Collect Lazy DuckDB Query Cache + Optimizer fixture replay shards (check_file + annotate_funcs +
+    annotate_types + in_nulls + corr_all + inline_opt + whole-method opt_methods, WITH fine .fdat/.ftoc!)."""
     opt_dir.mkdir(parents=True, exist_ok=True)
     code = f"""
-import ast as _ast, hashlib, json, marshal, pickle, sys, unittest, zlib
+import ast as _ast, hashlib, json, marshal, pickle, sys, unittest
 from pathlib import Path
 sys.path.insert(0, {str(sg_root)!r})
 sys.path.insert(0, "/app")
@@ -1694,6 +2026,101 @@ from sqlglot import exp, parse_one
 import tests.helpers as th
 import tests.test_optimizer as topt
 
+_topt_src = (Path({str(sg_root)!r}) / "tests/test_optimizer.py").read_text()
+_topt_tree = _ast.parse(_topt_src)
+
+# ---- Part A: Collect Lazy DuckDB Query-Result Cache FIRST (reused in Part C!) ----
+queries_cache = {{}}
+ddls_set = set()
+bad_queries = set()
+
+class _RecDuckCursor:
+    def __init__(self, real_cur, key):
+        self._cur = real_cur
+        self._key = key
+        self.description = real_cur.description
+
+    def fetchall(self):
+        rows = self._cur.fetchall()
+        if self._key is not None and self._key not in bad_queries:
+            try:
+                cols = tuple(d[0] for d in (self.description or ()))
+                pickle.dumps((cols, rows), protocol=pickle.HIGHEST_PROTOCOL)
+                prev = queries_cache.get(self._key)
+                if prev is None:
+                    queries_cache[self._key] = (cols, rows)
+                elif prev != (cols, rows):
+                    bad_queries.add(self._key)
+                    queries_cache.pop(self._key, None)
+            except Exception:
+                bad_queries.add(self._key)
+                queries_cache.pop(self._key, None)
+        return rows
+
+    def fetchone(self): return self._cur.fetchone()
+    def df(self): return self._cur.df()
+    def fetchdf(self): return self._cur.fetchdf()
+    def __getattr__(self, name): return getattr(self._cur, name)
+
+class _RecDuckConn:
+    def __init__(self, real_conn, init_sig):
+        self._conn = real_conn
+        self._sig = init_sig
+
+    def execute(self, query, parameters=None, *a, **kw):
+        if parameters is not None or a or kw or type(query) is not str:
+            return self._conn.execute(query, parameters, *a, **kw) if parameters is not None else self._conn.execute(query, *a, **kw)
+        if rc._is_pure_read_sql(query):
+            return _RecDuckCursor(self._conn.execute(query), (self._sig, query))
+        cur = self._conn.execute(query)
+        self._sig = rc._ddl_step_sig(self._sig, query)
+        ddls_set.add(self._sig)
+        return cur
+
+    def close(self): return self._conn.close()
+    def __enter__(self): return self
+    def __exit__(self, *ea): self.close()
+    def __getattr__(self, name): return getattr(self._conn, name)
+
+orig_connect = duckdb.connect
+def _rec_connect(*a, **kw):
+    if not a and not kw:
+        return _RecDuckConn(orig_connect(config={{"threads": 1}}), b"EMPTY")
+    return orig_connect(*a, **kw)
+
+duck_methods = []
+for node in _ast.walk(_topt_tree):
+    if isinstance(node, _ast.ClassDef) and node.name == "TestOptimizer":
+        for item in node.body:
+            if isinstance(item, _ast.FunctionDef) and item.name.startswith("test_"):
+                src_seg = _ast.get_source_segment(_topt_src, item) or ""
+                if ("duckdb.connect" in src_seg or "self.conn" in src_seg) and "check_file" not in src_seg:
+                    duck_methods.append(item.name)
+                elif item.name == "test_eliminate_joins":
+                    duck_methods.append(item.name)
+
+orig_cf = topt.TestOptimizer.check_file
+topt.TestOptimizer.pool = None
+topt.sqlglot.schema = topt.MappingSchema()
+topt.duckdb.connect = _rec_connect
+opt_db_conn = orig_connect("/app/duckdb_opt.db", read_only=True, config={{"threads": 1}})
+topt.TestOptimizer.conn = _RecDuckConn(opt_db_conn, b"OPT_DB")
+topt.TestOptimizer.check_file = lambda *a, **kw: None
+for mname in duck_methods:
+    tc = topt.TestOptimizer(mname)
+    res = unittest.TestResult()
+    tc.run(res)
+    if not res.wasSuccessful():
+        raise RuntimeError(f"duckdb cache collection failed in {{mname}}: {{res.failures[:1]}} {{res.errors[:1]}}")
+opt_db_conn.close()
+topt.duckdb.connect = orig_connect
+topt.TestOptimizer.check_file = orig_cf
+
+dblob = pickle.dumps({{"queries": queries_cache, "ddls": ddls_set}}, protocol=pickle.HIGHEST_PROTOCOL)
+Path({str(duck_path)!r}).write_bytes(dblob)
+rc._DUCKDB_CACHE_DATA = {{"queries": queries_cache, "ddls": ddls_set}}
+
+# ---- Part B: Collect check_file, annotate_funcs/types, in_nulls, corr_all ----
 fine_stack = []
 restore_fine = rc._install_fine_spies(fine_stack)
 rec_stack, restore_rec = rc._install_stage_recorders()
@@ -1801,36 +2228,60 @@ def record_check_file_shard(file, func, pretty=False, execute=None, **kwargs):
             add_fine(b["ff"], ff, rid)
             add_fine(b["ef"], ef, rid)
 
-orig_cf = topt.TestOptimizer.check_file
+cf_method_shards = {{}}
+_cur_cf_m = [None]
 def _collect_cf(self, file, func, pretty=False, execute=None, only=None, **kwargs):
     if only is None:
+        if _cur_cf_m[0] is not None:
+            cf_method_shards.setdefault(_cur_cf_m[0], set()).add(f"cf_{{file}}")
         record_check_file_shard(file, func, pretty=pretty, execute=execute, **kwargs)
 
 topt.TestOptimizer.check_file = _collect_cf
-_topt_src = (Path({str(sg_root)!r}) / "tests/test_optimizer.py").read_text()
-_topt_tree = _ast.parse(_topt_src)
 cf_methods = []
+pure_cf_only_methods = set()
+all_topt_methods = []
+unsafe_methods = set()
 for node in _ast.walk(_topt_tree):
     if isinstance(node, _ast.ClassDef) and node.name == "TestOptimizer":
         for item in node.body:
             if isinstance(item, _ast.FunctionDef) and item.name.startswith("test_"):
+                all_topt_methods.append(item.name)
+                src_seg = _ast.get_source_segment(_topt_src, item) or ""
+                if any(kw in src_seg for kw in ("patch", "mock", "Dialects", "_classes", "subprocess", "importlib", "is_compiled", "inspect", "sqlglot.schema =")):
+                    unsafe_methods.add(item.name)
+                for dec in item.decorator_list:
+                    dseg = _ast.get_source_segment(_topt_src, dec) or ""
+                    if "patch" in dseg and 'patch("sqlglot.generator.logger")' not in dseg and "patch('sqlglot.generator.logger')" not in dseg:
+                        unsafe_methods.add(item.name)
                 if any(isinstance(n, _ast.Attribute) and n.attr == "check_file" for n in _ast.walk(item)):
                     cf_methods.append(item.name)
+                    if item.body and all(
+                        isinstance(st, _ast.Expr)
+                        and isinstance(st.value, _ast.Call)
+                        and isinstance(st.value.func, _ast.Attribute)
+                        and st.value.func.attr == "check_file"
+                        and not any(kw.arg == "only" for kw in st.value.keywords)
+                        for st in item.body
+                    ):
+                        pure_cf_only_methods.add(item.name)
 
-topt.TestOptimizer.pool = None
-topt.sqlglot.schema = topt.MappingSchema()
-topt.TestOptimizer.conn = duckdb.connect("/app/duckdb_opt.db", read_only=True, config={{"threads": 1}})
+topt.TestOptimizer.conn = rc.LazyCachedDuckConn(
+    b"OPT_DB", lambda: orig_connect("/app/duckdb_opt.db", read_only=True, config={{"threads": 1}}), cache_enabled=True
+)
 for mname in cf_methods:
     if mname == "test_tpcds":
+        cf_method_shards[mname] = {{"cf_tpc-ds/tpc-ds"}}
         record_check_file_shard("tpc-ds/tpc-ds", topt.optimizer.optimize, schema=th.TPCDS_SCHEMA, pretty=True, execute=False)
         continue
     if mname == "test_tpch":
+        cf_method_shards[mname] = {{"cf_tpc-h/tpc-h"}}
         record_check_file_shard("tpc-h/tpc-h", topt.optimizer.optimize, schema=th.TPCH_SCHEMA, pretty=True)
         continue
+    _cur_cf_m[0] = mname
     tc = topt.TestOptimizer(mname)
     res = unittest.TestResult()
     tc.run(res)
-topt.TestOptimizer.conn.close()
+    _cur_cf_m[0] = None
 topt.TestOptimizer.check_file = orig_cf
 
 # Collect test_annotate_funcs
@@ -2053,6 +2504,228 @@ for col in ("b", "c"):
                 add_fine(b_ca["of"], of, rid)
                 add_fine(b_ca["ff"], ff, rid)
 
+# ---- Part C: Collect whole-method opt_methods + per-call inline_opt across pure TestOptimizer methods ----
+om_deps_list = []
+om_deps_to_id = {{}}
+om_methods = {{}}
+om_fine = {{}}
+om_next_mid = 0
+
+def _om_add(mname, dset, pset, gset, ftoks):
+    global om_next_mid
+    key = (tuple(sorted(dset)), tuple(sorted(pset)), tuple(sorted(gset)))
+    idx = om_deps_to_id.get(key)
+    if idx is None:
+        idx = len(om_deps_list)
+        om_deps_list.append(key)
+        om_deps_to_id[key] = idx
+    mid = om_next_mid
+    om_next_mid += 1
+    om_methods[mname] = (idx, mid)
+    for t in ftoks:
+        om_fine.setdefault(t, set()).add(mid)
+
+def _union_shard_deps(sh_names):
+    ud, up, ug, uf = set(), set(), set(), set()
+    for sn in sh_names:
+        sb = shard_builders.get(sn)
+        if sb is None:
+            continue
+        for ds, ps, gs in sb["deps_list"]:
+            ud.update(ds); up.update(ps); ug.update(gs)
+        for fk in ("pf", "of", "ff", "ef"):
+            uf.update(sb[fk].keys())
+    return ud, up, ug, uf
+
+# Pre-populated from Part B shards (zero extra execution!)
+_SKIP_LIVE_OM = {{
+    "test_scope", "test_qualify_struct_star_long_cte_chain", "test_deep_ast_type_annotation",
+    "test_simplify", "test_annotate_funcs", "test_annotate_types",
+    "test_optimize_in_nulls", "test_optimize_correlated_all",
+}} | unsafe_methods
+
+for mname, sh_name in (
+    ("test_annotate_funcs", "annotate_funcs"),
+    ("test_optimize_in_nulls", "in_nulls"),
+    ("test_optimize_correlated_all", "corr_all"),
+):
+    if mname not in unsafe_methods and sh_name in shard_builders:
+        _om_add(mname, *_union_shard_deps((sh_name,)))
+
+if "test_annotate_types" not in unsafe_methods and "annotate_types" in shard_builders:
+    ud, up, ug, uf = _union_shard_deps(("annotate_types",))
+    rec_stack.append((ud, up, ug)); fine_stack.append(uf)
+    try:
+        topt.annotate_types(exp.select("*").from_(exp.select("1").union("VALUES (2)").subquery("s")))
+        topt.annotate_types(exp.Literal.number(f"1E{{topt.MAX_EMAX + 1}}"))
+    finally:
+        rec_stack.pop(); fine_stack.pop()
+    _om_add("test_annotate_types", ud, up, ug, uf)
+
+for mname in pure_cf_only_methods:
+    if mname not in unsafe_methods and mname in cf_method_shards:
+        _om_add(mname, *_union_shard_deps(cf_method_shards[mname]))
+
+# Record inline_opt + remaining pure TestOptimizer methods (including test_qualify_columns!)
+b_inl = get_builder("inline_opt")
+inl_bad = set()
+inl_sigs = {{}}
+inl_depth = [0]
+
+orig_topt_po = topt.parse_one
+orig_topt_opt = topt.optimizer.optimize
+orig_topt_q = topt.qualify
+orig_mod_q = topt.optimizer.qualify.qualify
+orig_mod_qc = topt.optimizer.qualify_columns.qualify_columns
+
+def _inl_record(key, p_deps, p_sig, o_deps, out_expr, pf, of):
+    if key in inl_bad or not isinstance(out_expr, exp.Expr):
+        return
+    osig = rc.ast_struct_sig(out_expr, exp)
+    if osig is None:
+        inl_bad.add(key); b_inl["rows"].pop(key, None); return
+    prev = inl_sigs.get(key)
+    if prev is not None:
+        if prev != osig:
+            inl_bad.add(key); b_inl["rows"].pop(key, None)
+        return
+    pk = rc.pack_expr(out_expr, exp)
+    if pk is rc._UNPACKABLE:
+        inl_bad.add(key); return
+    ast_idx = len(b_inl["asts"]); b_inl["asts"].append(pk)
+    rid = b_inl["next_rid"]; b_inl["next_rid"] = rid + 1
+    p_idx = intern_dep(b_inl, *p_deps) if p_deps is not None else -1
+    o_idx = intern_dep(b_inl, *o_deps) if o_deps is not None else -1
+    b_inl["rows"][key] = (p_idx, p_sig, o_idx, ast_idx, rid)
+    inl_sigs[key] = osig
+    if pf: add_fine(b_inl["pf"], pf, rid)
+    if of: add_fine(b_inl["of"], of, rid)
+
+def _rec_topt_po(sql, read=None, dialect=None, **kw):
+    if inl_depth[0] != 0 or type(sql) is not str or kw:
+        return orig_topt_po(sql, read=read, dialect=dialect, **kw)
+    dk = rc.norm_dialect_key(read if read is not None else dialect)
+    if dk is None:
+        return orig_topt_po(sql, read=read, dialect=dialect)
+    p_d, p_p, p_g, pf = set(), set(), set(), set()
+    inl_depth[0] += 1
+    rec_stack.append((p_d, p_p, p_g)); fine_stack.append(pf)
+    try:
+        res = orig_topt_po(sql, read=read, dialect=dialect)
+    finally:
+        rec_stack.pop(); fine_stack.pop(); inl_depth[0] -= 1
+    ps = rc.ast_struct_sig(res, exp)
+    if ps is not None:
+        _inl_record(("P", sql, dk), (p_d, p_p, p_g), ps, None, res, pf, None)
+    return res
+
+def _rec_topt_opt(expression, *args, **kwargs):
+    if inl_depth[0] != 0 or args or "rules" in kwargs:
+        return orig_topt_opt(expression, *args, **kwargs)
+    kw_h = rc.norm_opt_kwargs(kwargs)
+    if kw_h is None:
+        return orig_topt_opt(expression, *args, **kwargs)
+    if type(expression) is str:
+        d_arg = kwargs.get("dialect")
+        p_d, p_p, p_g, pf = set(), set(), set(), set()
+        inl_depth[0] += 1
+        rec_stack.append((p_d, p_p, p_g)); fine_stack.append(pf)
+        try:
+            parsed = orig_topt_po(expression, read=d_arg)
+        finally:
+            rec_stack.pop(); fine_stack.pop()
+        ps = rc.ast_struct_sig(parsed, exp)
+        o_d, o_p, o_g, of = set(), set(), set(), set()
+        rec_stack.append((o_d, o_p, o_g)); fine_stack.append(of)
+        try:
+            res = orig_topt_opt(parsed, **kwargs)
+        finally:
+            rec_stack.pop(); fine_stack.pop(); inl_depth[0] -= 1
+        if ps is not None:
+            _inl_record(("OS", expression, kw_h), (p_d, p_p, p_g), ps, (o_d, o_p, o_g), res, pf, of)
+        return res
+    if isinstance(expression, exp.Expr) and kwargs.get("copy", True):
+        isig = rc.ast_struct_sig(expression, exp)
+        o_d, o_p, o_g, of = set(), set(), set(), set()
+        inl_depth[0] += 1
+        rec_stack.append((o_d, o_p, o_g)); fine_stack.append(of)
+        try:
+            res = orig_topt_opt(expression, **kwargs)
+        finally:
+            rec_stack.pop(); fine_stack.pop(); inl_depth[0] -= 1
+        if isig is not None:
+            _inl_record(("OE", isig, kw_h), None, None, (o_d, o_p, o_g), res, None, of)
+        return res
+    return orig_topt_opt(expression, *args, **kwargs)
+
+def _make_rec_q(orig_fn, tag):
+    import functools as _ft
+    @_ft.wraps(orig_fn)
+    def _rec_q(expression, *args, **kwargs):
+        if inl_depth[0] != 0 or args or not isinstance(expression, exp.Expr):
+            return orig_fn(expression, *args, **kwargs)
+        kw_h = rc.norm_opt_kwargs(kwargs)
+        if kw_h is None:
+            return orig_fn(expression, *args, **kwargs)
+        isig = rc.ast_struct_sig(expression, exp)
+        o_d, o_p, o_g, of = set(), set(), set(), set()
+        inl_depth[0] += 1
+        rec_stack.append((o_d, o_p, o_g)); fine_stack.append(of)
+        try:
+            res = orig_fn(expression, **kwargs)
+        finally:
+            rec_stack.pop(); fine_stack.pop(); inl_depth[0] -= 1
+        if isig is not None:
+            _inl_record((tag, isig, kw_h), None, None, (o_d, o_p, o_g), res, None, of)
+        return res
+    return _rec_q
+
+_rec_q_fn = _make_rec_q(orig_mod_q, "QE")
+_rec_qc_fn = _make_rec_q(orig_mod_qc, "QCE")
+
+def _stub_cf_union(self, file, func, pretty=False, execute=None, only=None, **kwargs):
+    if only is None and _cur_cf_m[0] is not None:
+        cf_method_shards.setdefault(_cur_cf_m[0], set()).add(f"cf_{{file}}")
+    elif only is not None:
+        orig_cf(self, file, func, pretty=pretty, execute=execute, only=only, **kwargs)
+
+topt.parse_one = _rec_topt_po
+topt.optimizer.optimize = _rec_topt_opt
+topt.qualify = _rec_q_fn
+topt.optimizer.qualify.qualify = _rec_q_fn
+topt.optimizer.qualify_columns.qualify_columns = _rec_qc_fn
+topt.TestOptimizer.check_file = _stub_cf_union
+topt.duckdb.connect = lambda *a, **kw: rc.LazyCachedDuckConn(b"EMPTY", lambda: orig_connect(config={{"threads": 1}}), cache_enabled=True) if (not a and not kw) else orig_connect(*a, **kw)
+
+try:
+    for mname in all_topt_methods:
+        if mname in _SKIP_LIVE_OM or mname in pure_cf_only_methods or mname in om_methods:
+            continue
+        _cur_cf_m[0] = mname
+        m_d, m_p, m_g, m_f = set(), set(), set(), set()
+        rec_stack.append((m_d, m_p, m_g)); fine_stack.append(m_f)
+        try:
+            tc = topt.TestOptimizer(mname)
+            res = unittest.TestResult()
+            tc.run(res)
+        finally:
+            rec_stack.pop(); fine_stack.pop()
+            _cur_cf_m[0] = None
+        if res.wasSuccessful():
+            if mname in cf_method_shards:
+                ud, up, ug, uf = _union_shard_deps(cf_method_shards[mname])
+                m_d.update(ud); m_p.update(up); m_g.update(ug); m_f.update(uf)
+            _om_add(mname, m_d, m_p, m_g, m_f)
+finally:
+    topt.parse_one = orig_topt_po
+    topt.optimizer.optimize = orig_topt_opt
+    topt.qualify = orig_topt_q
+    topt.optimizer.qualify.qualify = orig_mod_q
+    topt.optimizer.qualify_columns.qualify_columns = orig_mod_qc
+    topt.TestOptimizer.check_file = orig_cf
+    topt.duckdb.connect = orig_connect
+    topt.TestOptimizer.conn.close()
+
 restore_rec()
 restore_fine()
 
@@ -2075,90 +2748,13 @@ for name, b in shard_builders.items():
     tot_opt_rows += len(b["rows"])
     tot_opt_bytes += len(ib) + ast_p.stat().st_size + fb_sz
 
-# ---- Part B: Collect Lazy DuckDB Query-Result Cache ----
-queries_cache = {{}}
-ddls_set = set()
-bad_queries = set()
+# Write opt_methods shard (whole-method direct-jump for TestOptimizer!)
+if om_methods:
+    om_ib = marshal.dumps((om_deps_list, om_methods))
+    (opt_dir / "opt_methods.idx").write_bytes(om_ib)
+    om_fb = rc._write_fine_tables((om_fine,), opt_dir / "opt_methods.fdat", opt_dir / "opt_methods.ftoc")
+    tot_opt_bytes += len(om_ib) + om_fb
 
-class _RecDuckCursor:
-    def __init__(self, real_cur, key):
-        self._cur = real_cur
-        self._key = key
-        self.description = real_cur.description
-
-    def fetchall(self):
-        rows = self._cur.fetchall()
-        if self._key is not None and self._key not in bad_queries:
-            try:
-                cols = tuple(d[0] for d in (self.description or ()))
-                pickle.dumps((cols, rows), protocol=pickle.HIGHEST_PROTOCOL)
-                prev = queries_cache.get(self._key)
-                if prev is None:
-                    queries_cache[self._key] = (cols, rows)
-                elif prev != (cols, rows):
-                    bad_queries.add(self._key)
-                    queries_cache.pop(self._key, None)
-            except Exception:
-                bad_queries.add(self._key)
-                queries_cache.pop(self._key, None)
-        return rows
-
-    def fetchone(self): return self._cur.fetchone()
-    def df(self): return self._cur.df()
-    def fetchdf(self): return self._cur.fetchdf()
-    def __getattr__(self, name): return getattr(self._cur, name)
-
-class _RecDuckConn:
-    def __init__(self, real_conn, init_sig):
-        self._conn = real_conn
-        self._sig = init_sig
-
-    def execute(self, query, parameters=None, *a, **kw):
-        if parameters is not None or a or kw or type(query) is not str:
-            return self._conn.execute(query, parameters, *a, **kw) if parameters is not None else self._conn.execute(query, *a, **kw)
-        if rc._is_pure_read_sql(query):
-            return _RecDuckCursor(self._conn.execute(query), (self._sig, query))
-        cur = self._conn.execute(query)
-        self._sig = rc._ddl_step_sig(self._sig, query)
-        ddls_set.add(self._sig)
-        return cur
-
-    def close(self): return self._conn.close()
-    def __enter__(self): return self
-    def __exit__(self, *ea): self.close()
-    def __getattr__(self, name): return getattr(self._conn, name)
-
-orig_connect = duckdb.connect
-def _rec_connect(*a, **kw):
-    if not a and not kw:
-        return _RecDuckConn(orig_connect(config={{"threads": 1}}), b"EMPTY")
-    return orig_connect(*a, **kw)
-
-duck_methods = []
-for node in _ast.walk(_topt_tree):
-    if isinstance(node, _ast.ClassDef) and node.name == "TestOptimizer":
-        for item in node.body:
-            if isinstance(item, _ast.FunctionDef) and item.name.startswith("test_"):
-                src_seg = _ast.get_source_segment(_topt_src, item) or ""
-                if ("duckdb.connect" in src_seg or "self.conn" in src_seg) and "check_file" not in src_seg:
-                    duck_methods.append(item.name)
-                elif item.name == "test_eliminate_joins":
-                    duck_methods.append(item.name)
-
-topt.duckdb.connect = _rec_connect
-opt_db_conn = orig_connect("/app/duckdb_opt.db", read_only=True, config={{"threads": 1}})
-topt.TestOptimizer.conn = _RecDuckConn(opt_db_conn, b"OPT_DB")
-topt.TestOptimizer.check_file = lambda *a, **kw: None
-for mname in duck_methods:
-    tc = topt.TestOptimizer(mname)
-    res = unittest.TestResult()
-    tc.run(res)
-    if not res.wasSuccessful():
-        raise RuntimeError(f"duckdb cache collection failed in {{mname}}: {{res.failures[:1]}} {{res.errors[:1]}}")
-opt_db_conn.close()
-
-dblob = zlib.compress(pickle.dumps({{"queries": queries_cache, "ddls": ddls_set}}, protocol=pickle.HIGHEST_PROTOCOL), 6)
-Path({str(duck_path)!r}).write_bytes(dblob)
 print(f"{{tot_opt_rows}} {{tot_opt_bytes}} {{len(queries_cache)}} {{len(dblob)}}")
 """
     res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
@@ -2248,7 +2844,7 @@ res = unittest.TestResult()
 filt.run(res)
 if not res.wasSuccessful():
     raise RuntimeError(f"exec_replay collection failed: {{res.failures[:1]}} {{res.errors[:1]}}")
-eblob = zlib.compress(pickle.dumps(exec_cache, protocol=pickle.HIGHEST_PROTOCOL), 6)
+eblob = pickle.dumps(exec_cache, protocol=pickle.HIGHEST_PROTOCOL)
 Path({str(exec_path)!r}).write_bytes(eblob)
 
 # ---- Part B: Collect Lazy SQLite Query Cache (test_optimize_cross_joins & test_simplify_between & test_optimizer) ----
@@ -2319,7 +2915,7 @@ for mod_n in ("tests.test_optimize_cross_joins", "tests.test_simplify_between"):
     if not r.wasSuccessful():
         raise RuntimeError(f"sqlite cache failed in {{mod_n}}: {{r.failures[:1]}} {{r.errors[:1]}}")
 
-sblob = zlib.compress(pickle.dumps({{"queries": sq_queries, "ddls": sq_ddls}}, protocol=pickle.HIGHEST_PROTOCOL), 6)
+sblob = pickle.dumps({{"queries": sq_queries, "ddls": sq_ddls}}, protocol=pickle.HIGHEST_PROTOCOL)
 Path({str(sqlite_path)!r}).write_bytes(sblob)
 print(f"{{len(exec_cache)}} {{len(eblob)}} {{len(sq_queries)}} {{len(sblob)}}")
 """

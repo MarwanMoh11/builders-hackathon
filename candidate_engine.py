@@ -871,6 +871,10 @@ class CandidateEngine:
     @property
     def dict_keys_by_oa(self) -> dict[str, dict[str, dict[str, list[int]]]]:
         if self._dict_keys_by_oa is None:
+            raw_p = Path("/app/maps_raw/dict_maps.marshal")
+            if raw_p.is_file():
+                self._dict_keys_by_oa = marshal.loads(raw_p.read_bytes())
+                return self._dict_keys_by_oa
             if self.maps_dir is not None:
                 p = self.maps_dir / "dict_maps.zlib"
                 if p.exists():
@@ -888,6 +892,11 @@ class CandidateEngine:
         idx = self._line_cov_index.get(rel)
         if idx is None or self.maps_dir is None:
             return None
+        raw_p = Path(f"/app/maps_raw/line_cov/{idx}.marshal")
+        if raw_p.is_file():
+            lm = marshal.loads(raw_p.read_bytes())
+            self._line_cov_cache[rel] = lm
+            return lm
         p = self.maps_dir / "line_cov" / f"{idx}.zlib"
         if not p.exists():
             return None
@@ -904,6 +913,11 @@ class CandidateEngine:
         mtid = self.num_to_map_tid.get(rnum)
         if mtid is None or self.subtests_dir is None:
             return []
+        raw_p = Path(f"/app/maps_raw/subtests/{mtid}.marshal")
+        if raw_p.is_file():
+            groups = marshal.loads(raw_p.read_bytes())
+            self._loaded_subtests[rnum] = groups
+            return groups
         p = self.subtests_dir / f"{mtid}.zlib"
         if not p.exists():
             self._loaded_subtests[rnum] = []

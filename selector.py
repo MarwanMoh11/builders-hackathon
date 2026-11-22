@@ -44,11 +44,15 @@ def main() -> None:
     num_to_test = {t["number"]: t for t in tests_list}
     dur_by_num = {t["number"]: duration_ms(t["seconds"]) for t in tests_list}
 
-    # 2. Load compact core maps (< 40ms); subtest files load lazily on demand!
-    core_path = MAPS_DIR / "core_maps.zlib"
-    if not core_path.exists():
-        core_path = MAPS_DIR / "blast_maps.zlib"
-    maps = marshal.loads(zlib.decompress(core_path.read_bytes()))
+    # 2. Load compact core maps (< 15ms uncompressed in container, fallback to .zlib); subtest files load lazily!
+    raw_core = Path("/app/maps_raw/core_maps.marshal")
+    if raw_core.exists():
+        maps = marshal.loads(raw_core.read_bytes())
+    else:
+        core_path = MAPS_DIR / "core_maps.zlib"
+        if not core_path.exists():
+            core_path = MAPS_DIR / "blast_maps.zlib"
+        maps = marshal.loads(zlib.decompress(core_path.read_bytes()))
     t_load = time.perf_counter()
 
     # 3. Plan all commits in /data/commits/*.patch

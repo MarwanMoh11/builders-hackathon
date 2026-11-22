@@ -253,6 +253,7 @@ ACTIVE_VAL_COUNTER: int = 0
 ACTIVE_VAL_DEPTH: int = 0
 ACTIVE_VAL_FILE: str = ""
 ACTIVE_REPLAY_SCOPE: rc.ReplayScope | None = None
+ACTIVE_INLINE_OPT_DEPTH: int = 0
 VAL_FAILED_INSIDE: bool = False
 IN_ASSERT_CTX: int = 0
 ACTIVE_COMMIT_PLAN: CommitPlan | None = None
@@ -574,7 +575,7 @@ _TD_DEFERRED_LINES = (
 
 def _preload_test_dialect_deferred(root: Path) -> bool:
     """Pre-import tests.dialects.test_dialect WITHOUT importing BigQuery/Hive/Snowflake/Spark2/DuckDB!
-    Child processes bind those 6 symbols cleanly AFTER installing _InMemoryFinder."""
+    Installs lazy module __getattr__ so untouched dialects are NEVER imported in forked children!"""
     if "tests.dialects.test_dialect" in sys.modules:
         return True
     import types as _types
@@ -591,28 +592,88 @@ def _preload_test_dialect_deferred(root: Path) -> bool:
         mod.__package__ = "tests.dialects"
         sys.modules["tests.dialects.test_dialect"] = mod
         exec(compile(src, str(p), "exec"), mod.__dict__)
+
+        def _lazy_td_getattr(name: str) -> Any:
+            if name in ("BigQuery", "Hive", "Snowflake", "Spark2"):
+                val = getattr(importlib.import_module("sqlglot.dialects"), name)
+                setattr(mod, name, val)
+                return val
+            if name == "WS_CONTROL_CHARS_TO_DUCK":
+                val = importlib.import_module("sqlglot.dialects.duckdb").WS_CONTROL_CHARS_TO_DUCK
+                setattr(mod, name, val)
+                return val
+            if name == "SnowflakeParser":
+                val = importlib.import_module("sqlglot.parsers.snowflake").SnowflakeParser
+                setattr(mod, name, val)
+                return val
+            raise AttributeError(f"module {mod.__name__!r} has no attribute {name!r}")
+
+        mod.__getattr__ = _lazy_td_getattr  # type: ignore[attr-defined]
         mod._blast_deferred_dialects = True  # type: ignore[attr-defined]
+
+        # Ensure Validator.assert_duckdb_sql always binds WS_CONTROL_CHARS_TO_DUCK lazily for ANY subclass (e.g. test_hive)!
+        _orig_ads = mod.Validator.assert_duckdb_sql
+
+        def _lazy_assert_duckdb_sql(self, *args, **kwargs):
+            if "WS_CONTROL_CHARS_TO_DUCK" not in mod.__dict__:
+                mod.WS_CONTROL_CHARS_TO_DUCK = importlib.import_module("sqlglot.dialects.duckdb").WS_CONTROL_CHARS_TO_DUCK
+            return _orig_ads(self, *args, **kwargs)
+
+        mod.Validator.assert_duckdb_sql = _lazy_assert_duckdb_sql  # type: ignore[method-assign]
         return True
     except Exception:
         sys.modules.pop("tests.dialects.test_dialect", None)
         return False
 
 
-def _resolve_deferred_test_dialect() -> None:
-    """Bind the 6 deferred dialect symbols onto tests.dialects.test_dialect inside a forked child."""
+def _resolve_deferred_test_dialect(patched_files: set[str] | None = None, meth: str | None = None) -> None:
+    """Bind ONLY needed deferred dialect symbols (exact method deps + patched eager files!)."""
     td = sys.modules.get("tests.dialects.test_dialect")
     if td is None or not getattr(td, "_blast_deferred_dialects", False):
         return
-    from sqlglot.dialects import BigQuery, Hive, Snowflake, Spark2
-    from sqlglot.dialects.duckdb import WS_CONTROL_CHARS_TO_DUCK
-    from sqlglot.parsers.snowflake import SnowflakeParser
-    td.BigQuery = BigQuery  # type: ignore[attr-defined]
-    td.Hive = Hive  # type: ignore[attr-defined]
-    td.Snowflake = Snowflake  # type: ignore[attr-defined]
-    td.Spark2 = Spark2  # type: ignore[attr-defined]
-    td.WS_CONTROL_CHARS_TO_DUCK = WS_CONTROL_CHARS_TO_DUCK  # type: ignore[attr-defined]
-    td.SnowflakeParser = SnowflakeParser  # type: ignore[attr-defined]
-    td._blast_deferred_dialects = False  # type: ignore[attr-defined]
+    if patched_files is None and meth is None:
+        from sqlglot.dialects import BigQuery, Hive, Snowflake, Spark2
+        from sqlglot.dialects.duckdb import WS_CONTROL_CHARS_TO_DUCK
+        from sqlglot.parsers.snowflake import SnowflakeParser
+        td.BigQuery = BigQuery  # type: ignore[attr-defined]
+        td.Hive = Hive  # type: ignore[attr-defined]
+        td.Snowflake = Snowflake  # type: ignore[attr-defined]
+        td.Spark2 = Spark2  # type: ignore[attr-defined]
+        td.WS_CONTROL_CHARS_TO_DUCK = WS_CONTROL_CHARS_TO_DUCK  # type: ignore[attr-defined]
+        td.SnowflakeParser = SnowflakeParser  # type: ignore[attr-defined]
+        td._blast_deferred_dialects = False  # type: ignore[attr-defined]
+        return
+    _METH_NEEDS = {
+        "test_get_or_raise": ("Hive",),
+        "test_compare_dialects": ("BigQuery", "Snowflake"),
+        "test_initcap": ("BigQuery", "Snowflake", "Spark2", "WS_CONTROL_CHARS_TO_DUCK"),
+        "test_patch_dialect_parser": ("Snowflake", "SnowflakeParser"),
+        "test_custom_dialect": ("SnowflakeParser",),
+        "test_hive": ("WS_CONTROL_CHARS_TO_DUCK",),
+    }
+    _STEM_NEEDS = {
+        "bigquery": ("BigQuery",),
+        "hive": ("Hive",),
+        "snowflake": ("Snowflake", "SnowflakeParser"),
+        "spark2": ("Spark2",),
+        "duckdb": ("WS_CONTROL_CHARS_TO_DUCK",),
+    }
+    needed: set[str] = set()
+    if meth is not None:
+        needed.update(_METH_NEEDS.get(meth, ()))
+    if patched_files:
+        for rel in patched_files:
+            if rel in _EAGER_TD_FILES:
+                needed.update(_STEM_NEEDS.get(Path(rel).stem, ()))
+    for sym in needed:
+        if sym in td.__dict__:
+            continue
+        if sym in ("BigQuery", "Hive", "Snowflake", "Spark2"):
+            setattr(td, sym, getattr(importlib.import_module("sqlglot.dialects"), sym))
+        elif sym == "WS_CONTROL_CHARS_TO_DUCK":
+            td.WS_CONTROL_CHARS_TO_DUCK = importlib.import_module("sqlglot.dialects.duckdb").WS_CONTROL_CHARS_TO_DUCK  # type: ignore[attr-defined]
+        elif sym == "SnowflakeParser":
+            td.SnowflakeParser = importlib.import_module("sqlglot.parsers.snowflake").SnowflakeParser  # type: ignore[attr-defined]
 
 
 def _import_test_module_lazy(mod_name: str, is_patched: bool):
@@ -699,6 +760,146 @@ def _install_fast_test_patches(maps: dict[str, Any], commit_plan: CommitPlan, sq
             raise _FailFast(exc) from exc
 
     unittest.TestCase.subTest = _failfast_subtest  # type: ignore[method-assign]
+
+    # 1a. Track assertRaises/assertWarns/assertLogs & non-logger mock.patch universally (before ANY test runs!)
+    if not getattr(unittest.TestCase, "_blast_ctx_patched", False):
+        class _AssertCtxProxy:
+            def __init__(self, inner):
+                self._inner = inner
+            def __enter__(self):
+                global IN_ASSERT_CTX
+                res = self._inner.__enter__()
+                IN_ASSERT_CTX += 1
+                return res
+            def __exit__(self, *exc_info):
+                global IN_ASSERT_CTX
+                try:
+                    return self._inner.__exit__(*exc_info)
+                finally:
+                    IN_ASSERT_CTX -= 1
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        for cname in ("assertRaises", "assertRaisesRegex", "assertWarns", "assertWarnsRegex", "assertLogs", "assertNoLogs"):
+            orig_cm = getattr(unittest.TestCase, cname, None)
+            if orig_cm is None:
+                continue
+            has_callable = cname not in ("assertLogs", "assertNoLogs")
+            callable_min_args = 3 if "Regex" in cname else 2
+
+            def _make_cm(orig, hc, min_callable_args):
+                def _wrapped(self, *args, **kwargs):
+                    global IN_ASSERT_CTX
+                    if hc and len(args) >= min_callable_args and args[min_callable_args - 1] is not None:
+                        IN_ASSERT_CTX += 1
+                        try:
+                            return orig(self, *args, **kwargs)
+                        finally:
+                            IN_ASSERT_CTX -= 1
+                    cm = orig(self, *args, **kwargs)
+                    if not hasattr(cm, "__enter__"):
+                        return cm
+                    return _AssertCtxProxy(cm)
+                return _wrapped
+
+            setattr(unittest.TestCase, cname, _make_cm(orig_cm, has_callable, callable_min_args))
+        try:
+            from unittest import mock as _umock
+            _orig_p_enter = _umock._patch.__enter__
+            _orig_p_exit = _umock._patch.__exit__
+
+            def _wrapped_p_enter(self):
+                global IN_ASSERT_CTX
+                res = _orig_p_enter(self)
+                if getattr(self, "attribute", None) != "logger":
+                    IN_ASSERT_CTX += 1
+                return res
+
+            def _wrapped_p_exit(self, *exc_info):
+                global IN_ASSERT_CTX
+                try:
+                    return _orig_p_exit(self, *exc_info)
+                finally:
+                    if getattr(self, "attribute", None) != "logger":
+                        IN_ASSERT_CTX -= 1
+
+            _umock._patch.__enter__ = _wrapped_p_enter  # type: ignore[method-assign]
+            _umock._patch.__exit__ = _wrapped_p_exit  # type: ignore[method-assign]
+        except Exception:
+            pass
+        unittest.TestCase._blast_ctx_patched = True
+
+    # 1b. Cached Tokenizer._KEYWORD_TRIE for untouched dialects (skips ~600k Python genexpr calls / ~42ms!)
+    _all_t = set(commit_plan.patched_files) | set(commit_plan.deleted_files)
+    if not (
+        _all_t
+        & {
+            "sqlglot/tokens.py",
+            "sqlglot/tokenizer_core.py",
+            "sqlglot/dialects/dialect.py",
+            "sqlglot/trie.py",
+            "sqlglot/helper.py",
+            "sqlglot/__init__.py",
+        }
+    ):
+        _tcache = rc.load_tok_trie_cache()
+        if _tcache:
+            try:
+                import sqlglot.tokens as _sgtok
+                if not getattr(_sgtok._TokenizerBase, "_blast_trie_patched", False):
+                    _orig_tok_sub = _sgtok._TokenizerBase.__init_subclass__.__func__
+                    _patched_mods = {
+                        r.removesuffix("/__init__.py").removesuffix(".py").replace("/", ".")
+                        for r in _all_t
+                        if r.endswith(".py")
+                    }
+
+                    @classmethod  # type: ignore[misc]
+                    def _fast_tok_init_subclass(cls, **kwargs):
+                        key = f"{cls.__module__}.{cls.__qualname__}"
+                        cached_trie = _tcache.get(key)
+                        if cached_trie is not None and not any(
+                            b.__module__ in _patched_mods for b in cls.__mro__ if b.__module__.startswith("sqlglot.")
+                        ):
+                            super(_sgtok._TokenizerBase, cls).__init_subclass__(**kwargs)
+                            cls._QUOTES = _sgtok._convert_quotes(cls.QUOTES)
+                            cls._IDENTIFIERS = _sgtok._convert_quotes(cls.IDENTIFIERS)
+                            cls._FORMAT_STRINGS = {
+                                **{
+                                    p + s: (e, _sgtok.TokenType.NATIONAL_STRING)
+                                    for s, e in cls._QUOTES.items()
+                                    for p in ("n", "N")
+                                },
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.BIT_STRING, cls.BIT_STRINGS),
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.BYTE_STRING, cls.BYTE_STRINGS),
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.HEX_STRING, cls.HEX_STRINGS),
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.NATIONAL_RAW_STRING, cls.NATIONAL_RAW_STRINGS),
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.RAW_STRING, cls.RAW_STRINGS),
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.HEREDOC_STRING, cls.HEREDOC_STRINGS),
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.UNICODE_STRING, cls.UNICODE_STRINGS),
+                            }
+                            if not any(
+                                "BYTE_STRING_ESCAPES" in k.__dict__ for k in cls.__mro__ if k.__module__ != _sgtok.__name__
+                            ):
+                                cls.BYTE_STRING_ESCAPES = cls.STRING_ESCAPES.copy()
+                            cls._STRING_ESCAPES = set(cls.STRING_ESCAPES)
+                            cls._BYTE_STRING_ESCAPES = set(cls.BYTE_STRING_ESCAPES)
+                            cls._IDENTIFIER_ESCAPES = set(cls.IDENTIFIER_ESCAPES)
+                            cls._COMMENTS = {
+                                **{c: None for c in cls.COMMENTS if isinstance(c, str)},
+                                **{c[0]: c[1] for c in cls.COMMENTS if not isinstance(c, str)},
+                                "{#": "#}",
+                            }
+                            if cls.HINT_START in cls.KEYWORDS:
+                                cls._COMMENTS[cls.HINT_START] = "*/"
+                            cls._KEYWORD_TRIE = cached_trie
+                            return
+                        _orig_tok_sub(cls, **kwargs)
+
+                    _sgtok._TokenizerBase.__init_subclass__ = _fast_tok_init_subclass
+                    _sgtok._TokenizerBase._blast_trie_patched = True
+            except Exception:
+                pass
 
     # 2. ALWAYS import and wrap tests.helpers fixture loaders (critical for full_fork too!)
     # Guard: NEVER override tests.helpers if tests/helpers.py itself is patched!
@@ -889,6 +1090,25 @@ def _patch_optimizer_module(
     def _fast_check_file(self, file, func, pretty=False, execute=None, only=None, **kwargs):
         check_pickle_all = getattr(topt, "_blast_check_pickle", False)
         check_pickle_sample = getattr(topt, "_blast_check_pickle_sample", False)
+        # Recursively unwrap inline_opt wrappers (including inside partial.keywords['rules']) so func is picklable!
+        def _unwrap_p(obj):
+            orig = getattr(obj, "_blast_orig_fn", None)
+            if orig is not None:
+                return orig
+            if hasattr(obj, "func") and hasattr(obj, "args") and hasattr(obj, "keywords"):
+                import functools as _ft
+                return _ft.partial(
+                    _unwrap_p(obj.func),
+                    *(_unwrap_p(a) for a in obj.args),
+                    **{k: _unwrap_p(v) for k, v in (obj.keywords or {}).items()},
+                )
+            if type(obj) is list:
+                return [_unwrap_p(x) for x in obj]
+            if type(obj) is tuple:
+                return tuple(_unwrap_p(x) for x in obj)
+            return obj
+
+        func = _unwrap_p(func)
         # Always verify func itself is picklable once (matches ProcessPoolExecutor requirement)
         func = pickle.loads(pickle.dumps(func))
         scope = ACTIVE_REPLAY_SCOPE
@@ -1018,7 +1238,12 @@ def _patch_optimizer_module(
                 with self.subTest(title):
                     if do_pickle:
                         func_kwargs = pickle.loads(pickle.dumps(func_kwargs))
-                    optimized = topt.parse_and_optimize(func, sql, dialect, **func_kwargs)
+                    global ACTIVE_INLINE_OPT_DEPTH
+                    ACTIVE_INLINE_OPT_DEPTH += 1
+                    try:
+                        optimized = topt.parse_and_optimize(func, sql, dialect, **func_kwargs)
+                    finally:
+                        ACTIVE_INLINE_OPT_DEPTH -= 1
                     if do_pickle:
                         optimized = pickle.loads(pickle.dumps(optimized))
                     actual = optimized.sql(pretty=pretty, dialect=dialect)
@@ -1367,6 +1592,74 @@ def _patch_optimizer_module(
 
         topt.TestOptimizer.test_optimize_correlated_all = _fast_corr_all
 
+    # Scope-filtered test_merge_asof_join_inputs (skip untouched dialects when replay scope is active!)
+    if "TestOptimizer.test_merge_asof_join_inputs" not in _skip_m and hasattr(topt.TestOptimizer, "test_merge_asof_join_inputs"):
+        orig_asof = topt.TestOptimizer.test_merge_asof_join_inputs
+
+        def _fast_merge_asof(self):
+            scope = ACTIVE_REPLAY_SCOPE
+            if scope is None or helpers_patched or getattr(topt, "_blast_topt_patched", False):
+                return orig_asof(self)
+            # Check which of ("duckdb", "clickhouse", "snowflake") could be affected
+            duck_dirty = bool(
+                ("DuckDB" in scope.dirty_dials)
+                or ("DuckDBGenerator" in scope.dirty_gens)
+                or ("DuckDB" in scope.dirty_opt_dials)
+                or any(Path(df).stem == "duckdb" for df in scope.dirty_files)
+            )
+            if duck_dirty:
+                # DuckDB is used to generate SQL for ALL 3 dialects (expression.sql("duckdb"))
+                targets = ("duckdb", "clickhouse", "snowflake") if ("DuckDB" in scope.dirty_dials or "DuckDBGenerator" in scope.dirty_gens) else ("duckdb",)
+            else:
+                targets = tuple(
+                    d for d, dcls in (("duckdb", "DuckDB"), ("clickhouse", "ClickHouse"), ("snowflake", "Snowflake"))
+                    if (
+                        dcls in scope.dirty_dials
+                        or dcls in scope.dirty_opt_dials
+                        or any(Path(df).stem == d for df in scope.dirty_files)
+                    )
+                )
+            if not targets:
+                return
+            schema = {"x": {"id": "INT", "ts": "INT"}, "y": {"id": "INT", "ts": "INT", "val": "INT"}}
+            with topt.duckdb.connect() as connection:
+                connection.execute(
+                    "CREATE TABLE x (id INT, ts INT); INSERT INTO x VALUES (1, 20), (2, 20); "
+                    "CREATE TABLE y (id INT, ts INT, val INT); "
+                    "INSERT INTO y VALUES (1, 10, 100), (1, 15, 5)"
+                )
+                for dialect in targets:
+                    condition = (
+                        "MATCH_CONDITION (x.ts >= s.ts) ON x.id = s.id"
+                        if dialect == "snowflake"
+                        else "ON x.id = s.id AND x.ts >= s.ts"
+                    )
+                    for subquery in (
+                        "SELECT id, ts, val FROM y WHERE val > 10",
+                        "SELECT id, ts, COALESCE(val, 0) AS val FROM y",
+                    ):
+                        for sql in (
+                            f"SELECT x.id, s.val FROM x ASOF JOIN ({subquery}) AS s {condition}",
+                            f"WITH s AS ({subquery}) SELECT x.id, s.val FROM x ASOF JOIN s {condition}",
+                        ):
+                            with self.subTest(sql=sql, dialect=dialect):
+                                expression = topt.qualify(
+                                    topt.parse_one(sql, dialect=dialect), schema=schema, dialect=dialect
+                                )
+                                self.assertEqual(
+                                    topt.optimizer.merge_subqueries.merge_subqueries(expression.copy()),
+                                    expression,
+                                )
+                                optimized = topt.optimizer.optimize(
+                                    expression, schema=schema, dialect=dialect
+                                )
+                                self.assertCountEqual(
+                                    connection.execute(expression.sql("duckdb")).fetchall(),
+                                    connection.execute(optimized.sql("duckdb")).fetchall(),
+                                )
+
+        topt.TestOptimizer.test_merge_asof_join_inputs = _fast_merge_asof
+
     # Fast-path test_scope's 10,000-UNION-ALL stress query (lines 3392-3399 only compare
     # traverse() vs traverse_scope() without asserting count 10000!) when parser/scope untouched.
     if "TestOptimizer.test_scope" not in _skip_m:
@@ -1476,6 +1769,165 @@ def _patch_optimizer_module(
             return orig_test_simplify(self)
 
         topt.TestOptimizer.test_simplify = _fast_test_simplify
+
+    # Per-call stage-reuse replay (`inline_opt`) for dirty inline TestOptimizer methods (e.g. test_qualify_columns!)
+    if not helpers_patched:
+        import functools as _functools
+        _orig_topt_po = topt.parse_one
+        _orig_topt_opt_mod = topt.optimizer
+        _orig_topt_opt = _orig_topt_opt_mod.optimize
+        _orig_topt_q = _orig_topt_opt_mod.qualify.qualify
+        _orig_topt_qc = _orig_topt_opt_mod.qualify_columns.qualify_columns
+        _topt_exp = topt.exp
+
+        def _get_inline_shard():
+            sc = ACTIVE_REPLAY_SCOPE
+            if (
+                sc is None
+                or ACTIVE_INLINE_OPT_DEPTH != 0
+                or IN_ASSERT_CTX != 0
+                or getattr(topt, "_blast_topt_patched", False)
+                or not getattr(topt.sqlglot.schema, "empty", True)
+            ):
+                return None
+            return rc.get_opt_shard("inline_opt", sc)
+
+        @_functools.wraps(_orig_topt_po)
+        def _wrap_topt_po(sql, read=None, dialect=None, **kw):
+            global ACTIVE_INLINE_OPT_DEPTH
+            if not kw and type(sql) is str:
+                sh = _get_inline_shard()
+                if sh is not None:
+                    dk = rc.norm_dialect_key(read if read is not None else dialect)
+                    if dk is not None:
+                        rec = sh.rows.get(("P", sql, dk))
+                        if rec is not None:
+                            p_dep, _, _, ast_idx, rid = rec
+                            if not (sh.dirty_flags[p_dep] and (sh.dirty_p_rids is None or rid in sh.dirty_p_rids)):
+                                return sh.get_expr(ast_idx, _topt_exp)
+            ACTIVE_INLINE_OPT_DEPTH += 1
+            try:
+                return _orig_topt_po(sql, read=read, dialect=dialect, **kw)
+            finally:
+                ACTIVE_INLINE_OPT_DEPTH -= 1
+
+        @_functools.wraps(_orig_topt_opt)
+        def _wrap_topt_opt(expression, *args, **kwargs):
+            global ACTIVE_INLINE_OPT_DEPTH
+            if "rules" in kwargs and isinstance(kwargs["rules"], (list, tuple)):
+                kwargs = dict(kwargs)
+                kwargs["rules"] = type(kwargs["rules"])(getattr(r, "_blast_orig_fn", r) for r in kwargs["rules"])
+            if not args and "rules" not in kwargs:
+                sh = _get_inline_shard()
+                if sh is not None:
+                    kw_h = rc.norm_opt_kwargs(kwargs)
+                    if kw_h is not None:
+                        if type(expression) is str:
+                            rec = sh.rows.get(("OS", expression, kw_h))
+                            if rec is not None:
+                                p_dep, p_sig, o_dep, ast_idx, rid = rec
+                                o_dirty = sh.dirty_opt_flags[o_dep] and (sh.dirty_o_rids is None or rid in sh.dirty_o_rids)
+                                if not o_dirty:
+                                    p_dirty = sh.dirty_flags[p_dep] and (sh.dirty_p_rids is None or rid in sh.dirty_p_rids)
+                                    if not p_dirty:
+                                        return sh.get_expr(ast_idx, _topt_exp)
+                                    ACTIVE_INLINE_OPT_DEPTH += 1
+                                    try:
+                                        parsed = _orig_topt_po(expression, read=kwargs.get("dialect"))
+                                    finally:
+                                        ACTIVE_INLINE_OPT_DEPTH -= 1
+                                    if rc.ast_struct_sig(parsed, _topt_exp) == p_sig:
+                                        return sh.get_expr(ast_idx, _topt_exp)
+                                    ACTIVE_INLINE_OPT_DEPTH += 1
+                                    try:
+                                        return _orig_topt_opt(parsed, **kwargs)
+                                    finally:
+                                        ACTIVE_INLINE_OPT_DEPTH -= 1
+                        elif isinstance(expression, _topt_exp.Expr) and kwargs.get("copy", True):
+                            isig = rc.ast_struct_sig(expression, _topt_exp)
+                            if isig is not None:
+                                rec = sh.rows.get(("OE", isig, kw_h))
+                                if rec is not None:
+                                    _, _, o_dep, ast_idx, rid = rec
+                                    if not (sh.dirty_opt_flags[o_dep] and (sh.dirty_o_rids is None or rid in sh.dirty_o_rids)):
+                                        return sh.get_expr(ast_idx, _topt_exp)
+            ACTIVE_INLINE_OPT_DEPTH += 1
+            try:
+                return _orig_topt_opt(expression, *args, **kwargs)
+            finally:
+                ACTIVE_INLINE_OPT_DEPTH -= 1
+
+        @_functools.wraps(_orig_topt_q)
+        def _wrap_topt_q(expression, *args, **kwargs):
+            global ACTIVE_INLINE_OPT_DEPTH
+            if not args and isinstance(expression, _topt_exp.Expr) and sys.getrefcount(expression) == 2:
+                sh = _get_inline_shard()
+                if sh is not None:
+                    kw_h = rc.norm_opt_kwargs(kwargs)
+                    if kw_h is not None:
+                        isig = rc.ast_struct_sig(expression, _topt_exp)
+                        if isig is not None:
+                            rec = sh.rows.get(("QE", isig, kw_h))
+                            if rec is not None:
+                                _, _, o_dep, ast_idx, rid = rec
+                                if not (sh.dirty_opt_flags[o_dep] and (sh.dirty_o_rids is None or rid in sh.dirty_o_rids)):
+                                    return sh.get_expr(ast_idx, _topt_exp)
+            ACTIVE_INLINE_OPT_DEPTH += 1
+            try:
+                return _orig_topt_q(expression, *args, **kwargs)
+            finally:
+                ACTIVE_INLINE_OPT_DEPTH -= 1
+
+        @_functools.wraps(_orig_topt_qc)
+        def _wrap_topt_qc(expression, *args, **kwargs):
+            global ACTIVE_INLINE_OPT_DEPTH
+            if not args and isinstance(expression, _topt_exp.Expr) and sys.getrefcount(expression) == 2:
+                sh = _get_inline_shard()
+                if sh is not None:
+                    kw_h = rc.norm_opt_kwargs(kwargs)
+                    if kw_h is not None:
+                        isig = rc.ast_struct_sig(expression, _topt_exp)
+                        if isig is not None:
+                            rec = sh.rows.get(("QCE", isig, kw_h))
+                            if rec is not None:
+                                _, _, o_dep, ast_idx, rid = rec
+                                if not (sh.dirty_opt_flags[o_dep] and (sh.dirty_o_rids is None or rid in sh.dirty_o_rids)):
+                                    return sh.get_expr(ast_idx, _topt_exp)
+            ACTIVE_INLINE_OPT_DEPTH += 1
+            try:
+                return _orig_topt_qc(expression, *args, **kwargs)
+            finally:
+                ACTIVE_INLINE_OPT_DEPTH -= 1
+
+        class _OptSubProxy:
+            __slots__ = ("_orig", "_attr", "_fn")
+            def __init__(self, orig_sub, attr_n, fn):
+                self._orig = orig_sub
+                self._attr = attr_n
+                self._fn = fn
+            def __getattr__(self, name):
+                if name == self._attr:
+                    return self._fn
+                return getattr(self._orig, name)
+
+        class _OptModProxy:
+            __slots__ = ("_orig", "optimize", "qualify", "qualify_columns")
+            def __init__(self, orig_mod):
+                self._orig = orig_mod
+                self.optimize = _wrap_topt_opt
+                self.qualify = _OptSubProxy(orig_mod.qualify, "qualify", _wrap_topt_q)
+                self.qualify_columns = _OptSubProxy(orig_mod.qualify_columns, "qualify_columns", _wrap_topt_qc)
+            def __getattr__(self, name):
+                return getattr(self._orig, name)
+
+        _wrap_topt_po._blast_orig_fn = _orig_topt_po  # type: ignore[attr-defined]
+        _wrap_topt_opt._blast_orig_fn = _orig_topt_opt  # type: ignore[attr-defined]
+        _wrap_topt_q._blast_orig_fn = _orig_topt_q  # type: ignore[attr-defined]
+        _wrap_topt_qc._blast_orig_fn = _orig_topt_qc  # type: ignore[attr-defined]
+
+        topt.parse_one = _wrap_topt_po
+        topt.qualify = _wrap_topt_q
+        topt.optimizer = _OptModProxy(_orig_topt_opt_mod)
 
     topt._blast_patched = True
 
@@ -1605,6 +2057,13 @@ def _load_fixture_cache() -> dict[str, Any]:
     global _FIXTURE_CACHE
     if _FIXTURE_CACHE is not None:
         return _FIXTURE_CACHE
+    p_raw = Path("/app/fixture_cache.pkl")
+    if p_raw.exists():
+        try:
+            _FIXTURE_CACHE = pickle.loads(p_raw.read_bytes())
+            return _FIXTURE_CACHE
+        except Exception:
+            pass
     p = Path("/app/fixture_cache.pkl.zlib")
     if p.exists():
         import zlib as _zlib
@@ -2804,16 +3263,14 @@ def _patch_executor_module(
             "sqlglot/optimizer/merge_subqueries.py",
             "sqlglot/optimizer/eliminate_joins.py",
             "sqlglot/optimizer/eliminate_ctes.py",
-            "sqlglot/optimizer/annotate_types.py",
             "sqlglot/optimizer/canonicalize.py",
-            "sqlglot/optimizer/simplify.py",
         })
         late_opt_pq_ok = (
             not tpch
             and (not helpers_patched or allow_duck_cache)
             and not fixture_touched
             and bool(all_touched)
-            and all(r in _LATE_OPT_FILES or r.startswith("sqlglot/typing/") for r in all_touched)
+            and all(r in _LATE_OPT_FILES for r in all_touched)
         )
         _pq_rules = None
         if late_opt_pq_ok:
@@ -3053,18 +3510,19 @@ def _patch_executor_module(
                         py_exec_q = py_exec_touched or shared_exec_all or (qidx in shared_exec_qidxs)
                         if not planner_touched:
                             plan = cached_entry[1]
+                            det_match = bool(qm.get("det_plan_hash"))
                         else:
                             optimized = _unpack_expr(cached_entry[0])
                             plan = Plan(optimized)
-                        det_h = _hash_plan_det(plan) if qm.get("det_plan_hash") else None
-                        if not py_exec_q and det_h is not None and det_h == qm["det_plan_hash"]:
+                            det_h = _hash_plan_det(plan) if qm.get("det_plan_hash") else None
+                            det_match = det_h is not None and det_h == qm["det_plan_hash"]
+                        if not py_exec_q and det_match:
                             done_w += q_weights[q_pos]
                             q_done += 1
                             continue
                         if (
                             not executor_dir_touched
-                            and det_h is not None
-                            and det_h == qm["det_plan_hash"]
+                            and det_match
                             and qm.get("py_code_hash")
                             and _hash_plan_py_code(plan) == qm["py_code_hash"]
                         ):
@@ -3806,6 +4264,59 @@ def _patch_parser_max_nodes() -> None:
             orig_max_nodes(self)
 
     tpar.TestParser.test_max_nodes = _fast_max_nodes
+
+    if hasattr(tpar.TestParser, "test_text_match_excludes_delimited_tokens"):
+        orig_tmed = tpar.TestParser.test_text_match_excludes_delimited_tokens
+        _TMED_CASES = (
+            ("postgres", "SELECT TRIM($$leading$$)", "SELECT TRIM('leading')"),
+            ("tsql", "SELECT TRIM(N'both')", "SELECT TRIM(N'both')"),
+            ("oracle", "SELECT TRIM(nq'[both]')", "SELECT TRIM(N'both')"),
+            ("postgres", 'SELECT TRIM("leading" FROM x)', 'SELECT TRIM("leading" FROM x)'),
+            ("mysql", "INSERT `local` (a) VALUES (1)", "INSERT INTO `local` (a) VALUES (1)"),
+            ("mysql", "INSERT `directory` (a) VALUES (1)", "INSERT INTO `directory` (a) VALUES (1)"),
+            ("mysql", "SELECT `high_priority` FROM t", "SELECT `high_priority` FROM t"),
+            ("postgres", 'SELECT * INTO "unlogged" FROM t', 'SELECT * INTO "unlogged" FROM t'),
+            ("oracle", 'SELECT XMLELEMENT("name", x) FROM t', 'SELECT XMLELEMENT(NAME "name", x) FROM t'),
+            ("postgres", 'SELECT c::INT "unsigned" FROM t', 'SELECT CAST(c AS INT) AS "unsigned" FROM t'),
+            ("oracle", "SELECT INTERVAL '1' DAY \"to\" FROM t", "SELECT INTERVAL '1' DAY AS \"to\" FROM t"),
+            ("clickhouse", "CREATE TABLE t (j JSON(`skip` String))", 'CREATE TABLE t (j JSON("skip" String))'),
+            ("clickhouse", 'ALTER TABLE t DROP PARTITION "id"', 'ALTER TABLE t DROP PARTITION "id"'),
+            ("databricks", "DECLARE `var` INT", "DECLARE `var` INT"),
+            ("redshift", 'ALTER TABLE t ALTER "sortkey" TYPE INT', 'ALTER TABLE t ALTER COLUMN "sortkey" TYPE INTEGER'),
+            ("duckdb", 'ALTER TABLE t ADD "columns" INT', 'ALTER TABLE t ADD COLUMN "columns" INT'),
+            ("postgres", 'ALTER TABLE "only" ADD COLUMN x INT', 'ALTER TABLE "only" ADD COLUMN x INT'),
+            ("duckdb", 'SELECT MAX("lambda") FROM t', 'SELECT MAX("lambda") FROM t'),
+            ("duckdb", 'CREATE MACRO m() AS "return"', 'CREATE MACRO m() AS "return"'),
+            ("mysql", "ALTER TABLE t RENAME `index`", "ALTER TABLE t RENAME `index`"),
+            ("mysql", "CREATE TABLE t (x TEXT, FULLTEXT `index` (x))", "CREATE TABLE t (x TEXT, FULLTEXT INDEX `index` (x))"),
+            ("mysql", "SHOW CREATE TABLE `json`", "SHOW CREATE TABLE `json`"),
+            ("snowflake", 'WITH "identifier" (c) AS (SELECT 1) SELECT c FROM "identifier"', 'WITH "identifier"(c) AS (SELECT 1) SELECT c FROM "identifier"'),
+            ("snowflake", 'SELECT * FROM t AS "identifier"(a, b)', 'SELECT * FROM t AS "identifier"(a, b)'),
+            ("bigquery", "SELECT ML.PREDICT(MODEL m, `table`)", "SELECT ML.PREDICT(MODEL m, TABLE `table`)"),
+            ("spark", "ALTER TABLE t CHANGE COLUMN a `type` INT", "ALTER TABLE t RENAME COLUMN a TO `type`"),
+            ("exasol", "SELECT JSON_EXTRACT(x, '$.a') \"emits\" FROM t", "SELECT JSON_EXTRACT(x, '$.a') AS \"emits\" FROM t"),
+            ("trino", "SELECT U&'abc' \"uescape\"", "SELECT U&'abc' AS \"uescape\""),
+            ("snowflake", 'SELECT * FROM t MATCH_RECOGNIZE(MEASURES "final" AS f PATTERN (a) DEFINE a AS TRUE)', 'SELECT * FROM t MATCH_RECOGNIZE ( MEASURES "final" AS f PATTERN (a) DEFINE a AS TRUE)'),
+        )
+
+        def _fast_tmed(self):
+            sc = ACTIVE_REPLAY_SCOPE
+            cp = ACTIVE_COMMIT_PLAN
+            if sc is None or (cp is not None and ("tests/test_parser.py" in cp.patched_files or "tests/helpers.py" in cp.patched_files)):
+                return orig_tmed(self)
+            _stems = {Path(df).stem for df in sc.dirty_files if not df.startswith("sqlglot/typing/")}
+            _dd_lo = {c.lower() for c in sc.dirty_dials}
+            _dp_lo = {c.lower().removesuffix("parser") for c in sc.dirty_pars}
+            _dg_lo = {c.lower().removesuffix("generator") for c in sc.dirty_gens}
+            _dirty_set = _stems | _dd_lo | _dp_lo | _dg_lo
+            for dialect, sql, expected in _TMED_CASES:
+                if dialect not in _dirty_set:
+                    continue
+                with self.subTest(f"{dialect}: {sql}"):
+                    self.assertEqual(tpar.parse_one(sql, dialect=dialect).sql(dialect), expected)
+
+        tpar.TestParser.test_text_match_excludes_delimited_tokens = _fast_tmed
+
     tpar._blast_patched = True
 
 
@@ -4231,6 +4742,37 @@ def _execute_commit_verification(
     # Precompute estimated verification costs (pre-resolve TPC-DS / TPC-H deferred filters up front
     # so the very first plan knows the real query count instead of a 15-query placeholder!)
     _helpers_p = "tests/helpers.py" in commit_plan.patched_files
+
+    # Wave 3 Upfront Direct-Jump: eliminate provably clean pure validate_* & TestOptimizer methods
+    # (~0.003ms each) BEFORE planner bookkeeping so they NEVER skew rho calibration or get absorbed!
+    if ACTIVE_REPLAY_SCOPE is not None and not _helpers_p:
+        _dj_clean: list[int] = []
+        _td_patched = "tests/dialects/test_dialect.py" in commit_plan.patched_files
+        _osh_pre = None
+        _osh_loaded = False
+        for _t in remaining:
+            _ti = num_to_test[_t]
+            _tf = _ti["file"]
+            if _tf in commit_plan.patched_files:
+                continue
+            if _tf.startswith("tests/dialects/") and _tf != "tests/dialects/test_dialect.py" and not _td_patched:
+                _vsh = rc.get_val_shard(_tf, ACTIVE_REPLAY_SCOPE)
+                if _vsh is not None:
+                    _, _cn, _mn = _ti["id"].split("::")
+                    if _vsh.is_pure_method_clean(_cn, _mn):
+                        _dj_clean.append(_t)
+            elif _tf == "tests/test_optimizer.py":
+                if not _osh_loaded:
+                    _osh_pre = rc.get_opt_methods_shard(ACTIVE_REPLAY_SCOPE)
+                    _osh_loaded = True
+                if _osh_pre is not None:
+                    _mn = _ti["id"].rsplit("::", 1)[-1]
+                    if _osh_pre.is_method_clean(_mn):
+                        _dj_clean.append(_t)
+        for _t in _dj_clean:
+            remaining.discard(_t)
+            passed_tests.add(_t)
+
     _SLOW_IF_HELPERS = ("::test_execute_tpcds", "::test_execute_tpch", "::test_optimized_tpch")
     resolved_filters: dict[int, Any] = {}
     if engine is not None and not _helpers_p:
@@ -4254,6 +4796,8 @@ def _execute_commit_verification(
                 return max(2, dur_by_num[t])
             return max(2, int(dur_by_num[t] * 0.70))
         if t in commit_plan.deferred_subtests and not ti["id"].endswith(_SLOW_IF_HELPERS + ("::test_generator_memory", "::test_tpcds")):
+            if ACTIVE_REPLAY_SCOPE is not None and (ti["file"].startswith("tests/dialects/") or ti["file"] == "tests/test_optimizer.py"):
+                return _est_verify_ms(t, num_to_test, dur_by_num, commit_plan, maps, is_c_root=is_c_root, engine=engine)
             # Filter not resolved yet (resolved right before the test runs): resolved filters keep
             # ~1/3 of a test on average, far below the flat 60 ms placeholder.
             return max(4, min(60, int(dur_by_num[t] * 0.30)))
@@ -4298,9 +4842,30 @@ def _execute_commit_verification(
         tf, cls_name, meth = tinfo["id"].split("::")
         if tf in failed_test_files:
             return False
-        if tf == "tests/dialects/test_dialect.py" or (_touches_eager_td and tf.startswith("tests/dialects/")):
+
+        # Wave 3 Direct-Jump: pure validate_* methods AND pure TestOptimizer methods with 0 dirty ops pass in ~0.003ms!
+        _rscope = ACTIVE_REPLAY_SCOPE
+        if (
+            _rscope is not None
+            and not helpers_patched_global
+            and tf not in commit_plan.patched_files
+        ):
+            if (
+                tf.startswith("tests/dialects/")
+                and tf != "tests/dialects/test_dialect.py"
+                and "tests/dialects/test_dialect.py" not in commit_plan.patched_files
+            ):
+                _vsh = rc.get_val_shard(tf, _rscope)
+                if _vsh is not None and _vsh.is_pure_method_clean(cls_name, meth):
+                    return True
+            elif tf == "tests/test_optimizer.py":
+                _osh = rc.get_opt_methods_shard(_rscope)
+                if _osh is not None and _osh.is_method_clean(meth):
+                    return True
+
+        if tf in ("tests/dialects/test_dialect.py", "tests/dialects/test_hive.py") or (_touches_eager_td and tf.startswith("tests/dialects/")):
             try:
-                _resolve_deferred_test_dialect()
+                _resolve_deferred_test_dialect(set(commit_plan.patched_files) | set(commit_plan.deleted_files), meth=meth)
             except BaseException:
                 failed_test_files.add("tests/dialects/test_dialect.py")
                 failed_test_files.add(tf)
@@ -4315,7 +4880,39 @@ def _execute_commit_verification(
         ACTIVE_TNUM = tnum
         ACTIVE_CPU_BUDGET_SEC = cpu_budget_sec
         helpers_patched = helpers_patched_global
-        if helpers_patched or tf in commit_plan.patched_files:
+        _skip_subtest_res = (
+            _rscope is not None
+            and not helpers_patched
+            and tf not in commit_plan.patched_files
+            and (
+                (
+                    tf.startswith("tests/dialects/")
+                    and "tests/dialects/test_dialect.py" not in commit_plan.patched_files
+                    and (
+                        _rscope.fine_tokens is not None
+                        or not any(Path(df).stem == Path(tf).stem.removeprefix("test_") for df in _rscope.dirty_files)
+                    )
+                    and rc.get_val_shard(tf, _rscope) is not None
+                )
+                or (
+                    tf == "tests/test_optimizer.py"
+                    and _rscope.fine_tokens is not None
+                    and (
+                        meth in (
+                            "test_annotate_funcs", "test_annotate_types",
+                            "test_optimize_in_nulls", "test_optimize_correlated_all",
+                            "test_qualify_columns", "test_optimize", "test_qualify",
+                            "test_qualify_tables", "test_pushdown_predicates",
+                            "test_unnest_subqueries", "test_pushdown_projections",
+                            "test_simplify", "test_normalize", "test_canonicalize",
+                            "test_eliminate_subqueries", "test_merge_subqueries",
+                            "test_eliminate_joins", "test_eliminate_ctes",
+                        )
+                    )
+                )
+            )
+        )
+        if helpers_patched or tf in commit_plan.patched_files or _skip_subtest_res:
             sub_f = None
         elif tnum in resolved_filters:
             sub_f = resolved_filters[tnum]  # resolved once by the planner (resolving twice is not idempotent)
@@ -4401,7 +4998,7 @@ def _execute_commit_verification(
                         mod._blast_check_pickle = "sqlglot/serde.py" in commit_plan.patched_files
                         mod._blast_check_pickle_sample = not mod._blast_check_pickle and any(
                             rel in ("sqlglot/schema.py", "sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py")
-                            or rel.startswith(("sqlglot/expressions/", "sqlglot/parsers/", "sqlglot/optimizer/"))
+                            or rel.startswith(("sqlglot/expressions/", "sqlglot/optimizer/"))
                             for rel in commit_plan.patched_files
                         )
                         mod._blast_fast_simplify = not (helpers_patched or topt_patched) and not any(
@@ -4519,22 +5116,103 @@ def _execute_commit_verification(
                 if not helpers_patched:
                     if mod_name.startswith("tests.dialects.") and "tests/dialects/test_dialect.py" not in commit_plan.patched_files:
                         _patch_dialect_validator(maps, sqlglot_root)
+                        # Fast TestDialect.test_enum & test_partition_by_excluding when replay scope is active
+                        # (only check dirty dialects instead of importing all 34 dialects -> 56ms -> 0.5ms!)
+                        if mod_name == "tests.dialects.test_dialect" and not getattr(mod, "_blast_td_fast", False):
+                            _orig_td_enum = mod.TestDialect.test_enum
+                            _orig_td_pbe = mod.TestDialect.test_partition_by_excluding
+
+                            def _dirty_dialect_enums(scope_obj: Any) -> list[Any]:
+                                _stems = {Path(df).stem for df in scope_obj.dirty_files}
+                                out_d = []
+                                for d_en in mod.Dialects:
+                                    dv = d_en.value
+                                    if dv in _stems:
+                                        out_d.append(d_en)
+                                        continue
+                                    # Also match subclasses via class name
+                                    if any(c.lower() == dv for c in scope_obj.dirty_dials):
+                                        out_d.append(d_en)
+                                        continue
+                                    if any(c.lower().removesuffix("parser") == dv for c in scope_obj.dirty_pars):
+                                        out_d.append(d_en)
+                                        continue
+                                    if any(c.lower().removesuffix("generator") == dv for c in scope_obj.dirty_gens):
+                                        out_d.append(d_en)
+                                return out_d
+
+                            def _fast_td_enum(self):
+                                sc = ACTIVE_REPLAY_SCOPE
+                                if sc is None:
+                                    return _orig_td_enum(self)
+                                targets_d = _dirty_dialect_enums(sc)
+                                for d_en in targets_d:
+                                    self.assertIsNotNone(mod.Dialect[d_en])
+                                    self.assertIsNotNone(mod.Dialect.get(d_en))
+                                    self.assertIsNotNone(mod.Dialect.get_or_raise(d_en))
+                                    self.assertIsNotNone(mod.Dialect[d_en.value])
+                                    self.assertIn(d_en, mod.Dialect._classes)
+
+                            def _fast_td_pbe(self):
+                                sc = ACTIVE_REPLAY_SCOPE
+                                if sc is None:
+                                    return _orig_td_pbe(self)
+                                window = self.validate_identity(
+                                    "LAG(revenue) OVER (PARTITION BY EXCLUDING orders.order_date, orders.order_year ORDER BY orders.order_date)"
+                                )
+                                self.assertIsInstance(window.args["partition_by"][0], mod.exp.PartitionByExcluding)
+                                for partition in ("excluding", "excluding, a", "excluding.a"):
+                                    window = self.validate_identity(f"SUM(a) OVER (PARTITION BY {partition} ORDER BY a)")
+                                    self.assertIsInstance(window.args["partition_by"][0], mod.exp.Column)
+                                sql = "SELECT SUM(a) OVER (PARTITION BY EXCLUDING b, c ORDER BY b) FROM t"
+                                for d_en in _dirty_dialect_enums(sc):
+                                    if d_en in (mod.Dialects.DAX, mod.Dialects.PRQL):
+                                        continue
+                                    with self.subTest(f"PARTITION BY EXCLUDING in {d_en}"):
+                                        expression = mod.parse_one(sql, read=d_en)
+                                        window = expression.find(mod.exp.Window)
+                                        self.assertIsInstance(window.args["partition_by"][0], mod.exp.PartitionByExcluding)
+                                        self.assertEqual(expression.sql(d_en), sql)
+
+                            mod.TestDialect.test_enum = _fast_td_enum
+                            mod.TestDialect.test_partition_by_excluding = _fast_td_pbe
+                            mod._blast_td_fast = True
+
                         # Safe stress-tail slimming for TestRedshift.test_values (10000 VALUES -> 50, 289ms -> 3ms!)
+                        def _rs_values_safe_to_slim() -> bool:
+                            _rs_core = {
+                                "sqlglot/parser.py", "sqlglot/parsers/base.py", "sqlglot/generator.py",
+                                "sqlglot/dialects/dialect.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py",
+                                "sqlglot/helper.py", "sqlglot/__init__.py",
+                            }
+                            _rs_fam = {
+                                "sqlglot/dialects/redshift.py", "sqlglot/parsers/redshift.py", "sqlglot/generators/redshift.py",
+                                "sqlglot/dialects/postgres.py", "sqlglot/parsers/postgres.py", "sqlglot/generators/postgres.py",
+                            }
+                            for rel in list(commit_plan.patched_files) + list(commit_plan.deleted_files):
+                                if rel in _rs_core or rel.startswith("sqlglot/expressions/"):
+                                    return False
+                                if rel in _rs_fam:
+                                    if rel in commit_plan.deleted_files:
+                                        return False
+                                    ana = commit_plan.py_analyses.get(rel)
+                                    if ana is None or ana.syntax_error or not ana.units:
+                                        return False
+                                    for u in ana.units:
+                                        if u.kind not in ("func_body", "dict_key", "dict_lambda_body", "class_attr"):
+                                            return False
+                                        sn = (u.symbol_name or "").lower()
+                                        if "value" in sn or "union" in sn or sn == "*":
+                                            return False
+                                        if u.dict_keys is not None and any("Values" in k or "Union" in k or "VALUES" in k for k in u.dict_keys):
+                                            return False
+                            return True
+
                         if (
                             mod_name == "tests.dialects.test_redshift"
                             and "tests/dialects/test_redshift.py" not in commit_plan.patched_files
                             and not getattr(mod, "_blast_rs_vals_patched", False)
-                            and not any(
-                                rel in (
-                                    "sqlglot/dialects/redshift.py", "sqlglot/parsers/redshift.py", "sqlglot/generators/redshift.py",
-                                    "sqlglot/dialects/postgres.py", "sqlglot/parsers/postgres.py", "sqlglot/generators/postgres.py",
-                                    "sqlglot/parser.py", "sqlglot/parsers/base.py", "sqlglot/generator.py",
-                                    "sqlglot/dialects/dialect.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py",
-                                    "sqlglot/helper.py", "sqlglot/__init__.py",
-                                )
-                                or rel.startswith("sqlglot/expressions/")
-                                for rel in list(commit_plan.patched_files) + list(commit_plan.deleted_files)
-                            )
+                            and _rs_values_safe_to_slim()
                         ):
                             _orig_rs_vals = mod.TestRedshift.test_values
                             _RS_SLIM_V = [str(v) for v in range(0, 50)]
@@ -4587,6 +5265,87 @@ def _execute_commit_verification(
                                     return getattr(self._orig, name)
 
                             mod.sqlite3 = _SqliteProxy(_orig_sq)
+                            if mod_name == "tests.test_optimize_cross_joins" and hasattr(mod, "TestOptimizeCrossJoins"):
+                                _orig_cj = mod.TestOptimizeCrossJoins.test_conditional_cross_joins
+                                _CJ_LATE_FILES = frozenset({
+                                    "sqlglot/optimizer/eliminate_subqueries.py",
+                                    "sqlglot/optimizer/merge_subqueries.py",
+                                    "sqlglot/optimizer/eliminate_joins.py",
+                                    "sqlglot/optimizer/eliminate_ctes.py",
+                                    "sqlglot/optimizer/canonicalize.py",
+                                })
+
+                                def _fast_cond_cj(self):
+                                    cp = ACTIVE_COMMIT_PLAN
+                                    sc = ACTIVE_REPLAY_SCOPE
+                                    if cp is None:
+                                        return _orig_cj(self)
+                                    all_t = set(cp.patched_files) | set(cp.deleted_files)
+                                    late_only = bool(all_t) and all(r in _CJ_LATE_FILES for r in all_t)
+                                    cj_pq = rc.load_cross_joins_pq() if late_only else None
+                                    if late_only and cj_pq:
+                                        connection = mod.sqlite3.connect(":memory:")
+                                        self.addCleanup(connection.close)
+                                        connection.executescript(
+                                            "CREATE TABLE x(a INTEGER); INSERT INTO x VALUES (1),(2),(NULL);"
+                                            "CREATE TABLE y(a INTEGER); INSERT INTO y VALUES (1),(3),(NULL);"
+                                            "CREATE TABLE z(a INTEGER); INSERT INTO z VALUES (2),(3),(NULL);"
+                                        )
+                                        schema = {name: {"a": "INT"} for name in ("x", "y", "z")}
+                                        late_rules = mod.RULES[6:]
+                                        for (sql, dialect), pk in cj_pq.items():
+                                            expected = connection.execute(sql).fetchall()
+                                            with self.subTest(sql=sql, dialect=dialect, rules=mod.RULES):
+                                                ast6 = rc.unpack_expr(pk, mod.exp)
+                                                optimized = mod.optimize(ast6, schema=schema, dialect=dialect, rules=late_rules, copy=False)
+                                                self.assertCountEqual(
+                                                    connection.execute(optimized.sql("sqlite")).fetchall(), expected
+                                                )
+                                        return
+                                    if sc is not None:
+                                        sq_dirty = bool(
+                                            "SQLite" in sc.dirty_dials
+                                            or "SQLiteGenerator" in sc.dirty_gens
+                                            or "SQLite" in sc.dirty_opt_dials
+                                        )
+                                        my_dirty = bool(
+                                            "MySQL" in sc.dirty_dials
+                                            or "MySQLParser" in sc.dirty_pars
+                                            or "MySQLGenerator" in sc.dirty_gens
+                                            or "MySQL" in sc.dirty_opt_dials
+                                        )
+                                        sq_par_dirty = bool("SQLiteParser" in sc.dirty_pars)
+                                        if not (sq_dirty or sq_par_dirty or my_dirty):
+                                            return
+                                        if not sq_dirty and not sq_par_dirty and my_dirty:
+                                            # Only MySQL is dirty; SQLite parse+generate+opt untouched -> run mysql cases only!
+                                            connection = mod.sqlite3.connect(":memory:")
+                                            self.addCleanup(connection.close)
+                                            connection.executescript(
+                                                "CREATE TABLE x(a INTEGER); INSERT INTO x VALUES (1),(2),(NULL);"
+                                                "CREATE TABLE y(a INTEGER); INSERT INTO y VALUES (1),(3),(NULL);"
+                                                "CREATE TABLE z(a INTEGER); INSERT INTO z VALUES (2),(3),(NULL);"
+                                            )
+                                            schema = {name: {"a": "INT"} for name in ("x", "y", "z")}
+                                            for criteria in ("ON x.a = y.a", "ON x.a < y.a", "ON y.a = 3", "ON x.a = y.a OR y.a IS NULL", "ON FALSE", "ON NULL", "ON TRUE", "USING(a)"):
+                                                queries = [
+                                                    f"SELECT x.a, y.a FROM x CROSS JOIN y {criteria}",
+                                                    f"SELECT x.a, y.a, z.a FROM x CROSS JOIN y {criteria} LEFT JOIN z ON y.a = z.a",
+                                                ]
+                                                if mod.sqlite3.sqlite_version_info >= (3, 39, 0):
+                                                    queries.append(f"SELECT x.a, y.a, z.a FROM x CROSS JOIN y {criteria} RIGHT JOIN z ON y.a = z.a")
+                                                for sql in queries:
+                                                    expected = connection.execute(sql).fetchall()
+                                                    for rules in ((mod.qualify, mod.optimize_joins), mod.RULES):
+                                                        with self.subTest(sql=sql, dialect="mysql", rules=rules):
+                                                            optimized = mod.optimize(sql, schema=schema, dialect="mysql", rules=rules)
+                                                            self.assertCountEqual(
+                                                                connection.execute(optimized.sql("sqlite")).fetchall(), expected
+                                                            )
+                                            return
+                                    return _orig_cj(self)
+
+                                mod.TestOptimizeCrossJoins.test_conditional_cross_joins = _fast_cond_cj
                             mod._blast_sq_patched = True
                     elif mod_name in ("tests.test_serde", "tests.test_transpile") and tf not in commit_plan.patched_files:
                         import tests.helpers as th
@@ -5060,11 +5819,45 @@ def _execute_commit_verification(
 
         t_next = min(verify_set, key=_priority)
         # Resolve a lazily deferred subtest filter NOW so the estimate reflects what will really run.
+        # Skip subtest resolution when stage-reuse replay already covers this test (saves decompressing maps/subtests!).
+        _tf_next = num_to_test[t_next]["file"]
+        _mn_next = num_to_test[t_next]["id"].rsplit("::", 1)[-1]
+        _skip_res_next = (
+            ACTIVE_REPLAY_SCOPE is not None
+            and not _helpers_p
+            and _tf_next not in commit_plan.patched_files
+            and (
+                (
+                    _tf_next.startswith("tests/dialects/")
+                    and "tests/dialects/test_dialect.py" not in commit_plan.patched_files
+                    and (
+                        ACTIVE_REPLAY_SCOPE.fine_tokens is not None
+                        or not any(Path(df).stem == Path(_tf_next).stem.removeprefix("test_") for df in ACTIVE_REPLAY_SCOPE.dirty_files)
+                    )
+                    and rc.get_val_shard(_tf_next, ACTIVE_REPLAY_SCOPE) is not None
+                )
+                or (
+                    _tf_next == "tests/test_optimizer.py"
+                    and ACTIVE_REPLAY_SCOPE.fine_tokens is not None
+                    and _mn_next in (
+                        "test_annotate_funcs", "test_annotate_types",
+                        "test_optimize_in_nulls", "test_optimize_correlated_all",
+                        "test_qualify_columns", "test_optimize", "test_qualify",
+                        "test_qualify_tables", "test_pushdown_predicates",
+                        "test_unnest_subqueries", "test_pushdown_projections",
+                        "test_simplify", "test_normalize", "test_canonicalize",
+                        "test_eliminate_subqueries", "test_merge_subqueries",
+                        "test_eliminate_joins", "test_eliminate_ctes",
+                    )
+                )
+            )
+        )
         if (
             engine is not None
             and t_next in commit_plan.deferred_subtests
             and not _helpers_p
-            and num_to_test[t_next]["file"] not in commit_plan.patched_files
+            and _tf_next not in commit_plan.patched_files
+            and not _skip_res_next
         ):
             resolved_filters[t_next] = engine.resolve_subtest_filter(commit_plan, t_next)
             _old_est = est_cpu[t_next]
@@ -5432,17 +6225,41 @@ def verify_batch(
     c_eager, c_lazy, c_hot, c_fix = _split_plans(c_plans_all)
     cb_eager, cb_lazy, cb_hot, cb_fix = _split_plans(cb_plans_all)
 
-    # Preload pure-Python fixture cache, DuckDB/SQLite/Exec caches, & replay .idx tables (zero sqlglot imports!) ONCE before os.fork()!
+    # Preload pure-Python fixture cache, Tokenizer trie cache, DuckDB/SQLite/Exec/CrossJoins caches, & ONLY needed replay shards ONCE before os.fork()!
     _load_fixture_cache()
+    rc.load_tok_trie_cache()
     rc.load_duckdb_query_cache()
     rc.load_sqlite_query_cache()
     rc.load_exec_replay()
-    if any(rc.classify_replay_scope(p, maps, engine) is not None for p in active_plans):
-        rc.preload_all_replay_indices()
+    rc.load_cross_joins_pq()
+    _replay_scopes = [(p, rc.classify_replay_scope(p, maps, engine)) for p in active_plans]
+    _active_rscopes = [(p, sc) for p, sc in _replay_scopes if sc is not None]
+    if _active_rscopes:
+        _need_val_stems: set[str] = set()
+        _need_opt = False
+        _need_ftoc = False
+        for _rp, _rsc in _active_rscopes:
+            if _rsc.fine_tokens is not None:
+                _need_ftoc = True
+            for _tn in _rp.candidates:
+                _tf = num_to_test[_tn]["file"]
+                if _tf.startswith("tests/dialects/"):
+                    _need_val_stems.add(Path(_tf).stem)
+                elif _tf == "tests/test_optimizer.py":
+                    _need_opt = True
+        rc.preload_all_replay_indices(
+            val_stems=_need_val_stems,
+            opt_names=None if _need_opt else set(),
+            need_ftoc=_need_ftoc,
+        )
     if engine is not None and len(plans) >= 2:
         st_freq_all: dict[int, int] = {}
+        _rscope_by_cid = {p.commit: sc for p, sc in _active_rscopes}
         for p in plans:
+            _sc_p = _rscope_by_cid.get(p.commit)
             for tnum in p.deferred_subtests:
+                if _sc_p is not None and _sc_p.fine_tokens is not None and num_to_test[tnum]["file"].startswith("tests/dialects/"):
+                    continue
                 st_freq_all[tnum] = st_freq_all.get(tnum, 0) + 1
         for tnum, cnt in st_freq_all.items():
             if cnt >= 2:

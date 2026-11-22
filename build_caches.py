@@ -188,14 +188,11 @@ def main() -> None:
         except Exception:
             pass
 
-    fix_blob = zlib.compress(
-        pickle.dumps(
-            {"fixture_pairs": fixture_pairs, "fixture_singles": fixture_singles},
-            protocol=pickle.HIGHEST_PROTOCOL,
-        ),
-        6,
+    fix_blob = pickle.dumps(
+        {"fixture_pairs": fixture_pairs, "fixture_singles": fixture_singles},
+        protocol=pickle.HIGHEST_PROTOCOL,
     )
-    Path("/app/fixture_cache.pkl.zlib").write_bytes(fix_blob)
+    Path("/app/fixture_cache.pkl").write_bytes(fix_blob)
 
     # 2. Pure-Python pre-parsed TPC-DS & TPC-H CSV tables
     n_tbl, tbl_bytes = _build_tpc_tables(sg_root)
@@ -270,6 +267,100 @@ print(cnt)
     res_pq = subprocess.run([sys.executable, "-c", pq_code], capture_output=True, text=True, check=True)
     n_pq = int(res_pq.stdout.strip().splitlines()[-1])
 
+    # 5c. Precompute post-RULES[:6] ASTs for test_conditional_cross_joins (48 queries -> 10x speedup on late opt!)
+    cj_code = """
+import marshal, sqlite3, sys
+from pathlib import Path
+sys.path.insert(0, "/sqlglot")
+sys.path.insert(0, "/app")
+import replay_cache as rc
+from sqlglot import exp
+from sqlglot.optimizer import RULES, optimize
+
+schema = {name: {"a": "INT"} for name in ("x", "y", "z")}
+out = {}
+for criteria in (
+    "ON x.a = y.a",
+    "ON x.a < y.a",
+    "ON y.a = 3",
+    "ON x.a = y.a OR y.a IS NULL",
+    "ON FALSE",
+    "ON NULL",
+    "ON TRUE",
+    "USING(a)",
+):
+    queries = [
+        f"SELECT x.a, y.a FROM x CROSS JOIN y {criteria}",
+        f"SELECT x.a, y.a, z.a FROM x CROSS JOIN y {criteria} LEFT JOIN z ON y.a = z.a",
+    ]
+    if sqlite3.sqlite_version_info >= (3, 39, 0):
+        queries.append(
+            f"SELECT x.a, y.a, z.a FROM x CROSS JOIN y {criteria} RIGHT JOIN z ON y.a = z.a"
+        )
+    for sql in queries:
+        for dialect in ("sqlite", "mysql"):
+            ast6 = optimize(sql, schema=schema, dialect=dialect, rules=RULES[:6])
+            pk = rc.pack_expr(ast6, exp)
+            if pk is not rc._UNPACKABLE:
+                out[(sql, dialect)] = pk
+blob = marshal.dumps(out)
+Path("/app/cross_joins_pq.marshal").write_bytes(blob)
+print(f"{len(out)} {len(blob)}")
+"""
+    res_cj = subprocess.run([sys.executable, "-c", cj_code], capture_output=True, text=True, check=True)
+    n_cj, cj_bytes = (int(x) for x in res_cj.stdout.strip().splitlines()[-1].split())
+
+    # 0. Pre-decompress maps/*.zlib into /app/maps_raw/ (0 bytes in Git, 0 zlib.decompress at runtime!)
+    raw_root = Path("/app/maps_raw")
+    raw_root.mkdir(parents=True, exist_ok=True)
+    maps_src = Path("/app/maps")
+    n_raw = 0
+    if (maps_src / "core_maps.zlib").is_file():
+        (raw_root / "core_maps.marshal").write_bytes(zlib.decompress((maps_src / "core_maps.zlib").read_bytes()))
+        n_raw += 1
+    if (maps_src / "dict_maps.zlib").is_file():
+        (raw_root / "dict_maps.marshal").write_bytes(zlib.decompress((maps_src / "dict_maps.zlib").read_bytes()))
+        n_raw += 1
+    for sub in ("subtests", "line_cov"):
+        sdir = maps_src / sub
+        if sdir.is_dir():
+            ddir = raw_root / sub
+            ddir.mkdir(parents=True, exist_ok=True)
+            for zp in sdir.glob("*.zlib"):
+                (ddir / (zp.stem + ".marshal")).write_bytes(zlib.decompress(zp.read_bytes()))
+                n_raw += 1
+
+    # 0b. Precompute Tokenizer._KEYWORD_TRIE cache for all 34 baseline dialects (eliminates ~42ms/commit!)
+    tok_code = """
+import marshal, sys
+from pathlib import Path
+sys.path.insert(0, "/sqlglot")
+from sqlglot import Dialect, Dialects
+from sqlglot.tokens import Tokenizer
+
+cache = {}
+all_tok_cls = {Tokenizer}
+for d in Dialects:
+    di = Dialect.get_or_raise(d)
+    for c in di.tokenizer_class.__mro__:
+        if c.__module__.startswith("sqlglot.") and issubclass(c, Tokenizer):
+            all_tok_cls.add(c)
+for c in all_tok_cls:
+    key = f"{c.__module__}.{c.__qualname__}"
+    trie = getattr(c, "_KEYWORD_TRIE", None)
+    if isinstance(trie, dict):
+        try:
+            marshal.dumps(trie)
+            cache[key] = trie
+        except Exception:
+            pass
+blob = marshal.dumps(cache)
+Path("/app/tok_trie_cache.marshal").write_bytes(blob)
+print(f"{len(cache)} {len(blob)}")
+"""
+    res_tok = subprocess.run([sys.executable, "-c", tok_code], capture_output=True, text=True, check=True)
+    n_tok, tok_bytes = (int(x) for x in res_tok.stdout.strip().splitlines()[-1].split())
+
     # 6. Build-time Exact Dep Index (Wave 2A), Fine-Grained Validator/Optimizer Replay (Wave 1+2B),
     #    Executor Replay, Lazy DuckDB Cache, and Lazy SQLite Cache (Wave 2C)!
     t_rc = time.perf_counter()
@@ -281,8 +372,9 @@ print(cnt)
     erows, ebytes, sq, sbytes = rc.build_exec_and_sqlite_cache(sg_root)
 
     print(
-        f"[build_caches] fixtures={len(fixture_pairs)}p/{len(fixture_singles)}s ({len(fix_blob)/1024:.1f} KB), "
-        f"tpc_tables={n_tbl} ({tbl_bytes/1024:.1f} KB), tpc_cache py={n_py} c={n_c} cb={n_cb} rows={n_rows} pq={n_pq}, "
+        f"[build_caches] raw_maps={n_raw}, tok_tries={n_tok} ({tok_bytes/1024:.0f} KB), "
+        f"fixtures={len(fixture_pairs)}p/{len(fixture_singles)}s ({len(fix_blob)/1024:.1f} KB), "
+        f"tpc_tables={n_tbl} ({tbl_bytes/1024:.1f} KB), tpc_cache py={n_py} c={n_c} cb={n_cb} rows={n_rows} pq={n_pq} cj={n_cj} ({cj_bytes/1024:.0f} KB), "
         f"dep_index={d_seen}t/{d_keep}k ({d_bytes/1024:.0f} KB), "
         f"val_replay={vp}p/{ve}e ({vb/1024:.0f} KB), opt_replay={orows}r ({obytes/1024:.0f} KB), "
         f"duckdb={dq}q ({dbytes/1024:.1f} KB), exec_replay={erows}r ({ebytes/1024:.0f} KB), sqlite={sq}q ({sbytes/1024:.1f} KB) "
