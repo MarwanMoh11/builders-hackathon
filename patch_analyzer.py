@@ -607,10 +607,10 @@ def _const_key_repr(node: ast.AST | None) -> str | None:
 
 def _diff_dict_nodes_detailed(
     old_dict: ast.Dict, new_dict: ast.Dict
-) -> tuple[set[str] | None, set[str], set[str]]:
-    """Return (changed_keys_or_None_wildcard, added_keys, deleted_keys)."""
+) -> tuple[set[str] | None, set[str], set[str], set[int] | None]:
+    """Return (changed_keys_or_None_wildcard, added_keys, deleted_keys, lambda_only_old_lines_or_None)."""
     old_unpacks: list[str] = []
-    old_map: dict[str, tuple[int, str]] = {}
+    old_map: dict[str, list[tuple[int, str, ast.AST]]] = {}
     seg = 0
     for k, v in zip(old_dict.keys, old_dict.values):
         if k is None:
@@ -618,12 +618,12 @@ def _diff_dict_nodes_detailed(
             seg += 1
         else:
             kr = _const_key_repr(k)
-            if kr is None or kr in old_map:
-                return None, set(), set()
-            old_map[kr] = (seg, ast.dump(v, include_attributes=False))
+            if kr is None:
+                return None, set(), set(), None
+            old_map.setdefault(kr, []).append((seg, ast.dump(v, include_attributes=False), v))
 
     new_unpacks: list[str] = []
-    new_map: dict[str, tuple[int, str]] = {}
+    new_map: dict[str, list[tuple[int, str, ast.AST]]] = {}
     seg = 0
     for k, v in zip(new_dict.keys, new_dict.values):
         if k is None:
@@ -631,23 +631,52 @@ def _diff_dict_nodes_detailed(
             seg += 1
         else:
             kr = _const_key_repr(k)
-            if kr is None or kr in new_map:
-                return None, set(), set()
-            new_map[kr] = (seg, ast.dump(v, include_attributes=False))
+            if kr is None:
+                return None, set(), set(), None
+            new_map.setdefault(kr, []).append((seg, ast.dump(v, include_attributes=False), v))
 
     if old_unpacks != new_unpacks:
-        return None, set(), set()
+        return None, set(), set(), None
 
     old_keys = set(old_map)
     new_keys = set(new_map)
     added_keys = new_keys - old_keys
     deleted_keys = old_keys - new_keys
-    changed_keys = {k for k in old_keys | new_keys if old_map.get(k) != new_map.get(k)}
+    changed_keys = {
+        k
+        for k in old_keys | new_keys
+        if [(s, d) for s, d, _ in old_map.get(k, ())] != [(s, d) for s, d, _ in new_map.get(k, ())]
+    }
     # If AST differed (e.g., key reordering in TIME_MAPPING / QUOTES!)
     # yet no individual key/value/segment changed, return wildcard None!
     if not changed_keys:
-        return None, set(), set()
-    return changed_keys, added_keys, deleted_keys
+        return None, set(), set(), None
+
+    # Check if EVERY changed key is a pure in-place ast.Lambda body edit (same keyset, same lambda args!)
+    lambda_only_lines: set[int] | None = None
+    if not added_keys and not deleted_keys:
+        lam_lines: set[int] = set()
+        all_lam = True
+        for k in changed_keys:
+            ol = old_map[k]
+            nl = new_map[k]
+            if (
+                len(ol) == 1
+                and len(nl) == 1
+                and ol[0][0] == nl[0][0]
+                and isinstance(ol[0][2], ast.Lambda)
+                and isinstance(nl[0][2], ast.Lambda)
+                and ast.dump(ol[0][2].args, include_attributes=False)
+                == ast.dump(nl[0][2].args, include_attributes=False)
+            ):
+                lam_lines |= _stmt_line_span(ol[0][2].body)
+            else:
+                all_lam = False
+                break
+        if all_lam and lam_lines:
+            lambda_only_lines = lam_lines
+
+    return changed_keys, added_keys, deleted_keys, lambda_only_lines
 
 
 def _stmt_line_span(node: ast.AST) -> set[int]:
@@ -1120,17 +1149,17 @@ def _compare_block(
             _, n_val = _extract_assign_target_and_value(ns_node)
             span = _stmt_line_span(os_node)
             if isinstance(o_val, ast.Dict) and isinstance(n_val, ast.Dict):
-                diff_keys, added_keys, deleted_keys = _diff_dict_nodes_detailed(o_val, n_val)
+                diff_keys, added_keys, deleted_keys, lam_lines = _diff_dict_nodes_detailed(o_val, n_val)
                 units.append(
                     ChangeUnit(
-                        kind="dict_key",
+                        kind="dict_lambda_body" if lam_lines is not None else "dict_key",
                         file=file,
                         class_name=class_qual,
                         symbol_name=name,
                         dict_keys=diff_keys,
                         dict_added_keys=added_keys,
                         dict_deleted_keys=deleted_keys,
-                        old_lines=span & (changed_old_lines | anchor_old_lines),
+                        old_lines=lam_lines if lam_lines is not None else (span & (changed_old_lines | anchor_old_lines)),
                         enclosing_lines=span,
                     )
                 )

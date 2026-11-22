@@ -1210,7 +1210,17 @@ class CandidateEngine:
                     deferred_subtests.setdefault(rnum, []).append(spec)
             return
 
-        if unit.kind == "dict_key":
+        if unit.kind == "dict_lambda_body":
+            hits = self._tests_covering_lines(rel, unit.old_lines)
+            if hits:
+                candidates.update(hits)
+                spec = ("lines", (rel, unit.old_lines))
+                for rnum in hits:
+                    if rnum in has_sub:
+                        deferred_subtests.setdefault(rnum, []).append(spec)
+                return
+
+        if unit.kind in ("dict_key", "dict_lambda_body"):
             attr = unit.symbol_name or ""
             if attr == "arg_types" and unit.class_name:
                 subs = self._subclasses_of(unit.class_name)
@@ -1364,9 +1374,11 @@ class CandidateEngine:
                     "IDENTIFIER_ESCAPES", "SUPPORTED_JSON_PATH_PARTS",
                     "SINGLE_TOKENS", "NUMERIC_LITERALS", "NUMERIC_ESCAPES", "COERCES_TO",
                 }
-                keyset_sensitive_attrs = {
-                    "SHOW_PARSERS", "SET_PARSERS", "NO_PAREN_FUNCTIONS", "QUERY_MODIFIER_PARSERS",
-                }
+                keyset_sensitive_attrs = {"SHOW_PARSERS", "SET_PARSERS"}
+                if unit.class_name == "Parser":
+                    keyset_sensitive_attrs = {
+                        "SHOW_PARSERS", "SET_PARSERS", "NO_PAREN_FUNCTIONS", "QUERY_MODIFIER_PARSERS",
+                    }
                 has_keyset_change = bool(unit.dict_added_keys or unit.dict_deleted_keys)
                 kw_needs_trie = (
                     attr == "KEYWORDS"
@@ -1493,7 +1505,7 @@ class CandidateEngine:
                         deferred_subtests.setdefault(rnum, []).append(spec)
                 return
 
-        if unit.kind in ("class_attr", "dict_key") and unit.class_name:
+        if unit.kind in ("class_attr", "dict_key", "dict_lambda_body") and unit.class_name:
             attr = unit.symbol_name or "*"
             subs = self._expand_class_and_copiers(unit.class_name, attr)
             base_cls = unit.class_name.split(".")[0]

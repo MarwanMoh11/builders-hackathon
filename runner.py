@@ -1311,22 +1311,32 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
         except Exception:
             pass
 
-    ctx_untouched = "sqlglot/executor/context.py" not in all_touched
-    tbl_untouched = "sqlglot/executor/table.py" not in all_touched
-    py_changed: set[str] | None
-    if "sqlglot/executor/python.py" not in all_touched:
-        py_changed = set()
-    else:
-        py_ana = commit_plan.py_analyses.get("sqlglot/executor/python.py")
-        if (
-            py_ana is not None
-            and not py_ana.syntax_error
-            and "sqlglot/executor/python.py" not in commit_plan.deleted_files
-            and all(u.kind == "func_body" for u in py_ana.units)
-        ):
-            py_changed = set(py_ana.changed_funcs)
-        else:
-            py_changed = None
+    def _safe_changed_funcs(rel_path: str) -> set[str] | None:
+        if rel_path not in all_touched:
+            return set()
+        if rel_path in commit_plan.deleted_files:
+            return None
+        ana = commit_plan.py_analyses.get(rel_path)
+        if ana is not None and not ana.syntax_error and all(u.kind == "func_body" for u in ana.units):
+            return set(ana.changed_funcs)
+        return None
+
+    py_changed = _safe_changed_funcs("sqlglot/executor/python.py")
+    ctx_changed = _safe_changed_funcs("sqlglot/executor/context.py")
+    tbl_changed = _safe_changed_funcs("sqlglot/executor/table.py")
+
+    ctx_eval_ok = ctx_changed is not None and not (ctx_changed & {"Context.eval", "Context.eval_tuple"})
+    tbl_core_ok = tbl_changed is not None and not (
+        tbl_changed & {
+            "Table.__init__", "Table.append", "Table.__getitem__", "Table.__iter__",
+            "Table.add_columns", "RowReader.__init__", "RowReader.__getitem__",
+            "RangeReader.__init__", "RangeReader.__getitem__",
+        }
+    )
+    ctx_untouched = ctx_eval_ok and not (
+        ctx_changed & {"Context.__init__", "Context.table", "Context.set_row", "Context.set_index", "Context.set_range"}
+    )
+    tbl_untouched = tbl_core_ok
 
     try:
         from sqlglot.executor.python import PythonExecutor as _PE
@@ -1422,9 +1432,12 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                         return tuple((v is None, v) for v in self.eval_tuple(key))
                     self.table.rows.sort(key=_orig_sort_key)
 
-                _Ctx.__iter__ = _fast_ctx_iter  # type: ignore[method-assign]
-                _Ctx.filter = _fast_filter  # type: ignore[method-assign]
-                _Ctx.sort = _fast_ctx_sort  # type: ignore[method-assign]
+                if ctx_changed is not None and "Context.__iter__" not in ctx_changed:
+                    _Ctx.__iter__ = _fast_ctx_iter  # type: ignore[method-assign]
+                if ctx_changed is not None and "Context.filter" not in ctx_changed:
+                    _Ctx.filter = _fast_filter  # type: ignore[method-assign]
+                if ctx_changed is not None and "Context.sort" not in ctx_changed:
+                    _Ctx.sort = _fast_ctx_sort  # type: ignore[method-assign]
 
         if tbl_untouched:
             def _fast_rr_getitem(self, column):
@@ -3327,14 +3340,14 @@ def _execute_commit_verification(
     cal_act = [0.0, 0.0, 0.0, 0.0]
     cal_est = [0.0, 0.0, 0.0, 0.0]
     _CAL_PRIOR = (
-        (0.90, 0.75, 0.60, 0.70) if is_c_root else
-        ((1.15, 1.00, 0.85, 0.95) if is_cb_root else (1.65, 1.35, 1.0, 1.15))
+        (0.45, 0.40, 0.45, 0.40) if is_c_root else
+        ((0.65, 0.55, 0.60, 0.55) if is_cb_root else (0.85, 0.75, 0.80, 0.75))
     )
     _CAL_W0 = (250.0, 250.0, 1e12, 120.0)
 
     def _rho(c: int) -> float:
         r = (cal_act[c] + _CAL_PRIOR[c] * _CAL_W0[c]) / (cal_est[c] + _CAL_W0[c])
-        lo = 0.25 if (is_c_root or is_cb_root) else 0.40
+        lo = 0.20 if (is_c_root or is_cb_root) else 0.30
         return lo if r < lo else (3.5 if r > 3.5 else r)
 
     def _cal_idx(t: int) -> int:
