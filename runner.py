@@ -2320,6 +2320,8 @@ def _patch_executor_module(
     @classmethod
     def _lazy_exec_setup_class(cls):
         cp = ACTIVE_COMMIT_PLAN
+        if cp is not None:
+            _install_fast_python_executor(cp)
         touched = (set(cp.patched_files) | set(cp.deleted_files)) if cp is not None else set()
         allow_pkl = not helpers_patched or allow_duck_cache
         cls._tpch_conn = None
@@ -3264,6 +3266,7 @@ def _est_verify_ms(
     commit_plan: CommitPlan,
     maps: dict[str, Any],
     is_c_root: bool = False,
+    engine: Any = None,
 ) -> int:
     """Estimate in-process verification CPU cost (ms) for economic slack-absorption decisions."""
     tid_str = num_to_test[tnum]["id"]
@@ -3351,6 +3354,14 @@ def _est_verify_ms(
             total_cases += len(v)
         if total_cases == 0:
             return 2
+        if engine is not None:
+            sgs = engine._loaded_subtests.get(tnum)
+            if sgs:
+                n_all = sum(len(sg.get("cases", ())) for sg in sgs)
+                if n_all > 0:
+                    frac = min(1.0, total_cases / n_all)
+                    mul = 0.75 if is_c_root else 1.0
+                    return max(3, int(recorded * frac * mul) + 4)
         return max(3, min(recorded, int(total_cases * 0.8) + 4))
     if has_deferred:
         return max(5, min(recorded, 60))
@@ -3445,7 +3456,7 @@ def _execute_commit_verification(
         for t in remaining:
             if (
                 t in commit_plan.deferred_subtests
-                and num_to_test[t]["id"].endswith(("::test_execute_tpcds", "::test_execute_tpch"))
+                and num_to_test[t]["id"].endswith(("::test_execute_tpcds", "::test_execute_tpch", "::test_tpcds"))
                 and num_to_test[t]["file"] not in commit_plan.patched_files
             ):
                 resolved_filters[t] = engine.resolve_subtest_filter(commit_plan, t)
@@ -3457,15 +3468,15 @@ def _execute_commit_verification(
         if _helpers_p or ti["file"] in commit_plan.patched_files:
             tid = ti["id"]
             if tid == "tests/test_parser.py::TestParser::test_max_nodes" and ti["file"] not in commit_plan.patched_files:
-                return _est_verify_ms(t, num_to_test, dur_by_num, commit_plan, maps, is_c_root=is_c_root)
+                return _est_verify_ms(t, num_to_test, dur_by_num, commit_plan, maps, is_c_root=is_c_root, engine=engine)
             if tid.endswith(_SLOW_IF_HELPERS):
                 return max(2, dur_by_num[t])
             return max(2, int(dur_by_num[t] * 0.70))
-        if t in commit_plan.deferred_subtests and not ti["id"].endswith(_SLOW_IF_HELPERS + ("::test_generator_memory",)):
+        if t in commit_plan.deferred_subtests and not ti["id"].endswith(_SLOW_IF_HELPERS + ("::test_generator_memory", "::test_tpcds")):
             # Filter not resolved yet (resolved right before the test runs): resolved filters keep
             # ~1/3 of a test on average, far below the flat 60 ms placeholder.
             return max(4, min(60, int(dur_by_num[t] * 0.30)))
-        return _est_verify_ms(t, num_to_test, dur_by_num, commit_plan, maps, is_c_root=is_c_root)
+        return _est_verify_ms(t, num_to_test, dur_by_num, commit_plan, maps, is_c_root=is_c_root, engine=engine)
 
     est_cpu = {t: _est(t) for t in remaining}
     imported_tfiles: set[str] = {
@@ -3547,13 +3558,46 @@ def _execute_commit_verification(
             try:
                 mod = _import_test_module_lazy(mod_name, helpers_patched or tf in commit_plan.patched_files)
                 imported_tfiles.add(tf)
-                # Apply module-specific fast patches when the test module itself is unpatched!
-                if mod_name == "tests.test_parser" and "tests/test_parser.py" not in commit_plan.patched_files:
-                    _patch_parser_max_nodes()
-                if mod_name == "tests.test_generator" and "tests/test_generator.py" not in commit_plan.patched_files:
-                    _patch_generator_module()
-                if mod_name == "tests.test_executor" and "tests/test_executor.py" not in commit_plan.patched_files:
-                    _patch_executor_module(maps, helpers_patched=helpers_patched, allow_duck_cache=helpers_allow_duck_cache)
+                # Apply module-specific fast patches when the test module (or its hot method) is unpatched!
+                if mod_name == "tests.test_parser":
+                    tp_patched = "tests/test_parser.py" in commit_plan.patched_files
+                    tp_ana = commit_plan.py_analyses.get("tests/test_parser.py") if tp_patched else None
+                    if (not tp_patched) or (
+                        tp_ana is not None
+                        and not tp_ana.syntax_error
+                        and all(u.kind == "func_body" for u in tp_ana.units)
+                        and "TestParser.test_max_nodes" not in tp_ana.changed_funcs
+                    ):
+                        _patch_parser_max_nodes()
+                if mod_name == "tests.test_generator":
+                    tg_patched = "tests/test_generator.py" in commit_plan.patched_files
+                    tg_ana = commit_plan.py_analyses.get("tests/test_generator.py") if tg_patched else None
+                    if (not tg_patched) or (
+                        tg_ana is not None
+                        and not tg_ana.syntax_error
+                        and all(u.kind == "func_body" for u in tg_ana.units)
+                        and "TestGenerator.test_generator_memory" not in tg_ana.changed_funcs
+                    ):
+                        _patch_generator_module()
+                if mod_name == "tests.test_executor":
+                    te_patched = "tests/test_executor.py" in commit_plan.patched_files
+                    te_ana = commit_plan.py_analyses.get("tests/test_executor.py") if te_patched else None
+                    if (not te_patched) or (
+                        te_ana is not None
+                        and not te_ana.syntax_error
+                        and all(u.kind == "func_body" for u in te_ana.units)
+                        and not (
+                            set(te_ana.changed_funcs)
+                            & {
+                                "TestExecutor.setUpClass",
+                                "TestExecutor.tearDownClass",
+                                "TestExecutor.test_execute_tpcds",
+                                "TestExecutor.test_execute_tpch",
+                                "TestExecutor.test_optimized_tpch",
+                            }
+                        )
+                    ):
+                        _patch_executor_module(maps, helpers_patched=helpers_patched, allow_duck_cache=helpers_allow_duck_cache)
                 if mod_name == "tests.test_optimizer":
                     topt_patched = "tests/test_optimizer.py" in commit_plan.patched_files
                     topt_ana = commit_plan.py_analyses.get("tests/test_optimizer.py") if topt_patched else None
@@ -3720,7 +3764,19 @@ def _execute_commit_verification(
             timeout_sec = 45.0
         else:
             eff = tinfo["seconds"]
-            timeout_sec = max(4.0 if timeout_count < 2 else 2.5, min(45.0, 3.0 * eff + 4.0))
+            may_lazy_import = (
+                (tf in ("tests/test_executor.py", "tests/test_optimizer.py") and ("pandas" not in sys.modules or "duckdb" not in sys.modules))
+                or (meth == "test_sql_boolean_logic_with_numpy_scalars" and "numpy" not in sys.modules)
+            )
+            if may_lazy_import:
+                floor_s = 2.5 if timeout_count == 0 else 1.5
+                timeout_sec = max(floor_s, min(45.0, 4.0 * eff + 2.2))
+            elif eff < 0.25:
+                floor_s = 1.2 if timeout_count == 0 else 0.7
+                timeout_sec = max(floor_s, min(45.0, 5.0 * eff + 0.8))
+            else:
+                floor_s = 2.0 if timeout_count == 0 else 1.2
+                timeout_sec = max(floor_s, min(45.0, 3.5 * eff + 1.5))
 
         # Protect test_lazy_load subprocess CWD (#10.1) AND Dialect._classes across test_dialect_entry_points.py (#10.2)!
         saved_cwd: str | None = None
@@ -3979,6 +4035,8 @@ def _execute_commit_verification(
     _home_cands.sort(key=lambda t: (-dur_by_num[t], est_cpu[t]))
     home_probe_set: set[int] = set(_home_cands[:8])
 
+    _tpcds_tnum = next((t for t in remaining if num_to_test[t]["id"].endswith("::test_tpcds")), None)
+
     def _priority(t: int) -> tuple[int, int, int]:
         e = est_cpu[t]
         r = dur_by_num[t]
@@ -3987,8 +4045,8 @@ def _execute_commit_verification(
             return (-3, 0, e)
         if not confirmed_fail and t in home_probe_set:
             return (-2, -r, e)
-        if tid.endswith(("::test_tpcds", "::test_tpch")):
-            return (-1, -r, e)
+        if tid.endswith("::test_execute_tpcds") and _tpcds_tnum is not None and _tpcds_tnum in verify_set:
+            return (3, -r, e)
         if e <= 800:
             bucket = 0
         elif r >= 3 * e:
@@ -4451,7 +4509,7 @@ def verify_batch(
                     "tests/helpers.py",
                 ):
                     return False
-            elif rel in ("sqlglot/diff.py", "sqlglot/lineage.py", "sqlglot/anonymize.py", "sqlglot/planner.py", "sqlglot/serde.py"):
+            elif rel in ("sqlglot/lineage.py", "sqlglot/anonymize.py", "sqlglot/planner.py", "sqlglot/serde.py"):
                 continue
             else:
                 return False
@@ -4506,7 +4564,7 @@ def verify_batch(
     c_eager, c_lazy, c_hot, c_fix = _split_plans(c_plans_all)
     cb_eager, cb_lazy, cb_hot, cb_fix = _split_plans(cb_plans_all)
 
-    # Preload pure-Python fixture cache (zero sqlglot imports!) and shared subtest maps ONCE before os.fork()!
+    # Preload pure-Python fixture cache (zero sqlglot imports!) and truly shared hot subtest maps ONCE before os.fork()!
     _load_fixture_cache()
     if engine is not None and len(plans) >= 3:
         st_freq_all: dict[int, int] = {}
@@ -4514,7 +4572,7 @@ def verify_batch(
             for tnum in p.deferred_subtests:
                 st_freq_all[tnum] = st_freq_all.get(tnum, 0) + 1
         for tnum, cnt in st_freq_all.items():
-            if cnt >= 2:
+            if cnt >= 4 or (cnt >= 3 and dur_by_num.get(tnum, 0) >= 300):
                 engine._get_subtests(tnum)
 
     # Freeze parent heap objects before os.fork() to prevent Linux CoW page faults & GC scans in children!
@@ -4561,14 +4619,6 @@ def verify_batch(
             return lf
 
         all_warm_plans = wz_lazy + wz_fix + wz_hot
-        if engine is not None and len(all_warm_plans) >= 3:
-            st_freq: dict[int, int] = {}
-            for p in all_warm_plans:
-                for tnum in p.deferred_subtests:
-                    st_freq[tnum] = st_freq.get(tnum, 0) + 1
-            for tnum, cnt in st_freq.items():
-                if cnt >= 3:
-                    engine._get_subtests(tnum)
 
         all_patched_py = {
             rel for p in all_warm_plans for rel in p.patched_files if rel.endswith(".py")
@@ -4604,6 +4654,8 @@ def verify_batch(
             "tests/test_serde.py",
             "tests/test_transpile.py",
             "tests/test_diff.py",
+            "tests/test_expressions.py",
+            "tests/test_lineage.py",
         )
         for ztf in _ZERO_DIALECT_TESTS:
             if ztf in all_patched_py:
@@ -4612,8 +4664,11 @@ def verify_batch(
                 continue
             if ztf == "tests/test_serde.py" and "sqlglot/serde.py" in all_patched_py:
                 continue
+            if ztf == "tests/test_lineage.py" and "sqlglot/lineage.py" in all_patched_py:
+                continue
             if ztf == "tests/test_generator.py" and any(
-                r in all_patched_py for r in ("sqlglot/parsers/snowflake.py", "sqlglot/dialects/snowflake.py")
+                r in all_patched_py
+                for r in ("sqlglot/parsers/snowflake.py", "sqlglot/dialects/snowflake.py", "sqlglot/optimizer/annotate_types.py")
             ):
                 continue
             z_users = sum(
@@ -4627,6 +4682,33 @@ def verify_batch(
                     pass
         loaded_files = _snapshot_loaded()
 
+        # Pre-import fork-safe duckdb & numpy ONCE in the Warm Zygote ONLY when >= 2 plans are likely to import them!
+        _duck_likely = sum(
+            1 for p in all_warm_plans
+            if p.tpcds_fixture_touched or p.tpch_fixture_touched or any(
+                r.startswith(("sqlglot/executor/",))
+                or r in (
+                    "sqlglot/dialects/duckdb.py", "sqlglot/parsers/duckdb.py", "sqlglot/generators/duckdb.py",
+                    "tests/test_executor.py", "tests/helpers.py",
+                )
+                for r in p.patched_files
+            )
+        )
+        if _duck_likely >= 2:
+            try:
+                import duckdb  # noqa: F401
+            except Exception:
+                pass
+        _numpy_likely = sum(
+            1 for p in all_warm_plans
+            if any(num_to_test[t]["id"].endswith("::test_sql_boolean_logic_with_numpy_scalars") for t in p.candidates)
+        )
+        if _numpy_likely >= 2:
+            try:
+                import numpy  # noqa: F401
+            except Exception:
+                pass
+
         if opt_conflict_plans:
             gc.freeze()
         for plan in opt_conflict_plans:
@@ -4639,14 +4721,32 @@ def verify_batch(
                 fallback_commits.append(plan.commit)
 
         rem_after_opt = dialect_conflict_plans + dialect_safe_plans + wz_fix + wz_hot
-        if "tests/test_optimizer.py" not in all_patched_py:
-            opt_users = sum(
-                1 for p in rem_after_opt
-                if any(num_to_test[t]["file"] == "tests/test_optimizer.py" for t in p.candidates)
+        for _opt_tf in ("tests/test_optimizer.py", "tests/test_schema.py"):
+            if _opt_tf not in all_patched_py:
+                opt_users = sum(
+                    1 for p in rem_after_opt
+                    if any(num_to_test[t]["file"] == _opt_tf for t in p.candidates)
+                )
+                if opt_users >= 2:
+                    try:
+                        _import_test_module_lazy(_opt_tf.removesuffix(".py").replace("/", "."), False)
+                    except Exception:
+                        pass
+        if (
+            "tests/test_executor.py" not in all_patched_py
+            and not any(
+                r.startswith(("sqlglot/executor/", "sqlglot/optimizer/"))
+                or r in ("sqlglot/planner.py", "sqlglot/generators/python.py", "sqlglot/generators/__init__.py")
+                for r in all_patched_py
             )
-            if opt_users >= 2:
+        ):
+            exec_users = sum(
+                1 for p in rem_after_opt
+                if any(num_to_test[t]["file"] == "tests/test_executor.py" for t in p.candidates)
+            )
+            if exec_users >= 2:
                 try:
-                    _import_test_module_lazy("tests.test_optimizer", False)
+                    _import_test_module_lazy("tests.test_executor", False)
                 except Exception:
                     pass
 

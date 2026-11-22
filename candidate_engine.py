@@ -997,7 +997,10 @@ class CandidateEngine:
                                 fb_dr = d_cases or r_cases
                                 if not fb_dr:
                                     untracked_empty_tags.add(sg["tag"])
-                                self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], fb_dr if fb_dr else None)
+                                self._add_subtest_filter(
+                                    commit_plan.subtest_filters, rnum, sg["tag"],
+                                    fb_dr if (fb_dr or len(sgs) > 1) else None,
+                                )
                     elif kind == "transforms":
                         owners, expr_subs, rel, old_lines = payload
                         for sg in sgs:
@@ -1019,7 +1022,8 @@ class CandidateEngine:
                                 if not fb_t:
                                     untracked_empty_tags.add(sg["tag"])
                                 self._add_subtest_filter(
-                                    commit_plan.subtest_filters, rnum, sg["tag"], fb_t if fb_t else None
+                                    commit_plan.subtest_filters, rnum, sg["tag"],
+                                    fb_t if (fb_t or len(sgs) > 1) else None,
                                 )
                     elif kind == "dialect":
                         subs, base_cls = payload
@@ -1032,7 +1036,10 @@ class CandidateEngine:
                             d_cases2.update(sg["dialects"].get(base_cls, []))
                             if not d_cases2:
                                 untracked_empty_tags.add(sg["tag"])
-                            self._add_subtest_filter(commit_plan.subtest_filters, rnum, sg["tag"], d_cases2 if d_cases2 else None)
+                            self._add_subtest_filter(
+                                commit_plan.subtest_filters, rnum, sg["tag"],
+                                d_cases2 if (d_cases2 or len(sgs) > 1) else None,
+                            )
         tf = commit_plan.subtest_filters.get(rnum)
         if tf:
             # Convert untracked empty sets to None (unfiltered), while PRESERVING proven-disjoint empty sets!
@@ -1072,6 +1079,13 @@ class CandidateEngine:
         line_txt = lines[rline - 1].strip() if 0 < rline <= len(lines) else ""
         if f"IsPredicatePrecedence.{attr}" in line_txt:
             return True
+        # A reader inside a class-body lambda (e.g. "UUID": lambda ..., dialect: ...dialect.UUID_IS_STRING_TYPE)
+        # only executes at runtime, NOT at class-definition time!
+        lam_idx = line_txt.find("lambda")
+        if lam_idx >= 0:
+            col_idx = line_txt.find(":", lam_idx)
+            if col_idx >= 0 and attr not in line_txt[:col_idx] and f".{attr}" in line_txt[col_idx:]:
+                return True
         if (
             rfile == "sqlglot/parsers/teradata.py"
             and attr == "FUNCTION_PARSERS"
@@ -1091,6 +1105,13 @@ class CandidateEngine:
                 or (attr == "PROPERTIES_LOCATION" and f".{attr}" in line_txt and "for " in line_txt)
             ):
                 return True
+            if f".{attr}" in line_txt and ("*" in line_txt or "|" in line_txt or "-" in line_txt):
+                for back in range(1, min(5, rline)):
+                    prev_txt = lines[rline - 1 - back].strip()
+                    if prev_txt.startswith((f"{attr} =", f"{attr}:")):
+                        return True
+                    if prev_txt.startswith(("def ", "class ")) or (" = " in prev_txt and not prev_txt.startswith("*")):
+                        break
         return False
 
     def _dialect_hits_for_owners(self, owners: list[str]) -> set[int]:
@@ -1441,6 +1462,47 @@ class CandidateEngine:
                                     ml_by_file.setdefault(rf, set()).add(rl)
                         meta_line_specs = list(ml_by_file.items())
                         hits.update(self.file_to_test_nums.get("tests/test_time.py", []))
+                    elif attr == "DATE_PART_MAPPING":
+                        meta_line_specs = [
+                            ("sqlglot/dialects/dialect.py", {2576}),
+                            ("sqlglot/parser.py", {6583}),
+                        ]
+                    elif attr == "ESCAPED_SEQUENCES":
+                        meta_line_specs = [
+                            ("sqlglot/generator.py", {3279}),
+                            ("sqlglot/generators/bigquery.py", {739}),
+                        ]
+                    elif attr == "COERCES_TO":
+                        meta_line_specs = [
+                            ("sqlglot/optimizer/annotate_types.py", {208}),
+                            ("sqlglot/optimizer/canonicalize.py", {207}),
+                        ]
+                    elif attr == "ALTER_ALTER_PARSERS":
+                        meta_line_specs = [("sqlglot/parser.py", {9585, 9586})]
+                    elif attr == "VERSION_PHRASES":
+                        meta_line_specs = [("sqlglot/parser.py", {5373})]
+                    elif attr == "LAMBDAS":
+                        meta_line_specs = [("sqlglot/parser.py", {7864, 7865, 7868, 7871, 7872})]
+                    elif attr == "ALTER_PARSERS":
+                        meta_line_specs = [("sqlglot/parser.py", {9757, 9763, 9764, 9789, 9790})]
+                    elif attr == "TYPE_LITERAL_PARSERS":
+                        meta_line_specs = [("sqlglot/parser.py", {6804})]
+                    elif attr == "PROPERTIES_LOCATION":
+                        meta_line_specs = [("sqlglot/generator.py", {2222, 2268})]
+                    elif attr == "PROPERTY_PARSERS":
+                        ml_pp: dict[str, set[int]] = {}
+                        for rf, rl in self.maps["attr_readers"].get(attr, []):
+                            if rl not in self._get_non_runtime_info(rf)[0]:
+                                ml_pp.setdefault(rf, set()).add(rl)
+                        if ml_pp:
+                            meta_line_specs = list(ml_pp.items())
+                    elif attr == "CONSTRAINT_PARSERS":
+                        ml_cp: dict[str, set[int]] = {}
+                        for rf, rl in self.maps["attr_readers"].get(attr, []):
+                            if rl not in self._get_non_runtime_info(rf)[0]:
+                                ml_cp.setdefault(rf, set()).add(rl)
+                        if ml_cp:
+                            meta_line_specs = list(ml_cp.items())
 
                     if meta_line_specs is not None:
                         rt_hits: set[int] = set()
@@ -1668,6 +1730,33 @@ class CandidateEngine:
                     cls_meta_specs = [("sqlglot/tokenizer_core.py", {1267, 1270})]
                 elif attr == "NUMERIC_ESCAPES_ARE_BYTES":
                     cls_meta_specs = [("sqlglot/tokenizer_core.py", {1219, 1240, 1250, 1362, 1363})]
+                elif attr == "UNICODE_START":
+                    cls_meta_specs = [("sqlglot/generator.py", {1754})]
+                elif attr == "UNICODE_END":
+                    cls_meta_specs = [("sqlglot/generator.py", {1758})]
+                elif attr == "COMMAND_PREFIX_TOKENS":
+                    cls_meta_specs = [("sqlglot/tokenizer_core.py", {833})]
+                elif attr == "DATE_PART_MAPPING":
+                    cls_meta_specs = [
+                        ("sqlglot/dialects/dialect.py", {2576}),
+                        ("sqlglot/parser.py", {6583}),
+                    ]
+                elif attr == "ESCAPED_SEQUENCES":
+                    cls_meta_specs = [
+                        ("sqlglot/generator.py", {3279}),
+                        ("sqlglot/generators/bigquery.py", {739}),
+                    ]
+                elif attr == "ALTER_ALTER_PARSERS":
+                    cls_meta_specs = [("sqlglot/parser.py", {9585, 9586})]
+                elif attr == "VERSION_PHRASES":
+                    cls_meta_specs = [("sqlglot/parser.py", {5373})]
+                elif attr == "LAMBDAS":
+                    cls_meta_specs = [("sqlglot/parser.py", {7864, 7865, 7868, 7871, 7872})]
+                elif attr == "COERCES_TO":
+                    cls_meta_specs = [
+                        ("sqlglot/optimizer/annotate_types.py", {208}),
+                        ("sqlglot/optimizer/canonicalize.py", {207}),
+                    ]
 
                 if cls_meta_specs is not None:
                     rt_hits_c: set[int] = set()
