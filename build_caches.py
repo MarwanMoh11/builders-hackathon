@@ -349,16 +349,19 @@ def _build_tpc_tables(sg_root: Path, th) -> tuple[int, int]:
 def _build_duckdb_files_subproc(sg_root: Path) -> None:
     """Build persistent read-only DuckDB databases in an isolated subprocess."""
     code = f"""
-import sys
+import pickle, sys
 from pathlib import Path
 sys.path.insert(0, {str(sg_root)!r})
 import duckdb
 import tests.helpers as th
+from sqlglot import transpile
 
 sg_root = Path({str(sg_root)!r})
-for db_name, sub, schema in [
-    ("/app/duckdb_tpcds.db", "tests/fixtures/optimizer/tpc-ds/", th.TPCDS_SCHEMA),
-    ("/app/duckdb_tpch.db", "tests/fixtures/optimizer/tpc-h/", th.TPCH_SCHEMA),
+duck_res_dir = Path("/app/tpc_duck")
+duck_res_dir.mkdir(parents=True, exist_ok=True)
+for db_name, tag, sub, schema, fix_rel in [
+    ("/app/duckdb_tpcds.db", "tpcds", "tests/fixtures/optimizer/tpc-ds/", th.TPCDS_SCHEMA, "optimizer/tpc-ds/tpc-ds.sql"),
+    ("/app/duckdb_tpch.db", "tpch", "tests/fixtures/optimizer/tpc-h/", th.TPCH_SCHEMA, "optimizer/tpc-h/tpc-h.sql"),
 ]:
     p = Path(db_name)
     if p.exists():
@@ -372,6 +375,16 @@ for db_name, sub, schema in [
                     f"CREATE TABLE {{table}} AS SELECT * FROM READ_CSV('{{fn}}', delim='|', header=True, columns={{col_types}})"
                 )
         conn.execute("CHECKPOINT")
+        for qi, (qargs, qsql, _) in enumerate(th.load_sql_fixture_pairs(fix_rel), start=1):
+            if tag == "tpcds" and not qargs.get("execute"):
+                continue
+            dsql = transpile(qsql, write="duckdb")[0]
+            cur = conn.execute(dsql)
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+            (duck_res_dir / f"{{tag}}_{{qi}}.pkl").write_bytes(
+                pickle.dumps((cols, rows), protocol=pickle.HIGHEST_PROTOCOL)
+            )
     finally:
         conn.close()
 
@@ -613,13 +626,15 @@ def main() -> None:
             return out_cnt, pygen_res
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as sub_pool:
-            # MUST run exec_replay on Pure-Python sg_root so _install_fine_spies intercepts PythonGenerator!
+            # MUST run exec_replay & core_methods on Pure-Python sg_root so _install_fine_spies intercepts all Python classes!
             f_exec = sub_pool.submit(rc.build_exec_and_sqlite_cache, sg_root)
             f_rows = sub_pool.submit(_build_tpc_rows, fast_root_str, master_plan_dir)
             f_plans = sub_pool.submit(_build_other_plans_and_pygen)
+            f_core = sub_pool.submit(rc.build_core_methods_shard, sg_root)
             exec_res = f_exec.result()
             n_rows_r = f_rows.result()
             plan_counts, pygen_res = f_plans.result()
+            core_res = f_core.result()
 
         # Step 2b: dep_index (n_cpus-1 while opt_replay runs, or n_cpus if opt_replay already finished)
         dep_w = n_cpus if opt_done.is_set() else max(1, n_cpus - 1)
@@ -627,17 +642,18 @@ def main() -> None:
 
         # Step 2c: val_replay (LPT-bucketed 1 spy install per worker, grabs all 4 cores seamlessly)
         val_res = _run_val_replay_subproc(sg_root, n_cpus)
-        return exec_res, n_rows_r, plan_counts, pygen_res, dep_res, val_res
+        return exec_res, n_rows_r, plan_counts, pygen_res, core_res, dep_res, val_res
 
     t_p2 = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as p2_pool:
         f_opt = p2_pool.submit(_run_opt_replay)
         f_sec = p2_pool.submit(_run_secondary_pipeline)
         orows, obytes, dq, dbytes = f_opt.result()
-        exec_res, n_rows, plan_counts, pygen_res, dep_res, val_res = f_sec.result()
+        exec_res, n_rows, plan_counts, pygen_res, core_res, dep_res, val_res = f_sec.result()
 
     erows, ebytes, sq, sbytes = exec_res
     n_pyg_q, n_pyg_toks, pyg_bytes = pygen_res
+    cm_n, cm_bytes = core_res
     d_seen, d_keep, d_attrs, d_dicts, d_bytes = dep_res
     vp, ve, vb = val_res
 
@@ -650,6 +666,7 @@ def main() -> None:
         f"rows={n_rows} pq={n_pq} cj={n_cj} ({cj_bytes/1024:.0f} KB) pygen={n_pyg_q}q/{n_pyg_toks}t ({pyg_bytes/1024:.1f} KB), "
         f"dep_index={d_seen}t/{d_keep}k ({d_bytes/1024:.0f} KB), "
         f"val_replay={vp}p/{ve}e ({vb/1024:.0f} KB), opt_replay={orows}r ({obytes/1024:.0f} KB), "
+        f"core_methods={cm_n}m ({cm_bytes/1024:.1f} KB), "
         f"duckdb={dq}q ({dbytes/1024:.1f} KB), exec_replay={erows}r ({ebytes/1024:.0f} KB), sqlite={sq}q ({sbytes/1024:.1f} KB) "
         f"[p1={t_p1:.1f}s p2={time.perf_counter()-t_p2:.1f}s] total={time.perf_counter() - t0:.1f}s",
         flush=True,

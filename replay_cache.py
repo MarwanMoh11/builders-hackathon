@@ -177,6 +177,19 @@ SHARD_OPT_FILES: dict[str, frozenset[str]] = {
     "annotate_funcs": _OPT_QUALIFY_FILES | _OPT_ANNOTATE_FILES,
 }
 
+# 8 core test files covered by whole-method CoreMethodsShard (/app/opt_replay/core_methods.{idx,ftoc,fdat})
+CORE_METHODS_FILES: tuple[str, ...] = (
+    "tests/test_parser.py",
+    "tests/test_generator.py",
+    "tests/test_transpile.py",
+    "tests/test_expressions.py",
+    "tests/test_schema.py",
+    "tests/test_serde.py",
+    "tests/test_diff.py",
+    "tests/test_lineage.py",
+)
+CORE_METHODS_FILE_SET: frozenset[str] = frozenset(CORE_METHODS_FILES)
+
 
 class ReplayScope:
     __slots__ = (
@@ -1506,6 +1519,120 @@ _VAL_SHARD_CACHE: dict[str, ValReplayShard | None] = {}
 _OPT_SHARD_CACHE: dict[str, OptReplayShard | None] = {}
 _OPT_METHODS_SHARD_CACHE: OptMethodsShard | None = None
 _OPT_METHODS_LOADED: bool = False
+_OPT_METHODS_SCOPE: ReplayScope | None = None
+_VAL_METHODS_SHARD_CACHE: ValMethodsShard | None = None
+_VAL_METHODS_LOADED: bool = False
+_VAL_METHODS_SCOPE: ReplayScope | None = None
+_CORE_METHODS_SHARD_CACHE: CoreMethodsShard | None = None
+_CORE_METHODS_LOADED: bool = False
+_CORE_METHODS_SCOPE: ReplayScope | None = None
+
+
+class ValMethodsShard:
+    """Unified whole-method coarse+fine dependency shard across ALL 35 dialect test files (~0.002ms!)."""
+    __slots__ = (
+        "deps_table", "methods", "dirty_flags", "dirty_opt_flags",
+        "dirty_mids", "opt_dirty_files",
+    )
+
+    def __init__(
+        self,
+        deps_table: list,
+        methods: dict[str, tuple[int, int, int]],
+        ftoc: dict[Any, tuple[int, ...]] | None,
+        fdat_path: Path,
+        scope: ReplayScope,
+    ) -> None:
+        self.deps_table = deps_table
+        self.methods = methods
+        self.opt_dirty_files = scope.opt_dirty_files
+        dd = scope.dirty_dials
+        dp = scope.dirty_pars
+        dg = scope.dirty_gens
+        dod = scope.dirty_opt_dials
+        dtd = scope.dirty_typing_dials
+        self.dirty_flags: list[bool] = [
+            bool(
+                (dd and any(x in dd for x in ds))
+                or (dp and any(x in dp for x in ps))
+                or (dg and any(x in dg for x in gs))
+                or (dtd and any(x in dtd for x in ds))
+            )
+            for ds, ps, gs in deps_table
+        ]
+        self.dirty_opt_flags: list[bool] = (
+            [
+                self.dirty_flags[i] or bool(any(x in dod for x in deps_table[i][0]))
+                for i in range(len(deps_table))
+            ]
+            if dod
+            else self.dirty_flags
+        )
+        self.dirty_mids: set[int] | None = None
+        if scope.fine_tokens is not None and (any(self.dirty_flags) or any(self.dirty_opt_flags)):
+            try:
+                res = _query_fine_tables(ftoc, fdat_path, scope.fine_tokens, 1)
+                if res is not None:
+                    self.dirty_mids = res[0]
+            except Exception:
+                pass
+
+    def is_method_clean(self, tid_str: str) -> bool:
+        rec = self.methods.get(tid_str)
+        if rec is None:
+            return False
+        dep_idx, mid, uses_opt = rec
+        if uses_opt:
+            if self.opt_dirty_files:
+                return False
+            return (not self.dirty_opt_flags[dep_idx]) or (
+                self.dirty_mids is not None and mid not in self.dirty_mids
+            )
+        return (not self.dirty_flags[dep_idx]) or (
+            self.dirty_mids is not None and mid not in self.dirty_mids
+        )
+
+
+def load_val_methods_raw() -> bool:
+    """Preload unified /app/val_replay/val_methods.{idx,ftoc} ONCE in parent before os.fork()."""
+    if "val_methods" not in _RAW_VAL_IDX:
+        idx_path = VAL_REPLAY_DIR / "val_methods.idx"
+        raw: Any = None
+        if idx_path.is_file():
+            try:
+                raw = marshal.loads(idx_path.read_bytes())
+            except Exception:
+                raw = None
+        _RAW_VAL_IDX["val_methods"] = raw
+    if "val_methods" not in _RAW_VAL_FTOC:
+        fp = VAL_REPLAY_DIR / "val_methods.ftoc"
+        ftoc: Any = None
+        if fp.is_file():
+            try:
+                ftoc = marshal.loads(fp.read_bytes())
+            except Exception:
+                ftoc = None
+        _RAW_VAL_FTOC["val_methods"] = ftoc
+    return _RAW_VAL_IDX.get("val_methods") is not None
+
+
+def get_val_methods_shard(scope: ReplayScope) -> ValMethodsShard | None:
+    global _VAL_METHODS_SHARD_CACHE, _VAL_METHODS_LOADED, _VAL_METHODS_SCOPE
+    if _VAL_METHODS_LOADED and _VAL_METHODS_SCOPE is scope:
+        return _VAL_METHODS_SHARD_CACHE
+    _VAL_METHODS_LOADED = True
+    _VAL_METHODS_SCOPE = scope
+    if "val_methods" not in _RAW_VAL_IDX or "val_methods" not in _RAW_VAL_FTOC:
+        load_val_methods_raw()
+    raw = _RAW_VAL_IDX.get("val_methods")
+    if raw is None:
+        _VAL_METHODS_SHARD_CACHE = None
+        return None
+    ftoc = _RAW_VAL_FTOC.get("val_methods")
+    fdat_path = VAL_REPLAY_DIR / "val_methods.fdat"
+    deps_table, methods = raw[:2]
+    _VAL_METHODS_SHARD_CACHE = ValMethodsShard(deps_table, methods, ftoc, fdat_path, scope)
+    return _VAL_METHODS_SHARD_CACHE
 
 
 class OptMethodsShard:
@@ -1578,32 +1705,42 @@ class OptMethodsShard:
         return False
 
 
-def get_opt_methods_shard(scope: ReplayScope) -> OptMethodsShard | None:
-    global _OPT_METHODS_SHARD_CACHE, _OPT_METHODS_LOADED
-    if _OPT_METHODS_LOADED:
-        return _OPT_METHODS_SHARD_CACHE
-    _OPT_METHODS_LOADED = True
-    raw = _RAW_OPT_IDX.get("opt_methods")
-    if raw is None and "opt_methods" not in _RAW_OPT_IDX:
+def load_opt_methods_raw() -> bool:
+    """Preload /app/opt_replay/opt_methods.{idx,ftoc} ONCE in parent before os.fork()."""
+    if "opt_methods" not in _RAW_OPT_IDX:
         idx_path = OPT_REPLAY_DIR / "opt_methods.idx"
+        raw: Any = None
         if idx_path.is_file():
             try:
                 raw = marshal.loads(idx_path.read_bytes())
             except Exception:
                 raw = None
         _RAW_OPT_IDX["opt_methods"] = raw
-    if raw is None:
-        _OPT_METHODS_SHARD_CACHE = None
-        return None
-    ftoc = _RAW_OPT_FTOC.get("opt_methods")
-    if ftoc is None and "opt_methods" not in _RAW_OPT_FTOC:
+    if "opt_methods" not in _RAW_OPT_FTOC:
         fp = OPT_REPLAY_DIR / "opt_methods.ftoc"
+        ftoc: Any = None
         if fp.is_file():
             try:
                 ftoc = marshal.loads(fp.read_bytes())
             except Exception:
                 ftoc = None
         _RAW_OPT_FTOC["opt_methods"] = ftoc
+    return _RAW_OPT_IDX.get("opt_methods") is not None
+
+
+def get_opt_methods_shard(scope: ReplayScope) -> OptMethodsShard | None:
+    global _OPT_METHODS_SHARD_CACHE, _OPT_METHODS_LOADED, _OPT_METHODS_SCOPE
+    if _OPT_METHODS_LOADED and _OPT_METHODS_SCOPE is scope:
+        return _OPT_METHODS_SHARD_CACHE
+    _OPT_METHODS_LOADED = True
+    _OPT_METHODS_SCOPE = scope
+    if "opt_methods" not in _RAW_OPT_IDX or "opt_methods" not in _RAW_OPT_FTOC:
+        load_opt_methods_raw()
+    raw = _RAW_OPT_IDX.get("opt_methods")
+    if raw is None:
+        _OPT_METHODS_SHARD_CACHE = None
+        return None
+    ftoc = _RAW_OPT_FTOC.get("opt_methods")
     fdat_path = OPT_REPLAY_DIR / "opt_methods.fdat"
     if len(raw) >= 3:
         deps_table, methods, method_opt_files = raw[:3]
@@ -1614,8 +1751,141 @@ def get_opt_methods_shard(scope: ReplayScope) -> OptMethodsShard | None:
     return _OPT_METHODS_SHARD_CACHE
 
 
+class CoreMethodsShard:
+    """Whole-method coarse+fine+opt_files dependency shard across the 8 core test files (~0.002ms!)."""
+    __slots__ = (
+        "deps_table", "methods", "method_opt_files",
+        "dirty_flags", "dirty_opt_flags", "dirty_mids",
+        "is_opt_only", "opt_dirty_files", "opt_func_only",
+    )
+
+    def __init__(
+        self,
+        deps_table: list,
+        methods: dict[str, tuple[int, int, int]],
+        method_opt_files: dict[str, tuple[str, ...]],
+        ftoc: dict[Any, tuple[int, ...]] | None,
+        fdat_path: Path,
+        scope: ReplayScope,
+    ) -> None:
+        self.deps_table = deps_table
+        self.methods = methods
+        self.method_opt_files = method_opt_files
+        self.is_opt_only = scope.is_opt_only
+        self.opt_dirty_files = scope.opt_dirty_files
+        self.opt_func_only = scope.opt_func_only
+        dd = scope.dirty_dials
+        dp = scope.dirty_pars
+        dg = scope.dirty_gens
+        dod = scope.dirty_opt_dials
+        dtd = scope.dirty_typing_dials
+        self.dirty_flags: list[bool] = [
+            bool(
+                (dd and any(x in dd for x in ds))
+                or (dp and any(x in dp for x in ps))
+                or (dg and any(x in dg for x in gs))
+                or (dtd and any(x in dtd for x in ds))
+            )
+            for ds, ps, gs in deps_table
+        ]
+        self.dirty_opt_flags: list[bool] = (
+            [
+                self.dirty_flags[i] or bool(any(x in dod for x in deps_table[i][0]))
+                for i in range(len(deps_table))
+            ]
+            if dod
+            else self.dirty_flags
+        )
+        self.dirty_mids: set[int] | None = None
+        if scope.fine_tokens is not None and (
+            self.is_opt_only or any(self.dirty_flags) or any(self.dirty_opt_flags)
+        ):
+            try:
+                res = _query_fine_tables(ftoc, fdat_path, scope.fine_tokens, 1)
+                if res is not None:
+                    self.dirty_mids = res[0]
+            except Exception:
+                pass
+
+    def is_method_clean(self, tid_str: str) -> bool:
+        rec = self.methods.get(tid_str)
+        if rec is None:
+            return False
+        dep_idx, mid, uses_opt = rec
+        dm = self.dirty_mids
+        if uses_opt:
+            if self.opt_dirty_files:
+                opt_clean = False
+                if self.opt_func_only:
+                    m_of = self.method_opt_files.get(tid_str)
+                    if m_of is not None and self.opt_dirty_files.isdisjoint(m_of):
+                        opt_clean = True
+                if not opt_clean and dm is not None and mid not in dm:
+                    opt_clean = True
+                if not opt_clean:
+                    return False
+                if self.is_opt_only:
+                    return True
+            if not self.dirty_opt_flags[dep_idx]:
+                return True
+            if dm is not None and mid not in dm:
+                return True
+            return False
+        if self.is_opt_only and self.opt_func_only:
+            return True
+        if not self.dirty_flags[dep_idx]:
+            return True
+        if dm is not None and mid not in dm:
+            return True
+        return False
+
+
+def load_core_methods_raw() -> bool:
+    """Preload /app/opt_replay/core_methods.{idx,ftoc} ONCE in parent before os.fork()."""
+    if "core_methods" not in _RAW_OPT_IDX:
+        idx_path = OPT_REPLAY_DIR / "core_methods.idx"
+        raw: Any = None
+        if idx_path.is_file():
+            try:
+                raw = marshal.loads(idx_path.read_bytes())
+            except Exception:
+                raw = None
+        _RAW_OPT_IDX["core_methods"] = raw
+    if "core_methods" not in _RAW_OPT_FTOC:
+        fp = OPT_REPLAY_DIR / "core_methods.ftoc"
+        ftoc: Any = None
+        if fp.is_file():
+            try:
+                ftoc = marshal.loads(fp.read_bytes())
+            except Exception:
+                ftoc = None
+        _RAW_OPT_FTOC["core_methods"] = ftoc
+    return _RAW_OPT_IDX.get("core_methods") is not None
+
+
+def get_core_methods_shard(scope: ReplayScope) -> CoreMethodsShard | None:
+    global _CORE_METHODS_SHARD_CACHE, _CORE_METHODS_LOADED, _CORE_METHODS_SCOPE
+    if _CORE_METHODS_LOADED and _CORE_METHODS_SCOPE is scope:
+        return _CORE_METHODS_SHARD_CACHE
+    _CORE_METHODS_LOADED = True
+    _CORE_METHODS_SCOPE = scope
+    if "core_methods" not in _RAW_OPT_IDX or "core_methods" not in _RAW_OPT_FTOC:
+        load_core_methods_raw()
+    raw = _RAW_OPT_IDX.get("core_methods")
+    if raw is None:
+        _CORE_METHODS_SHARD_CACHE = None
+        return None
+    ftoc = _RAW_OPT_FTOC.get("core_methods")
+    fdat_path = OPT_REPLAY_DIR / "core_methods.fdat"
+    deps_table, methods, method_opt_files = raw[:3]
+    _CORE_METHODS_SHARD_CACHE = CoreMethodsShard(deps_table, methods, method_opt_files, ftoc, fdat_path, scope)
+    return _CORE_METHODS_SHARD_CACHE
+
+
 def clear_replay_shard_caches() -> None:
-    global _OPT_METHODS_SHARD_CACHE, _OPT_METHODS_LOADED
+    global _OPT_METHODS_SHARD_CACHE, _OPT_METHODS_LOADED, _OPT_METHODS_SCOPE
+    global _VAL_METHODS_SHARD_CACHE, _VAL_METHODS_LOADED, _VAL_METHODS_SCOPE
+    global _CORE_METHODS_SHARD_CACHE, _CORE_METHODS_LOADED, _CORE_METHODS_SCOPE
     for sh in _VAL_SHARD_CACHE.values():
         if sh is not None:
             sh.close()
@@ -1626,6 +1896,13 @@ def clear_replay_shard_caches() -> None:
     _OPT_SHARD_CACHE.clear()
     _OPT_METHODS_SHARD_CACHE = None
     _OPT_METHODS_LOADED = False
+    _OPT_METHODS_SCOPE = None
+    _VAL_METHODS_SHARD_CACHE = None
+    _VAL_METHODS_LOADED = False
+    _VAL_METHODS_SCOPE = None
+    _CORE_METHODS_SHARD_CACHE = None
+    _CORE_METHODS_LOADED = False
+    _CORE_METHODS_SCOPE = None
 
 
 def get_val_shard(test_file: str, scope: ReplayScope) -> ValReplayShard | None:
@@ -2390,9 +2667,11 @@ def _install_opt_touch_hook() -> tuple[list[bool], Any]:
     return opt_touched, _restore
 
 
-def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int, int]:
-    """Collect Validator replay shards (parses + edges + pure method_ops + whole_methods) for a bucket
-    of dialect test files using ONE spy install per worker (avoids wrapper stacking & cuts build time)."""
+def _collect_dialect_bucket(
+    args: tuple[str, list[str], str],
+) -> tuple[int, int, int, list[tuple[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], frozenset[tuple[Any, ...]], int]]]:
+    """Collect Validator replay shards (parses + edges + pure method_ops + whole_methods + unified val_methods)
+    for a bucket of dialect test files using ONE spy install per worker (avoids wrapper stacking & cuts build time)."""
     sg_root, test_files, out_dir_str = args
     sys.path.insert(0, sg_root)
     sys.path.insert(0, "/app")
@@ -2404,6 +2683,7 @@ def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int,
     from sqlglot.dialects.dialect import Dialect as _BaseDialect
     from sqlglot.generator import Generator as _BaseGen
     from sqlglot.parser import Parser as _BasePar
+    from sqlglot.tokens import Tokenizer as _BaseTok
     import tests.dialects.test_dialect as tdial
 
     fine_stack: list[set[tuple[Any, ...]]] = []
@@ -2411,19 +2691,36 @@ def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int,
     rec_stack, restore_rec = _install_stage_recorders()
     opt_touched_flag, restore_opt_hook = _install_opt_touch_hook()
 
-    def _all_sub_names(root_cls: type) -> set[str]:
-        out, q_s = {root_cls.__name__}, [root_cls]
+    def _all_sub_key_to_name(root_cls: type) -> dict[str, str]:
+        out: dict[str, str] = {}
+        seen: set[type] = set()
+        q_s = [root_cls]
         while q_s:
             cur_c = q_s.pop()
+            if cur_c in seen:
+                continue
+            seen.add(cur_c)
+            if getattr(cur_c, "__module__", "").startswith("sqlglot."):
+                out[cur_c.__name__] = cur_c.__name__
+                out[cur_c.__qualname__] = cur_c.__name__
             for sc in cur_c.__subclasses__():
-                if sc.__name__ not in out:
-                    out.add(sc.__name__)
-                    q_s.append(sc)
+                q_s.append(sc)
         return out
 
-    _gen_names = _all_sub_names(_BaseGen)
-    _par_names = _all_sub_names(_BasePar)
-    _dial_names = _all_sub_names(_BaseDialect)
+    _gen_map = _all_sub_key_to_name(_BaseGen)
+    _par_map = _all_sub_key_to_name(_BasePar)
+    _dial_map = _all_sub_key_to_name(_BaseDialect)
+    _tok_names = set(_all_sub_key_to_name(_BaseTok).keys())
+    _gen_names = set(_gen_map.values())
+    _par_names = set(_par_map.values())
+    _dial_names = set(_dial_map.values())
+
+    def _is_known_par(p: str) -> bool:
+        if p in _par_names or p == "Tokenizer":
+            return True
+        if p.startswith("TOK:") and p[4:] in _dial_names:
+            return True
+        return False
 
     deps_list: list[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = []
     deps_to_id: dict[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], int] = {}
@@ -2526,6 +2823,7 @@ def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int,
             cur_m_rec[0][2].add(eff_dep)
 
     in_ctx = [0]
+    rt_unsafe = [False]
 
     class _RecCtxProxy:
         __slots__ = ("_cm",)
@@ -2545,6 +2843,7 @@ def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int,
         def __getattr__(self, name: str) -> Any:
             return getattr(self._cm, name)
 
+    _UNSAFE_CMS = frozenset({"assertLogs", "assertNoLogs", "assertWarns", "assertWarnsRegex"})
     saved_tc_cms: list[tuple[str, Any]] = []
     for cname in ("assertLogs", "assertNoLogs", "assertRaises", "assertRaisesRegex", "assertWarns", "assertWarnsRegex"):
         orig_cm = getattr(unittest.TestCase, cname, None)
@@ -2553,9 +2852,12 @@ def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int,
         saved_tc_cms.append((cname, orig_cm))
         has_callable = cname not in ("assertLogs", "assertNoLogs")
         min_a = 3 if "Regex" in cname else 2
+        marks_rt_unsafe = cname in _UNSAFE_CMS
 
-        def _make_cm(orig, hc, ma):
+        def _make_cm(orig, hc, ma, mru):
             def _w(self, *a, **kw):
+                if mru:
+                    rt_unsafe[0] = True
                 if hc and len(a) >= ma and a[ma - 1] is not None:
                     in_ctx[0] += 1
                     try:
@@ -2568,10 +2870,11 @@ def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int,
                 return _RecCtxProxy(cm)
             return _w
 
-        setattr(unittest.TestCase, cname, _make_cm(orig_cm, has_callable, min_a))
+        setattr(unittest.TestCase, cname, _make_cm(orig_cm, has_callable, min_a, marks_rt_unsafe))
 
     _ope, _opx = _umock._patch.__enter__, _umock._patch.__exit__
     def _wpe(self):
+        rt_unsafe[0] = True
         r = _ope(self); in_ctx[0] += 1; return r
     def _wpx(self, *ei):
         try: return _opx(self, *ei)
@@ -2719,7 +3022,7 @@ def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int,
     _UNSAFE_MNAME = {
         "test_enum", "test_lazy_load", "test_get_or_raise",
         "test_patch_dialect_parser", "test_custom_dialect",
-        "test_partition_by_excluding",
+        "test_partition_by_excluding", "test_dialect_import_no_deadlock",
     }
     _UNSAFE_SUBSTRS = (
         "patch", "mock", "Dialects", "_classes", "subprocess", "importlib",
@@ -2727,6 +3030,9 @@ def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int,
         "Dialect[", "Dialect.get(", ".KEYWORDS", ".Tokenizer", ".Parser",
         ".Generator", "Tokenizer(", "Parser(", "Generator(",
         "TypeAnnotator", "optimizer.",
+        "assertLogs", "assertNoLogs", "assertWarns", "logger",
+        "Token(", "TokenizerCore", "open(", "Path(", "load_sql_fixture",
+        "warnings", "threading",
     )
 
     def _expr_is_pure_data(node: Any) -> bool:
@@ -2753,8 +3059,16 @@ def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int,
             return _expr_is_pure_data(st.value)
         return False
 
+    def _prof_opt_touch(frame: Any, event: str, arg: Any) -> None:
+        if event == "call" and not opt_touched_flag[0]:
+            if "/sqlglot/optimizer/" in frame.f_code.co_filename:
+                opt_touched_flag[0] = True
+
     out_dir = Path(out_dir_str)
     tot_p = tot_e = tot_b = 0
+    unified_methods: list[
+        tuple[str, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], frozenset[tuple[Any, ...]], int]
+    ] = []
     try:
         for test_file in test_files:
             deps_list.clear()
@@ -2785,13 +3099,26 @@ def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int,
                             isinstance(_it, _ast.FunctionDef) and _it.name in ("setUp", "setUpClass", "parse_one")
                             for _it in _node.body
                         )
+                        _has_setup_cls = any(
+                            isinstance(_it, _ast.FunctionDef) and _it.name == "setUpClass"
+                            for _it in _node.body
+                        )
                         for _item in _node.body:
                             if isinstance(_item, _ast.FunctionDef) and _item.name.startswith("test_"):
                                 mk = f"{_node.name}::{_item.name}"
                                 seg = _ast.get_source_segment(_src_txt, _item) or ""
-                                if _item.name in _UNSAFE_MNAME or any(k in seg for k in _UNSAFE_SUBSTRS):
+                                _has_sub_cls = any(
+                                    isinstance(_n, _ast.ClassDef) and _n.bases for _n in _ast.walk(_item)
+                                )
+                                if (
+                                    _has_setup_cls
+                                    or _item.decorator_list
+                                    or _has_sub_cls
+                                    or _item.name in _UNSAFE_MNAME
+                                    or any(k in seg for k in _UNSAFE_SUBSTRS)
+                                ):
                                     unsafe_methods.add(mk)
-                                if not _has_custom_hook and not _item.decorator_list:
+                                if not _has_custom_hook and not _item.decorator_list and not _has_sub_cls:
                                     _body = _item.body
                                     if _body and isinstance(_body[0], _ast.Expr) and isinstance(_body[0].value, _ast.Constant) and isinstance(_body[0].value.value, str):
                                         _body = _body[1:]
@@ -2805,6 +3132,42 @@ def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int,
             mod = importlib.import_module(mod_name)
             suite = unittest.defaultTestLoader.loadTestsFromModule(mod)
             res = unittest.TestResult()
+
+            def _fold_fine_deps(
+                ftoks: set[tuple[Any, ...]],
+                dset: set[str],
+                pset: set[str],
+                gset: set[str],
+            ) -> bool:
+                for tok in ftoks:
+                    t0 = tok[0]
+                    if t0 in ("A", "D", "T", "M"):
+                        rc_n = tok[1]
+                        if rc_n in _gen_map:
+                            gset.add(_gen_map[rc_n])
+                        elif rc_n in _par_map:
+                            pset.add(_par_map[rc_n])
+                        elif rc_n in _dial_map:
+                            dset.add(_dial_map[rc_n])
+                        elif ".Tokenizer" in rc_n and rc_n.split(".")[0] in _dial_names:
+                            pset.add("Tokenizer")
+                            pset.add(f"TOK:{rc_n.split('.')[0]}")
+                        elif rc_n == "_TrinoTokenizer":
+                            pset.update(("Tokenizer", "TOK:Trino", "TOK:Athena"))
+                        elif rc_n in _tok_names:
+                            pset.add("Tokenizer")
+                        else:
+                            return False
+                    elif t0 == "F":
+                        mn_f = tok[1]
+                        if mn_f.startswith(("sqlglot.optimizer.", "sqlglot.typing.")):
+                            opt_touched_flag[0] = True
+                return (
+                    dset <= _dial_names
+                    and gset <= _gen_names
+                    and all(_is_known_par(p) for p in pset)
+                )
+
             for grp in suite:
                 for tc in grp:
                     mname = getattr(tc, "_testMethodName", "")
@@ -2813,56 +3176,79 @@ def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int,
                     mkey = f"{tc.__class__.__name__}::{mname}"
                     if mkey in pure_methods:
                         cur_m_rec[0] = [set(), set(), set(), True]
-                    else:
-                        cur_m_rec[0] = None
-                    rec_whole = mkey not in unsafe_methods and mkey not in pure_methods
-                    if rec_whole:
-                        wm_d, wm_p, wm_g, wm_f = set(), set(), set(), set()
+                        pm_d, pm_p, pm_g, pm_f = set(), set(), set(), set()
                         opt_touched_flag[0] = False
-
-                        def _prof_opt_touch(frame: Any, event: str, arg: Any) -> None:
-                            if event == "call" and not opt_touched_flag[0]:
-                                fn = frame.f_code.co_filename
-                                if "/sqlglot/optimizer/" in fn:
-                                    opt_touched_flag[0] = True
-
-                        rec_stack.append((wm_d, wm_p, wm_g)); fine_stack.append(wm_f)
+                        rt_unsafe[0] = False
+                        t_res = unittest.TestResult()
+                        rec_stack.append((pm_d, pm_p, pm_g)); fine_stack.append(pm_f)
                         sys.setprofile(_prof_opt_touch)
                         try:
-                            tc.run(res)
+                            tc.run(t_res)
                         finally:
                             sys.setprofile(None)
                             rec_stack.pop(); fine_stack.pop()
-                        if res.wasSuccessful() and (wm_d or wm_p or wm_g or wm_f):
-                            for tok in wm_f:
-                                t0 = tok[0]
-                                if t0 in ("A", "D", "T", "M"):
-                                    rc_n = tok[1]
-                                    if rc_n in _gen_names:
-                                        wm_g.add(rc_n)
-                                    elif rc_n in _par_names:
-                                        wm_p.add(rc_n)
-                                    elif rc_n in _dial_names:
-                                        wm_d.add(rc_n)
-                                    elif ".Tokenizer" in rc_n:
-                                        wm_p.add("Tokenizer")
-                                        wm_p.add(f"TOK:{rc_n.split('.')[0]}")
-                                elif t0 == "F":
-                                    mn_f = tok[1]
-                                    if mn_f.startswith(("sqlglot.optimizer.", "sqlglot.typing.")):
-                                        opt_touched_flag[0] = True
+                        if not t_res.wasSuccessful():
+                            res.failures.extend(t_res.failures)
+                            res.errors.extend(t_res.errors)
+                        rec_m = cur_m_rec[0]
+                        cur_m_rec[0] = None
+                        if rec_m is not None and rec_m[3] and (rec_m[0] or rec_m[1]):
+                            method_ops[mkey] = (tuple(sorted(rec_m[0])), tuple(sorted(rec_m[1])), tuple(sorted(rec_m[2])))
+                            for d_i in rec_m[2]:
+                                da, pa, ga = deps_list[d_i]
+                                pm_d.update(da); pm_p.update(pa); pm_g.update(ga)
+                            if (
+                                not rt_unsafe[0]
+                                and t_res.wasSuccessful()
+                                and not t_res.skipped
+                                and (pm_d or pm_p or pm_g or pm_f)
+                                and _fold_fine_deps(pm_f, pm_d, pm_p, pm_g)
+                            ):
+                                unified_methods.append((
+                                    f"{test_file}::{mkey}",
+                                    (tuple(sorted(pm_d)), tuple(sorted(pm_p)), tuple(sorted(pm_g))),
+                                    frozenset(pm_f),
+                                    1 if opt_touched_flag[0] else 0,
+                                ))
+                    elif mkey not in unsafe_methods:
+                        cur_m_rec[0] = None
+                        wm_d, wm_p, wm_g, wm_f = set(), set(), set(), set()
+                        opt_touched_flag[0] = False
+                        rt_unsafe[0] = False
+                        t_res = unittest.TestResult()
+                        rec_stack.append((wm_d, wm_p, wm_g)); fine_stack.append(wm_f)
+                        sys.setprofile(_prof_opt_touch)
+                        try:
+                            tc.run(t_res)
+                        finally:
+                            sys.setprofile(None)
+                            rec_stack.pop(); fine_stack.pop()
+                        if not t_res.wasSuccessful():
+                            res.failures.extend(t_res.failures)
+                            res.errors.extend(t_res.errors)
+                        if (
+                            not rt_unsafe[0]
+                            and t_res.wasSuccessful()
+                            and not t_res.skipped
+                            and (wm_d or wm_p or wm_g or wm_f)
+                            and _fold_fine_deps(wm_f, wm_d, wm_p, wm_g)
+                        ):
                             dep_idx = _intern_deps(wm_d, wm_p, wm_g)
                             mid = next_mid[0]
                             next_mid[0] = mid + 1
-                            whole_methods[mkey] = (dep_idx, mid, 1 if opt_touched_flag[0] else 0)
+                            uses_opt = 1 if opt_touched_flag[0] else 0
+                            whole_methods[mkey] = (dep_idx, mid, uses_opt)
                             for tok in wm_f:
                                 m_fine_inv.setdefault(tok, set()).add(mid)
+                            unified_methods.append((
+                                f"{test_file}::{mkey}",
+                                deps_list[dep_idx],
+                                frozenset(wm_f),
+                                uses_opt,
+                            ))
                     else:
+                        cur_m_rec[0] = None
                         tc.run(res)
-                    rec_m = cur_m_rec[0]
-                    cur_m_rec[0] = None
-                    if rec_m is not None and rec_m[3] and (rec_m[0] or rec_m[1]):
-                        method_ops[mkey] = (tuple(sorted(rec_m[0])), tuple(sorted(rec_m[1])), tuple(sorted(rec_m[2])))
             if not res.wasSuccessful():
                 raise RuntimeError(f"val_replay collection failed in {test_file}: {res.failures[:2]} {res.errors[:2]}")
 
@@ -2891,11 +3277,11 @@ def _collect_dialect_bucket(args: tuple[str, list[str], str]) -> tuple[int, int,
         restore_rec()
         restore_fine()
 
-    return tot_p, tot_e, tot_b
+    return tot_p, tot_e, tot_b, unified_methods
 
 
 def build_val_replay(sg_root: Path, out_dir: Path = VAL_REPLAY_DIR, n_workers: int | None = None) -> tuple[int, int, int]:
-    """Collect per-test-file Validator replay shards (idx + mmap ast + fine inverted index) across parallel workers."""
+    """Collect per-test-file Validator replay shards + unified val_methods.{idx,ftoc,fdat} across parallel workers."""
     from concurrent.futures import ProcessPoolExecutor
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2915,9 +3301,30 @@ def build_val_replay(sg_root: Path, out_dir: Path = VAL_REPLAY_DIR, n_workers: i
 
     tasks = [(str(sg_root), b, str(out_dir)) for b in buckets if b]
     tot_p = tot_e = tot_b = 0
+    vm_deps_list: list[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = []
+    vm_deps_to_id: dict[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], int] = {}
+    vm_methods: dict[str, tuple[int, int, int]] = {}
+    vm_fine_inv: dict[tuple[Any, ...], set[int]] = {}
+    vm_next_mid = 0
     with ProcessPoolExecutor(max_workers=len(tasks)) as pool:
-        for np_, ne_, nb_ in pool.map(_collect_dialect_bucket, tasks):
+        for np_, ne_, nb_, u_meths in pool.map(_collect_dialect_bucket, tasks):
             tot_p += np_; tot_e += ne_; tot_b += nb_
+            for tid_str, dep_key, ftoks, uses_opt in u_meths:
+                d_idx = vm_deps_to_id.get(dep_key)
+                if d_idx is None:
+                    d_idx = len(vm_deps_list)
+                    vm_deps_list.append(dep_key)
+                    vm_deps_to_id[dep_key] = d_idx
+                mid = vm_next_mid
+                vm_next_mid += 1
+                vm_methods[tid_str] = (d_idx, mid, uses_opt)
+                for tok in ftoks:
+                    vm_fine_inv.setdefault(tok, set()).add(mid)
+    if vm_methods:
+        vm_ib = marshal.dumps((vm_deps_list, vm_methods))
+        (out_dir / "val_methods.idx").write_bytes(vm_ib)
+        vm_fb = _write_fine_tables((vm_fine_inv,), out_dir / "val_methods.fdat", out_dir / "val_methods.ftoc")
+        tot_b += len(vm_ib) + vm_fb
     return tot_p, tot_e, tot_b
 
 
@@ -3130,6 +3537,7 @@ def _run_optimize_with_ckps(b, parsed_expr, opt_kwargs):
 
 def record_check_file_shard(file, func, pretty=False, execute=None, **kwargs):
     b = get_builder(f"cf_{{file}}")
+    b["complete"] = False
     fname = rc._func_key(func)
     is_full_opt = (func is topt.optimizer.optimize)
     for i, (meta, sql, expected) in enumerate(th.load_sql_fixture_pairs(f"optimizer/{{file}}.sql"), start=1):
@@ -3221,6 +3629,7 @@ def record_check_file_shard(file, func, pretty=False, execute=None, **kwargs):
             add_fine(b["of"], of, rid)
             add_fine(b["ff"], ff, rid)
             add_fine(b["ef"], ef, rid)
+    b["complete"] = bool(b["rows"])
 
 cf_method_shards = {{}}
 _cur_cf_m = [None]
@@ -3589,7 +3998,10 @@ if "test_annotate_types" not in unsafe_methods and "annotate_types" in shard_bui
 
 for mname in pure_cf_only_methods:
     if mname not in unsafe_methods and mname in cf_method_shards:
-        if not all(sn in shard_builders for sn in cf_method_shards[mname]):
+        if not all(
+            sn in shard_builders and shard_builders[sn]["rows"] and shard_builders[sn].get("complete", True)
+            for sn in cf_method_shards[mname]
+        ):
             continue
         _om_add(
             mname,
@@ -3750,7 +4162,7 @@ def _om_prof(frame, event, arg):
 try:
     sys.setprofile(_om_prof)
     for mname in all_topt_methods:
-        if mname in _SKIP_LIVE_OM or mname in pure_cf_only_methods or mname in om_methods:
+        if mname in _SKIP_LIVE_OM or mname in unsafe_methods or mname in pure_cf_only_methods or mname in om_methods:
             continue
         _cur_cf_m[0] = mname
         m_d, m_p, m_g, m_f = set(), set(), set(), set()
@@ -3765,9 +4177,12 @@ try:
             _cur_om_opt_files[0] = None
             rec_stack.pop(); fine_stack.pop()
             _cur_cf_m[0] = None
-        if res.wasSuccessful():
+        if res.wasSuccessful() and not res.skipped:
             if mname in cf_method_shards:
-                if not all(sn in shard_builders for sn in cf_method_shards[mname]):
+                if not all(
+                    sn in shard_builders and shard_builders[sn]["rows"] and shard_builders[sn].get("complete", True)
+                    for sn in cf_method_shards[mname]
+                ):
                     continue
                 ud, up, ug, uf = _union_shard_deps(cf_method_shards[mname])
                 m_d.update(ud); m_p.update(up); m_g.update(ug); m_f.update(uf)
@@ -3791,7 +4206,7 @@ opt_dir = Path({str(opt_dir)!r})
 tot_opt_rows = 0
 tot_opt_bytes = 0
 for name, b in shard_builders.items():
-    if not b["rows"]:
+    if not b["rows"] or not b.get("complete", True):
         continue
     safe_name = name.replace("/", "__")
     ast_p = opt_dir / f"{{safe_name}}.ast"
@@ -3994,6 +4409,293 @@ print(f"{{len(exec_cache)}} {{len(eblob)}} {{len(sq_queries)}} {{len(sblob)}}")
     import subprocess as _subprocess
     res = _subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     if res.returncode != 0:
-        raise RuntimeError(f"build_opt_replay_and_duckdb_cache failed ({res.returncode}):\n{res.stderr}\n{res.stdout}")
+        raise RuntimeError(f"build_exec_and_sqlite_cache failed ({res.returncode}):\n{res.stderr}\n{res.stdout}")
     parts = res.stdout.strip().splitlines()[-1].split()
     return int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+
+
+def build_core_methods_shard(
+    sg_root: Path,
+    out_dir: Path = OPT_REPLAY_DIR,
+) -> tuple[int, int]:
+    """Collect whole-method coarse+fine+opt_files dependency shard for safe tests across the
+    8 core test files (/app/opt_replay/core_methods.{idx,ftoc,fdat}). Runs on Pure-Python /sqlglot."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    code = """
+import ast as _ast
+import importlib
+import marshal
+import os
+import sys
+import unittest
+from pathlib import Path
+from unittest import mock as _umock
+
+sg_root = Path(sys.argv[1])
+out_dir = Path(sys.argv[2])
+os.environ["SKIP_INTEGRATION"] = "0"
+sys.path.insert(0, str(sg_root))
+sys.path.insert(0, "/app")
+
+import sqlglot
+from sqlglot.dialects.dialect import Dialect as _BaseDialect
+from sqlglot.generator import Generator as _BaseGen
+from sqlglot.parser import Parser as _BasePar
+from sqlglot.tokens import Tokenizer as _BaseTok
+from sqlglot.schema import MappingSchema as _MappingSchema
+import tests.helpers as th
+import replay_cache as rc
+
+fine_stack = []
+restore_fine = rc._install_fine_spies(fine_stack)
+rec_stack, restore_rec = rc._install_stage_recorders()
+
+def _all_sub_key_to_name(root_cls):
+    out = {}
+    q = [c for c in root_cls.__mro__ if c.__module__.startswith("sqlglot.")]
+    seen = set(q)
+    while q:
+        cur = q.pop()
+        out[cur.__name__] = cur.__name__
+        qn = cur.__qualname__
+        if "." in qn and "<locals>" not in qn:
+            out[qn] = cur.__name__
+        for sc in cur.__subclasses__():
+            if sc not in seen and sc.__module__.startswith("sqlglot."):
+                seen.add(sc)
+                q.append(sc)
+    return out
+
+_gen_map = _all_sub_key_to_name(_BaseGen)
+_par_map = _all_sub_key_to_name(_BasePar)
+_dial_map = _all_sub_key_to_name(_BaseDialect)
+_gen_names = set(_gen_map.values())
+_par_names = set(_par_map.values())
+_dial_names = set(_dial_map.values())
+_tok_names = set(_all_sub_key_to_name(_BaseTok).keys()) | {"Tokenizer", "_TokenizerBase", "JSONPathTokenizer"}
+
+_SKIP_MNAMES = frozenset({
+    "test_max_nodes",
+    "test_generator_memory",
+    "test_recursion",
+    "test_named_selects_long_by_name_chain",
+    "test_lazy_load",
+})
+_UNSAFE_SUBSTRS = (
+    "patch", "mock", "Dialects", "_classes", "subprocess", "importlib",
+    "is_compiled", "inspect", "sqlglot.schema", "assertLogs", "assertWarns",
+    "assertNoLogs", "logger", ".TRANSFORMS", ".FUNCTIONS", "open(", "Path(",
+    "load_sql_fixture", "tempfile", "environ", "warnings",
+    "Dialect.classes", ".KEYWORDS", "Token(", "TokenizerCore",
+)
+
+rt_unsafe = [False]
+saved_tc = []
+for cname in ("assertLogs", "assertNoLogs", "assertWarns", "assertWarnsRegex"):
+    orig_cm = getattr(unittest.TestCase, cname, None)
+    if orig_cm is not None:
+        saved_tc.append((cname, orig_cm))
+        def _make_u(o):
+            def _w(self, *a, **kw):
+                rt_unsafe[0] = True
+                return o(self, *a, **kw)
+            return _w
+        setattr(unittest.TestCase, cname, _make_u(orig_cm))
+
+_ope = _umock._patch.__enter__
+def _wpe(self):
+    rt_unsafe[0] = True
+    return _ope(self)
+_umock._patch.__enter__ = _wpe
+
+_orig_lsf = th.load_sql_fixtures
+_orig_lsfp = th.load_sql_fixture_pairs
+def _w_lsf(*a, **kw):
+    rt_unsafe[0] = True
+    return _orig_lsf(*a, **kw)
+def _w_lsfp(*a, **kw):
+    rt_unsafe[0] = True
+    return _orig_lsfp(*a, **kw)
+th.load_sql_fixtures = _w_lsf
+th.load_sql_fixture_pairs = _w_lsfp
+
+cm_deps_list = []
+cm_deps_to_id = {}
+cm_methods = {}
+cm_opt_files = {}
+cm_fine = {}
+cm_next_mid = 0
+
+_cur_opt_files = [None]
+_opt_marker = "/sqlglot/optimizer/"
+def _cm_prof(frame, event, arg):
+    if event == "call":
+        fn = frame.f_code.co_filename
+        idx_m = fn.find(_opt_marker)
+        if idx_m >= 0:
+            s = _cur_opt_files[0]
+            if s is not None:
+                s.add(fn[idx_m + 1 :])
+
+def _is_known_par(p):
+    if p in _par_names or p == "Tokenizer":
+        return True
+    if p.startswith("TOK:") and p[4:] in _dial_names:
+        return True
+    return False
+
+try:
+    sys.setprofile(_cm_prof)
+    for test_file in rc.CORE_METHODS_FILES:
+        src_p = sg_root / test_file
+        if not src_p.is_file():
+            continue
+        src_txt = src_p.read_text(encoding="utf-8")
+        tree = _ast.parse(src_txt)
+        safe_mkeys = set()
+        for node in tree.body:
+            if isinstance(node, _ast.ClassDef) and node.name.startswith("Test"):
+                for item in node.body:
+                    if isinstance(item, _ast.FunctionDef) and item.name.startswith("test_"):
+                        if item.name in _SKIP_MNAMES:
+                            continue
+                        if item.decorator_list:
+                            continue
+                        if any(isinstance(n, _ast.ClassDef) and n.bases for n in _ast.walk(item)):
+                            continue
+                        seg = _ast.get_source_segment(src_txt, item) or ""
+                        if any(k in seg for k in _UNSAFE_SUBSTRS):
+                            continue
+                        safe_mkeys.add(f"{node.name}::{item.name}")
+        if not safe_mkeys:
+            continue
+        mod_name = test_file.removesuffix(".py").replace("/", ".")
+        mod = importlib.import_module(mod_name)
+        if hasattr(mod, "load_sql_fixtures"):
+            mod.load_sql_fixtures = _w_lsf
+        if hasattr(mod, "load_sql_fixture_pairs"):
+            mod.load_sql_fixture_pairs = _w_lsfp
+        suite = unittest.defaultTestLoader.loadTestsFromModule(mod)
+        for grp in suite:
+            tcs = list(grp)
+            if not tcs:
+                continue
+            run_tcs = [
+                tc for tc in tcs
+                if f"{tc.__class__.__name__}::{getattr(tc, '_testMethodName', '')}" in safe_mkeys
+            ]
+            if not run_tcs:
+                continue
+            cls = run_tcs[0].__class__
+            sc_d, sc_p, sc_g, sc_f, sc_of = set(), set(), set(), set(), set()
+            rt_unsafe[0] = False
+            _cur_opt_files[0] = sc_of
+            rec_stack.append((sc_d, sc_p, sc_g)); fine_stack.append(sc_f)
+            setup_ok = True
+            try:
+                cls.setUpClass()
+            except Exception:
+                setup_ok = False
+            finally:
+                _cur_opt_files[0] = None
+                rec_stack.pop(); fine_stack.pop()
+            if not setup_ok or rt_unsafe[0]:
+                continue
+            try:
+                for tc in run_tcs:
+                    mname = getattr(tc, "_testMethodName", "")
+                    mkey = f"{tc.__class__.__name__}::{mname}"
+                    tid_str = f"{test_file}::{mkey}"
+                    m_d, m_p, m_g, m_f, m_of = set(sc_d), set(sc_p), set(sc_g), set(sc_f), set(sc_of)
+                    rt_unsafe[0] = False
+                    sqlglot.schema = _MappingSchema()
+                    schema_before = sqlglot.schema
+                    _cur_opt_files[0] = m_of
+                    rec_stack.append((m_d, m_p, m_g)); fine_stack.append(m_f)
+                    res = unittest.TestResult()
+                    try:
+                        tc.run(res)
+                    finally:
+                        _cur_opt_files[0] = None
+                        rec_stack.pop(); fine_stack.pop()
+                    if sqlglot.schema is not schema_before or not getattr(sqlglot.schema, "empty", True):
+                        rt_unsafe[0] = True
+                        sqlglot.schema = _MappingSchema()
+                    if rt_unsafe[0] or not res.wasSuccessful() or res.skipped:
+                        continue
+                    if not (m_d or m_p or m_g or m_f or m_of):
+                        continue
+                    typing_touched = False
+                    unknown_cls = False
+                    for tok in m_f:
+                        t0 = tok[0]
+                        if t0 in ("A", "D", "T", "M"):
+                            rc_n = tok[1]
+                            if rc_n in _gen_map:
+                                m_g.add(_gen_map[rc_n])
+                            elif rc_n in _par_map:
+                                m_p.add(_par_map[rc_n])
+                            elif rc_n in _dial_map:
+                                m_d.add(_dial_map[rc_n])
+                            elif ".Tokenizer" in rc_n and rc_n.split(".")[0] in _dial_names:
+                                m_p.add("Tokenizer")
+                                m_p.add(f"TOK:{rc_n.split('.')[0]}")
+                            elif rc_n == "_TrinoTokenizer":
+                                m_p.update(("Tokenizer", "TOK:Trino", "TOK:Athena"))
+                            elif rc_n in _tok_names:
+                                m_p.add("Tokenizer")
+                            else:
+                                unknown_cls = True
+                                break
+                        elif t0 == "F":
+                            mn_f = tok[1]
+                            if mn_f.startswith("sqlglot.optimizer."):
+                                m_of.add(mn_f.replace(".", "/") + ".py")
+                            elif mn_f.startswith("sqlglot.typing."):
+                                typing_touched = True
+                    if unknown_cls:
+                        continue
+                    if not (m_d <= _dial_names) or not (m_g <= _gen_names) or not all(_is_known_par(p) for p in m_p):
+                        continue
+                    dep_key = (tuple(sorted(m_d)), tuple(sorted(m_p)), tuple(sorted(m_g)))
+                    dep_idx = cm_deps_to_id.get(dep_key)
+                    if dep_idx is None:
+                        dep_idx = len(cm_deps_list)
+                        cm_deps_list.append(dep_key)
+                        cm_deps_to_id[dep_key] = dep_idx
+                    mid = cm_next_mid
+                    cm_next_mid += 1
+                    uses_opt = 1 if (m_of or typing_touched) else 0
+                    cm_methods[tid_str] = (dep_idx, mid, uses_opt)
+                    cm_opt_files[tid_str] = tuple(sorted(m_of))
+                    for tok in m_f:
+                        cm_fine.setdefault(tok, set()).add(mid)
+            finally:
+                try:
+                    cls.tearDownClass()
+                except Exception:
+                    pass
+finally:
+    sys.setprofile(None)
+    _umock._patch.__enter__ = _ope
+    th.load_sql_fixtures = _orig_lsf
+    th.load_sql_fixture_pairs = _orig_lsfp
+    for cname, orig_cm in saved_tc:
+        setattr(unittest.TestCase, cname, orig_cm)
+    restore_rec()
+    restore_fine()
+
+tot_bytes = 0
+if cm_methods:
+    cm_ib = marshal.dumps((cm_deps_list, cm_methods, cm_opt_files))
+    (out_dir / "core_methods.idx").write_bytes(cm_ib)
+    cm_fb = rc._write_fine_tables((cm_fine,), out_dir / "core_methods.fdat", out_dir / "core_methods.ftoc")
+    tot_bytes = len(cm_ib) + cm_fb
+print(f"{len(cm_methods)} {tot_bytes}")
+"""
+    import subprocess as _subprocess
+    res = _subprocess.run([sys.executable, "-c", code, str(sg_root), str(out_dir)], capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"build_core_methods_shard failed ({res.returncode}):\n{res.stderr}\n{res.stdout}")
+    parts = res.stdout.strip().splitlines()[-1].split()
+    return int(parts[0]), int(parts[1])
