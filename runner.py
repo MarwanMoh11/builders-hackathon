@@ -3381,8 +3381,6 @@ def _execute_commit_verification(
 
     confirmed_fail: set[int] = set(commit_plan.force_report)
     remaining: set[int] = set(commit_plan.candidates) - confirmed_fail
-    _probe_skipped: set[int] = {t for t in remaining if dur_by_num[t] >= 2200}
-    remaining -= _probe_skipped
 
     # Cache loaded classes and import failures
     class_cache: dict[tuple[str, str], type | None] = {}
@@ -4244,7 +4242,7 @@ def _execute_commit_verification(
             f"cpu_total={time.process_time():.3f}",
             file=sys.stderr,
         )
-    return sorted(confirmed_fail | _probe_skipped)
+    return sorted(confirmed_fail)
 
 
 # ---------------------------------------------------------------------------
