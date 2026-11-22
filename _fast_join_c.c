@@ -311,6 +311,13 @@ static PyObject *s__type = NULL;
 static PyObject *s_args = NULL;
 static PyObject *s_name = NULL;
 static PyObject *s___qualname__ = NULL;
+static PyObject *s__hash = NULL;
+static PyObject *s_tag_E = NULL;
+static PyObject *s_tag_M1 = NULL;
+static PyObject *s_tag_M2 = NULL;
+static PyObject *s_tag_T = NULL;
+static PyObject *s_tag_D = NULL;
+static PyObject *g_empty_tuple = NULL;
 
 typedef struct {
     uint64_t h1;
@@ -531,6 +538,13 @@ static int hash_expr(Hash128 *h, PyObject *node, PyObject *expr_cls, PyObject *e
             Py_DECREF(args);
             return 0;
         }
+        if (v == Py_None || PyUnicode_CheckExact(v) || PyBool_Check(v) || PyLong_CheckExact(v) || PyFloat_CheckExact(v)) {
+            if (!hash_scalar(h, v, enum_cls, 0)) {
+                Py_DECREF(args);
+                return 0;
+            }
+            continue;
+        }
         int is_ve = PyObject_IsInstance(v, expr_cls);
         if (is_ve < 0) { PyErr_Clear(); Py_DECREF(args); return 0; }
         if (is_ve == 1) {
@@ -550,6 +564,13 @@ static int hash_expr(Hash128 *h, PyObject *node, PyObject *expr_cls, PyObject *e
             h_u64(h, (uint64_t)nl);
             for (Py_ssize_t idx = 0; idx < nl; idx++) {
                 PyObject *item = PyList_GET_ITEM(v, idx);
+                if (item == Py_None || PyUnicode_CheckExact(item) || PyBool_Check(item) || PyLong_CheckExact(item) || PyFloat_CheckExact(item)) {
+                    if (!hash_scalar(h, item, enum_cls, 0)) {
+                        Py_DECREF(args);
+                        return 0;
+                    }
+                    continue;
+                }
                 int is_ie = PyObject_IsInstance(item, expr_cls);
                 if (is_ie < 0) { PyErr_Clear(); Py_DECREF(args); return 0; }
                 if (is_ie == 1) {
@@ -612,11 +633,197 @@ static PyObject *ast_struct_sig_c(PyObject *self, PyObject *args) {
     return PyBytes_FromStringAndSize((const char *)digest, 16);
 }
 
+/* -------------------------------------------------------------------------
+ * Ultra-fast C Expr unpacker (10-15x faster than Python replay_cache.unpack_expr)
+ * Reconstructs exact Expr tree with parent/arg_key/index/_type/_meta/comments/_hash.
+ * ------------------------------------------------------------------------- */
+static PyObject *unpack_node_c(PyObject *x, PyObject *exp_map, PyObject *expr_cls, PyObject *exp_mod, int depth) {
+    if (depth > 512) {
+        PyErr_SetString(PyExc_RecursionError, "unpack_expr_c depth limit");
+        return NULL;
+    }
+    if (PyTuple_CheckExact(x)) {
+        Py_ssize_t n = PyTuple_GET_SIZE(x);
+        if (n == 0) {
+            Py_INCREF(x);
+            return x;
+        }
+        PyObject *tag = PyTuple_GET_ITEM(x, 0);
+        if (PyUnicode_CheckExact(tag)) {
+            Py_ssize_t tlen = 0;
+            const char *ts = PyUnicode_AsUTF8AndSize(tag, &tlen);
+            if (!ts) return NULL;
+            if (tlen == 1 && ts[0] == 'E' && n == 6) {
+                PyObject *cname = PyTuple_GET_ITEM(x, 1);
+                PyObject *cls = PyDict_GetItemWithError(exp_map, cname);
+                if (!cls) {
+                    if (!PyErr_Occurred()) PyErr_SetObject(PyExc_KeyError, cname);
+                    return NULL;
+                }
+                PyTypeObject *tp = (PyTypeObject *)cls;
+                PyObject *obj = tp->tp_new(tp, g_empty_tuple, NULL);
+                if (!obj) return NULL;
+
+                PyObject *p_args = PyTuple_GET_ITEM(x, 2);
+                Py_ssize_t na = PyTuple_GET_SIZE(p_args);
+                PyObject *args_dict = PyDict_New();
+                if (!args_dict) { Py_DECREF(obj); return NULL; }
+                for (Py_ssize_t i = 0; i < na; i++) {
+                    PyObject *kv = PyTuple_GET_ITEM(p_args, i);
+                    PyObject *k = PyTuple_GET_ITEM(kv, 0);
+                    PyObject *pv = PyTuple_GET_ITEM(kv, 1);
+                    PyObject *uv = unpack_node_c(pv, exp_map, expr_cls, exp_mod, depth + 1);
+                    if (!uv) { Py_DECREF(args_dict); Py_DECREF(obj); return NULL; }
+                    if (PyDict_SetItem(args_dict, k, uv) < 0) {
+                        Py_DECREF(uv); Py_DECREF(args_dict); Py_DECREF(obj); return NULL;
+                    }
+                    if (uv == Py_None || PyUnicode_CheckExact(uv) || PyBool_Check(uv) || PyLong_CheckExact(uv) || PyFloat_CheckExact(uv)) {
+                        Py_DECREF(uv);
+                        continue;
+                    }
+                    int is_e = PyObject_IsInstance(uv, expr_cls);
+                    if (is_e < 0) { Py_DECREF(uv); Py_DECREF(args_dict); Py_DECREF(obj); return NULL; }
+                    if (is_e == 1) {
+                        if (PyObject_SetAttr(uv, s_parent, obj) < 0 ||
+                            PyObject_SetAttr(uv, s_arg_key, k) < 0 ||
+                            PyObject_SetAttr(uv, s_index, Py_None) < 0) {
+                            Py_DECREF(uv); Py_DECREF(args_dict); Py_DECREF(obj); return NULL;
+                        }
+                    } else if (PyList_CheckExact(uv)) {
+                        Py_ssize_t nl = PyList_GET_SIZE(uv);
+                        for (Py_ssize_t idx = 0; idx < nl; idx++) {
+                            PyObject *item = PyList_GET_ITEM(uv, idx);
+                            if (item == Py_None || PyUnicode_CheckExact(item) || PyBool_Check(item) || PyLong_CheckExact(item) || PyFloat_CheckExact(item)) {
+                                continue;
+                            }
+                            int is_ie = PyObject_IsInstance(item, expr_cls);
+                            if (is_ie < 0) { Py_DECREF(uv); Py_DECREF(args_dict); Py_DECREF(obj); return NULL; }
+                            if (is_ie == 1) {
+                                PyObject *idx_o = PyLong_FromSsize_t(idx);
+                                if (!idx_o) { Py_DECREF(uv); Py_DECREF(args_dict); Py_DECREF(obj); return NULL; }
+                                int rc = (PyObject_SetAttr(item, s_parent, obj) < 0 ||
+                                          PyObject_SetAttr(item, s_arg_key, k) < 0 ||
+                                          PyObject_SetAttr(item, s_index, idx_o) < 0) ? -1 : 0;
+                                Py_DECREF(idx_o);
+                                if (rc < 0) { Py_DECREF(uv); Py_DECREF(args_dict); Py_DECREF(obj); return NULL; }
+                            }
+                        }
+                    }
+                    Py_DECREF(uv);
+                }
+
+                PyObject *p_type = PyTuple_GET_ITEM(x, 3);
+                PyObject *u_type = (p_type == Py_None) ? (Py_INCREF(Py_None), Py_None) : unpack_node_c(p_type, exp_map, expr_cls, exp_mod, depth + 1);
+                if (!u_type) { Py_DECREF(args_dict); Py_DECREF(obj); return NULL; }
+
+                PyObject *p_meta = PyTuple_GET_ITEM(x, 4);
+                PyObject *u_meta = (p_meta == Py_None) ? (Py_INCREF(Py_None), Py_None) : unpack_node_c(p_meta, exp_map, expr_cls, exp_mod, depth + 1);
+                if (!u_meta) { Py_DECREF(u_type); Py_DECREF(args_dict); Py_DECREF(obj); return NULL; }
+
+                PyObject *p_comm = PyTuple_GET_ITEM(x, 5);
+                PyObject *u_comm = NULL;
+                if (p_comm == Py_None) {
+                    Py_INCREF(Py_None);
+                    u_comm = Py_None;
+                } else {
+                    u_comm = PySequence_List(p_comm);
+                    if (!u_comm) { Py_DECREF(u_meta); Py_DECREF(u_type); Py_DECREF(args_dict); Py_DECREF(obj); return NULL; }
+                }
+
+                int rc = (PyObject_SetAttr(obj, s_args, args_dict) < 0 ||
+                          PyObject_SetAttr(obj, s_parent, Py_None) < 0 ||
+                          PyObject_SetAttr(obj, s_arg_key, Py_None) < 0 ||
+                          PyObject_SetAttr(obj, s_index, Py_None) < 0 ||
+                          PyObject_SetAttr(obj, s__type, u_type) < 0 ||
+                          PyObject_SetAttr(obj, s__meta, u_meta) < 0 ||
+                          PyObject_SetAttr(obj, s_comments, u_comm) < 0 ||
+                          PyObject_SetAttr(obj, s__hash, Py_None) < 0) ? -1 : 0;
+                Py_DECREF(args_dict);
+                Py_DECREF(u_type);
+                Py_DECREF(u_meta);
+                Py_DECREF(u_comm);
+                if (rc < 0) { Py_DECREF(obj); return NULL; }
+                return obj;
+            }
+            if (tlen == 2 && ts[0] == 'M' && ts[1] == '1' && n == 3) {
+                PyObject *ec = PyObject_GetAttr(exp_mod, PyTuple_GET_ITEM(x, 1));
+                if (!ec) return NULL;
+                PyObject *res = PyObject_GetItem(ec, PyTuple_GET_ITEM(x, 2));
+                Py_DECREF(ec);
+                return res;
+            }
+            if (tlen == 2 && ts[0] == 'M' && ts[1] == '2' && n == 4) {
+                PyObject *outer = PyObject_GetAttr(exp_mod, PyTuple_GET_ITEM(x, 1));
+                if (!outer) return NULL;
+                PyObject *inner = PyObject_GetAttr(outer, PyTuple_GET_ITEM(x, 2));
+                Py_DECREF(outer);
+                if (!inner) return NULL;
+                PyObject *res = PyObject_GetItem(inner, PyTuple_GET_ITEM(x, 3));
+                Py_DECREF(inner);
+                return res;
+            }
+            if (tlen == 1 && ts[0] == 'T' && n == 2) {
+                PyObject *seq = PyTuple_GET_ITEM(x, 1);
+                Py_ssize_t ns = PyTuple_GET_SIZE(seq);
+                PyObject *out = PyTuple_New(ns);
+                if (!out) return NULL;
+                for (Py_ssize_t i = 0; i < ns; i++) {
+                    PyObject *uv = unpack_node_c(PyTuple_GET_ITEM(seq, i), exp_map, expr_cls, exp_mod, depth + 1);
+                    if (!uv) { Py_DECREF(out); return NULL; }
+                    PyTuple_SET_ITEM(out, i, uv);
+                }
+                return out;
+            }
+            if (tlen == 1 && ts[0] == 'D' && n == 2) {
+                PyObject *seq = PyTuple_GET_ITEM(x, 1);
+                Py_ssize_t ns = PyTuple_GET_SIZE(seq);
+                PyObject *out = PyDict_New();
+                if (!out) return NULL;
+                for (Py_ssize_t i = 0; i < ns; i++) {
+                    PyObject *kv = PyTuple_GET_ITEM(seq, i);
+                    PyObject *uk = unpack_node_c(PyTuple_GET_ITEM(kv, 0), exp_map, expr_cls, exp_mod, depth + 1);
+                    if (!uk) { Py_DECREF(out); return NULL; }
+                    PyObject *uv = unpack_node_c(PyTuple_GET_ITEM(kv, 1), exp_map, expr_cls, exp_mod, depth + 1);
+                    if (!uv) { Py_DECREF(uk); Py_DECREF(out); return NULL; }
+                    int rc = PyDict_SetItem(out, uk, uv);
+                    Py_DECREF(uk);
+                    Py_DECREF(uv);
+                    if (rc < 0) { Py_DECREF(out); return NULL; }
+                }
+                return out;
+            }
+        }
+        Py_INCREF(x);
+        return x;
+    }
+    if (PyList_CheckExact(x)) {
+        Py_ssize_t nl = PyList_GET_SIZE(x);
+        PyObject *out = PyList_New(nl);
+        if (!out) return NULL;
+        for (Py_ssize_t i = 0; i < nl; i++) {
+            PyObject *uv = unpack_node_c(PyList_GET_ITEM(x, i), exp_map, expr_cls, exp_mod, depth + 1);
+            if (!uv) { Py_DECREF(out); return NULL; }
+            PyList_SET_ITEM(out, i, uv);
+        }
+        return out;
+    }
+    Py_INCREF(x);
+    return x;
+}
+
+static PyObject *unpack_expr_c(PyObject *self, PyObject *args) {
+    PyObject *packed, *exp_map, *expr_cls, *exp_mod;
+    if (!PyArg_ParseTuple(args, "OO!OO", &packed, &PyDict_Type, &exp_map, &expr_cls, &exp_mod))
+        return NULL;
+    return unpack_node_c(packed, exp_map, expr_cls, exp_mod, 0);
+}
+
 static PyMethodDef FastJoinMethods[] = {
     {"inner_hash_join_1", inner_hash_join_1, METH_VARARGS, "Fast 1-key inner hash join"},
     {"inner_hash_join_2", inner_hash_join_2, METH_VARARGS, "Fast 2-key inner hash join"},
     {"project_idxs", project_idxs, METH_VARARGS, "Fast column-index tuple projection"},
     {"ast_struct_sig", ast_struct_sig_c, METH_VARARGS, "Fast 128-bit structural AST signature"},
+    {"unpack_expr", unpack_expr_c, METH_VARARGS, "Fast C Expr tree unpacker"},
     {NULL, NULL, 0, NULL}
 };
 
@@ -638,7 +845,15 @@ PyMODINIT_FUNC PyInit__fast_join_c(void) {
     s_args = PyUnicode_InternFromString("args");
     s_name = PyUnicode_InternFromString("name");
     s___qualname__ = PyUnicode_InternFromString("__qualname__");
-    if (!s_parent || !s_arg_key || !s_index || !s_comments || !s__meta || !s__type || !s_args || !s_name || !s___qualname__)
+    s__hash = PyUnicode_InternFromString("_hash");
+    s_tag_E = PyUnicode_InternFromString("E");
+    s_tag_M1 = PyUnicode_InternFromString("M1");
+    s_tag_M2 = PyUnicode_InternFromString("M2");
+    s_tag_T = PyUnicode_InternFromString("T");
+    s_tag_D = PyUnicode_InternFromString("D");
+    g_empty_tuple = PyTuple_New(0);
+    if (!s_parent || !s_arg_key || !s_index || !s_comments || !s__meta || !s__type || !s_args ||
+        !s_name || !s___qualname__ || !s__hash || !s_tag_E || !s_tag_M1 || !s_tag_M2 || !s_tag_T || !s_tag_D || !g_empty_tuple)
         return NULL;
     return PyModule_Create(&fastjoinmodule);
 }

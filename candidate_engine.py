@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import ast
+import bisect
 import marshal
 import re
-import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,15 +13,32 @@ from typing import Any
 _CLASS_DEF_RE = re.compile(r"^class\s+(\w+)\s*[\(:]", re.MULTILINE)
 _PLAIN_IDENT_KEY_RE = re.compile(r"^['\"][A-Za-z_][A-Za-z0-9_]*['\"]$")
 _COMPILED_C_FILES: frozenset[str] = frozenset()
+_UNSET: Any = object()
+_EXTRA_DIALECT_META_ATTRS: frozenset[str] = frozenset({
+    "BIT_STRINGS", "BYTE_STRINGS", "COMMENTS", "HEREDOC_STRING", "HEREDOC_STRINGS",
+    "HEX_STRINGS", "HINT_START", "IDENTIFIERS", "NATIONAL_RAW_STRING",
+    "NATIONAL_RAW_STRINGS", "NATIONAL_STRING", "QUOTES", "RAW_STRING", "RAW_STRINGS",
+    "SINGLE_TOKENS", "UNICODE_STRINGS", "NUMERIC_LITERALS", "NUMERIC_ESCAPES",
+    "KEYWORDS", "VAR_SINGLE_TOKENS", "COMMANDS", "COMMAND_PREFIX_TOKENS",
+    "STRING_ESCAPES", "BYTE_STRING_ESCAPES", "IDENTIFIER_ESCAPES",
+    "SUPPORTED_JSON_PATH_PARTS", "DATE_PART_MAPPING", "TIME_MAPPING",
+    "FORMAT_MAPPING", "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING",
+    "CREATABLE_KIND_MAPPING", "UNESCAPED_SEQUENCES", "ESCAPED_SEQUENCES",
+    "VALID_INTERVAL_UNITS", "TIME_TRIE", "FORMAT_TRIE", "INVERSE_TIME_TRIE",
+    "INVERSE_FORMAT_TRIE",
+})
 
 from patch_analyzer import (
+    BaseAstIndex,
     ChangeUnit,
     FilePatch,
     PyFileAnalysis,
+    _diff_has_identity_or_eq_change,
     analyze_python_change,
     apply_file_patch,
     diff_sql_fixture_lines,
     diff_sql_fixture_pairs,
+    load_base_ast_index,
     parse_unified_diff,
 )
 import dep_index as _di
@@ -55,44 +72,57 @@ class CandidateEngine:
         tests_list: list[dict],
         sqlglot_root: Path,
         subtests_dir: Path | None = None,
+        base_ast_index: Any = _UNSET,
     ) -> None:
         self.maps = maps
         self.sqlglot_root = sqlglot_root
         self.tests_list = tests_list
         self.subtests_dir = subtests_dir
 
-        self.id_to_num: dict[str, int] = {t["id"]: t["number"] for t in tests_list}
-        self.num_to_test: dict[int, dict] = {t["number"]: t for t in tests_list}
+        id_to_num: dict[str, int] = {}
+        num_to_test: dict[int, dict] = {}
+        file_to_test_nums: dict[str, list[int]] = {}
+        for t in tests_list:
+            num = t["number"]
+            id_to_num[t["id"]] = num
+            num_to_test[num] = t
+            file_to_test_nums.setdefault(t["file"], []).append(num)
+        self.id_to_num = id_to_num
+        self.num_to_test = num_to_test
+        self.file_to_test_nums = file_to_test_nums
 
         map_test_ids: list[str] = maps["test_ids"]
-        self.map_tid_to_num: dict[int, int] = {}
-        self.num_to_map_tid: dict[int, int] = {}
+        map_tid_to_num: dict[int, int] = {}
+        num_to_map_tid: dict[int, int] = {}
+        identity_map = True
         for mtid, tid_str in enumerate(map_test_ids):
-            num = self.id_to_num.get(tid_str)
+            num = id_to_num.get(tid_str)
             if num is not None:
-                self.map_tid_to_num[mtid] = num
-                self.num_to_map_tid[num] = mtid
-        self._identity_map: bool = (
-            len(self.map_tid_to_num) == len(map_test_ids)
-            and all(k == v for k, v in self.map_tid_to_num.items())
-        )
-
-        self.file_to_test_nums: dict[str, list[int]] = {}
-        for t in tests_list:
-            self.file_to_test_nums.setdefault(t["file"], []).append(t["number"])
+                map_tid_to_num[mtid] = num
+                num_to_map_tid[num] = mtid
+                if num != mtid:
+                    identity_map = False
+            else:
+                identity_map = False
+        self.map_tid_to_num = map_tid_to_num
+        self.num_to_map_tid = num_to_map_tid
+        self._identity_map: bool = identity_map
 
         # Lazy subtest group cache (v2 maps store maps/subtests/<mtid>.zlib separately!)
         self._subtest_tags_by_num: dict[int, list[str]] = {}
         self._loaded_subtests: dict[int, list[dict[str, Any]]] = {}
         if "subtest_index" in maps:
-            for mtid, tags in maps["subtest_index"].items():
-                rnum = self.map_tid_to_num.get(mtid)
-                if rnum is not None:
-                    self._subtest_tags_by_num[rnum] = tags
+            if identity_map:
+                self._subtest_tags_by_num = dict(maps["subtest_index"])
+            else:
+                for mtid, tags in maps["subtest_index"].items():
+                    rnum = map_tid_to_num.get(mtid)
+                    if rnum is not None:
+                        self._subtest_tags_by_num[rnum] = tags
         elif "subtests" in maps:
             # Backward compat with v1 monolithic map
             for sg in maps["subtests"].values():
-                rnum = self.map_tid_to_num.get(sg["tid"])
+                rnum = map_tid_to_num.get(sg["tid"])
                 if rnum is not None:
                     self._loaded_subtests.setdefault(rnum, []).append(sg)
                     self._subtest_tags_by_num.setdefault(rnum, []).append(sg["tag"])
@@ -114,82 +144,64 @@ class CandidateEngine:
         self._line_cov_index: dict[str, int] = maps.get("line_cov_index", {})
         self._line_cov_cache: dict[str, dict[int, list[int]]] = {}
 
-        # Optional build-time exact (receiver_cls, attr/dispatch/dict_with_misses) dependency index (Wave 2A)
-        self._dep_index: dict[str, Any] | None = _di.load_dep_index()
-        if self._dep_index is not None:
-            self._dep_tracked_attrs: frozenset[str] = frozenset(self._dep_index.get("tracked_attrs", ()))
-            self._dep_tracked_dicts: frozenset[str] = frozenset(self._dep_index.get("tracked_dicts", ()))
-            self._dep_always_keep_rnums: set[int] = self._to_rnums(self._dep_index.get("always_keep_mtids", ()))
-        else:
-            self._dep_tracked_attrs = frozenset()
-            self._dep_tracked_dicts = frozenset()
-            self._dep_always_keep_rnums = set()
+        # Optional build-time exact (receiver_cls, attr/dispatch/dict_with_misses) dependency index (Wave 2A, lazy!)
+        self._dep_index_loaded: bool = False
+        self._dep_index_val: dict[str, Any] | None = None
+        self._dep_tracked_attrs: frozenset[str] = frozenset()
+        self._dep_tracked_dicts: frozenset[str] = frozenset()
+        self._dep_always_keep_rnums: set[int] = set()
 
-        self.typing_test_num = self.id_to_num.get(
+        self.typing_test_num = id_to_num.get(
             "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
         )
-        self.lazy_load_test_num = self.id_to_num.get(
+        self.lazy_load_test_num = id_to_num.get(
             "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
         )
-        self.dialect_meta_attrs: set[str] = set(maps["dialect_meta_attrs"]) | {
-            "BIT_STRINGS", "BYTE_STRINGS", "COMMENTS", "HEREDOC_STRING", "HEREDOC_STRINGS",
-            "HEX_STRINGS", "HINT_START", "IDENTIFIERS", "NATIONAL_RAW_STRING",
-            "NATIONAL_RAW_STRINGS", "NATIONAL_STRING", "QUOTES", "RAW_STRING", "RAW_STRINGS",
-            "SINGLE_TOKENS", "UNICODE_STRINGS", "NUMERIC_LITERALS", "NUMERIC_ESCAPES",
-            "KEYWORDS", "VAR_SINGLE_TOKENS", "COMMANDS", "COMMAND_PREFIX_TOKENS",
-            "STRING_ESCAPES", "BYTE_STRING_ESCAPES", "IDENTIFIER_ESCAPES",
-            "SUPPORTED_JSON_PATH_PARTS", "DATE_PART_MAPPING", "TIME_MAPPING",
-            "FORMAT_MAPPING", "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING",
-            "CREATABLE_KIND_MAPPING", "UNESCAPED_SEQUENCES", "ESCAPED_SEQUENCES",
-            "VALID_INTERVAL_UNITS", "TIME_TRIE", "FORMAT_TRIE", "INVERSE_TIME_TRIE",
-            "INVERSE_FORMAT_TRIE",
-        }
+        self.dialect_meta_attrs: set[str] = set(maps["dialect_meta_attrs"]) | _EXTRA_DIALECT_META_ATTRS
         self.expr_meta_attrs: set[str] = set(maps["expr_meta_attrs"])
-        self.all_expr_classes: set[str] = set(maps["class_subclasses"].get("Expr", []))
-        self._expr_key_to_cls: dict[str, list[str]] = {"expression": ["Expr"]}
-        for _ec in self.all_expr_classes:
-            self._expr_key_to_cls.setdefault(_ec.lower(), []).append(_ec)
+        cls_subs = maps["class_subclasses"]
+        self.all_expr_classes: set[str] = set(cls_subs.get("Expr", []))
+        self._expr_key_to_cls_cache: dict[str, list[str]] | None = None
         self.all_dialect_family: set[str] = (
-            set(maps["class_subclasses"].get("Dialect", []))
-            | set(maps["class_subclasses"].get("Tokenizer", []))
-            | set(maps["class_subclasses"].get("Parser", []))
-            | set(maps["class_subclasses"].get("Generator", []))
+            set(cls_subs.get("Dialect", []))
+            | set(cls_subs.get("Tokenizer", []))
+            | set(cls_subs.get("Parser", []))
+            | set(cls_subs.get("Generator", []))
             | {"JSONPathTokenizer"}
         )
         self.pure_enums: set[str] = set(maps.get("pure_enums", []))
         self.strict_enum_attrs: set[tuple[str, str]] = {
             tuple(x) for x in maps.get("strict_enum_attrs", [])
         }
-        self.cmp_agree: frozenset[str] = frozenset()
-        cmp_path = self.maps_dir / "cmp_agree.zlib" if self.maps_dir is not None else None
-        if cmp_path is not None and cmp_path.exists():
-            self.cmp_agree = frozenset(marshal.loads(zlib.decompress(cmp_path.read_bytes())))
+        self._cmp_agree_loaded: bool = False
+        self._cmp_agree_val: frozenset[str] = frozenset()
         self._file_cache: dict[str, str] = {}
+        self._file_lines_cache: dict[str, list[str]] = {}
         self._old_ast_cache: dict[str, Any] = {}
+        self._expand_cache: dict[tuple[str, str], list[str]] = {}
+        self._subclasses_cache: dict[str, list[str]] = {}
+        self._rev_closure_cache: dict[str, set[str]] = {}
+        self._guarded_reader_cache: dict[tuple[str, str, int], frozenset[str] | None] = {}
+        self._base_ast_index: BaseAstIndex | None = (
+            load_base_ast_index() if base_ast_index is _UNSET else base_ast_index
+        )
+
         static_meta = maps.get("static_ast_meta")
+        self._static_meta: dict[str, Any] | None = static_meta
         if static_meta is not None:
-            self._rev_import_graph: dict[str, set[str]] | None = {
-                k: set(v) for k, v in static_meta["rev_import_graph"].items()
-            }
             self._file_classes_cache: dict[str, list[str]] = dict(static_meta["file_classes"])
-            cdg = static_meta["class_dep_graph"]
-            self._class_dep_graph: dict[str, Any] | None = {
-                "class_children": {k: set(v) for k, v in cdg["class_children"].items()},
-                "attr_copiers": {tuple(k): {tuple(x) for x in v} for k, v in cdg["attr_copiers"].items()},
-                "class_aliases": {k: set(v) for k, v in cdg["class_aliases"].items()},
-                "class_copiers": {k: set(v) for k, v in cdg["class_copiers"].items()},
-                "attr_mutators": {k: set(v) for k, v in cdg["attr_mutators"].items()},
-                "all_class_body_refs": set(cdg["all_class_body_refs"]),
-            }
-            self._non_runtime_cache: dict[str, tuple[set[int], set[str]]] = {
-                k: (set(v[0]), set(v[1])) for k, v in static_meta["non_runtime_info"].items()
-            }
-            self._import_time_called: dict[str, set[str]] | None = {
-                k: set(v) for k, v in static_meta["import_time_called"].items()
-            }
-            self._import_time_ref_map: dict[str, set[str]] | None = {
-                k: set(v) for k, v in static_meta["import_time_refs"].items()
-            }
+            if static_meta.get("_preconverted"):
+                self._rev_import_graph: dict[str, Any] | None = static_meta["rev_import_graph"]
+                self._class_dep_graph: dict[str, Any] | None = static_meta["class_dep_graph"]
+                self._non_runtime_cache: dict[str, tuple[Any, Any]] = dict(static_meta["non_runtime_info"])
+                self._import_time_called: dict[str, Any] | None = static_meta["import_time_called"]
+                self._import_time_ref_map: dict[str, Any] | None = static_meta["import_time_refs"]
+            else:
+                self._rev_import_graph = None
+                self._class_dep_graph = None
+                self._non_runtime_cache = {}
+                self._import_time_called = None
+                self._import_time_ref_map = None
         else:
             self._rev_import_graph = None
             self._file_classes_cache = {}
@@ -199,6 +211,45 @@ class CandidateEngine:
             self._import_time_ref_map = None
         # Ignore pure docstring edits ONLY when tests/test_docs.py is absent from runtime tests.json
         self.ignore_docstrings: bool = "tests/test_docs.py" not in self.file_to_test_nums
+
+    @property
+    def _dep_index(self) -> dict[str, Any] | None:
+        if not self._dep_index_loaded:
+            self._dep_index_loaded = True
+            di = _di.load_dep_index()
+            self._dep_index_val = di
+            if di is not None:
+                self._dep_tracked_attrs = frozenset(di.get("tracked_attrs", ()))
+                self._dep_tracked_dicts = frozenset(di.get("tracked_dicts", ()))
+                self._dep_always_keep_rnums = self._to_rnums(di.get("always_keep_mtids", ()))
+        return self._dep_index_val
+
+    @property
+    def _expr_key_to_cls(self) -> dict[str, list[str]]:
+        if self._expr_key_to_cls_cache is None:
+            m: dict[str, list[str]] = {"expression": ["Expr"]}
+            for ec in self.all_expr_classes:
+                m.setdefault(ec.lower(), []).append(ec)
+            self._expr_key_to_cls_cache = m
+        return self._expr_key_to_cls_cache
+
+    def _get_cmp_agree(self) -> frozenset[str]:
+        if not self._cmp_agree_loaded:
+            self._cmp_agree_loaded = True
+            raw_cmp = Path("/app/maps_raw/cmp_agree.marshal")
+            if raw_cmp.is_file():
+                obj = marshal.loads(raw_cmp.read_bytes())
+                self._cmp_agree_val = obj if isinstance(obj, frozenset) else frozenset(obj)
+            else:
+                cmp_path = self.maps_dir / "cmp_agree.zlib" if self.maps_dir is not None else None
+                if cmp_path is not None and cmp_path.exists():
+                    import zlib
+                    self._cmp_agree_val = frozenset(marshal.loads(zlib.decompress(cmp_path.read_bytes())))
+        return self._cmp_agree_val
+
+    @property
+    def cmp_agree(self) -> frozenset[str]:
+        return self._get_cmp_agree()
 
     def _parse_base_ast(self, rel: str) -> ast.Module | None:
         cached = self._old_ast_cache.get(rel)
@@ -249,6 +300,17 @@ class CandidateEngine:
         Hive->Athena, Trino->_TrinoTokenizer->Athena, TypeAnnotator->BigQuery, JSONPathTokenizer),
         mutators (.pop/del), and class-body bare-name reads directly from sqlglot@eb11aec ASTs."""
         if self._class_dep_graph is not None:
+            return self._class_dep_graph
+        if self._static_meta is not None:
+            cdg = self._static_meta["class_dep_graph"]
+            self._class_dep_graph = {
+                "class_children": {k: frozenset(v) for k, v in cdg["class_children"].items()},
+                "attr_copiers": {tuple(k): frozenset(tuple(x) for x in v) for k, v in cdg["attr_copiers"].items()},
+                "class_aliases": {k: frozenset(v) for k, v in cdg["class_aliases"].items()},
+                "class_copiers": {k: frozenset(v) for k, v in cdg["class_copiers"].items()},
+                "attr_mutators": {k: frozenset(v) for k, v in cdg["attr_mutators"].items()},
+                "all_class_body_refs": frozenset(cdg["all_class_body_refs"]),
+            }
             return self._class_dep_graph
 
         class_children: dict[str, set[str]] = {}
@@ -384,11 +446,17 @@ class CandidateEngine:
         }
         return self._class_dep_graph
 
-    def _get_non_runtime_info(self, rel: str) -> tuple[set[int], set[str]]:
+    def _get_non_runtime_info(self, rel: str) -> tuple[Any, Any]:
         """Lazily return (non_runtime_lines, class_body_refs) for a single sqlglot/ file."""
         cached = self._non_runtime_cache.get(rel)
         if cached is not None:
             return cached
+        if self._static_meta is not None:
+            raw = self._static_meta["non_runtime_info"].get(rel)
+            if raw is not None:
+                res_s = (frozenset(raw[0]), frozenset(raw[1]))
+                self._non_runtime_cache[rel] = res_s
+                return res_s
         tree = self._parse_base_ast(rel)
         if tree is None:
             res: tuple[set[int], set[str]] = (set(), set())
@@ -458,8 +526,18 @@ class CandidateEngine:
         if self._import_time_called is not None and self._import_time_ref_map is not None:
             cf = self._import_time_called.get(meth_name)
             rf = self._import_time_ref_map.get(meth_name)
-            cf_hit = ((cf & rev_cl) - {"sqlglot/__main__.py"}) if cf else set()
-            rf_hit = ((rf & rev_cl) - {"sqlglot/__main__.py"}) if rf else set()
+            cf_hit = ((rev_cl & cf) - {"sqlglot/__main__.py"}) if cf else set()
+            rf_hit = ((rev_cl & rf) - {"sqlglot/__main__.py"}) if rf else set()
+            if cf_hit:
+                return True, True, cf_hit
+            if rf_hit:
+                return False, True, rf_hit
+            return False, False, set()
+        if self._static_meta is not None:
+            raw_cf = self._static_meta["import_time_called"].get(meth_name)
+            raw_rf = self._static_meta["import_time_refs"].get(meth_name)
+            cf_hit = (rev_cl.intersection(raw_cf) - {"sqlglot/__main__.py"}) if raw_cf else set()
+            rf_hit = (rev_cl.intersection(raw_rf) - {"sqlglot/__main__.py"}) if raw_rf else set()
             if cf_hit:
                 return True, True, cf_hit
             if rf_hit:
@@ -631,61 +709,121 @@ class CandidateEngine:
                 return None
         return sites
 
+    def _guarded_isinstance_for_reader(self, attr: str, rfile: str, rline: int) -> frozenset[str] | None:
+        ck = (attr, rfile, rline)
+        if ck in self._guarded_reader_cache:
+            return self._guarded_reader_cache[ck]
+
+        search_root: ast.AST | None = self._old_ast_cache.get(rfile)
+        if search_root is None and self._base_ast_index is not None:
+            txt = self._read_base_file(rfile)
+            if txt:
+                idx_entry = self._base_ast_index.get_verified(rfile, txt)
+                if idx_entry is not None:
+                    ustarts = idx_entry["unit_starts"]
+                    units_idx = idx_entry["units"]
+                    ui = bisect.bisect_right(ustarts, rline) - 1
+                    if ui >= 0:
+                        u = units_idx[ui]
+                        if u[0] <= rline <= u[1] and u[3] == "func":
+                            lines = txt.split("\n")
+                            u0, u1 = u[0] - 1, u[1]
+                            c_indents = u[6]
+                            d = len(c_indents)
+                            prefix = "".join(f"{ind}class _C{i}:\n" for i, ind in enumerate(c_indents))
+                            try:
+                                stree = ast.parse(prefix + "\n".join(lines[u0:u1]))
+                                body = stree.body
+                                ok = True
+                                for _ in range(d):
+                                    if len(body) != 1 or not isinstance(body[0], ast.ClassDef):
+                                        ok = False
+                                        break
+                                    body = body[0].body
+                                if ok and len(body) == 1:
+                                    fn_n = body[0]
+                                    if u0 - d != 0:
+                                        ast.increment_lineno(fn_n, u0 - d)
+                                    search_root = fn_n
+                            except SyntaxError:
+                                search_root = None
+        if search_root is None:
+            search_root = self._parse_base_ast(rfile)
+        if search_root is None:
+            self._guarded_reader_cache[ck] = None
+            return None
+
+        matched_if: ast.If | None = None
+        for node in ast.walk(search_root):
+            if isinstance(node, ast.If):
+                t_start = getattr(node.test, "lineno", 0)
+                t_end = getattr(node.test, "end_lineno", t_start)
+                if t_start <= rline <= t_end:
+                    matched_if = node
+                    break
+        if matched_if is None or not isinstance(matched_if.test, ast.BoolOp) or not isinstance(matched_if.test.op, ast.And):
+            self._guarded_reader_cache[ck] = None
+            return None
+        has_self_attr = False
+        found_cls: set[str] = set()
+        for part in matched_if.test.values:
+            if (
+                isinstance(part, ast.Attribute)
+                and part.attr == attr
+                and isinstance(part.value, ast.Name)
+                and part.value.id == "self"
+            ):
+                has_self_attr = True
+            elif (
+                isinstance(part, ast.Call)
+                and isinstance(part.func, ast.Name)
+                and part.func.id == "isinstance"
+                and len(part.args) == 2
+            ):
+                arg2 = part.args[1]
+                items = arg2.elts if isinstance(arg2, ast.Tuple) else [arg2]
+                local_cls: set[str] = set()
+                all_exp = bool(items)
+                for it in items:
+                    if (
+                        isinstance(it, ast.Attribute)
+                        and isinstance(it.value, ast.Name)
+                        and it.value.id == "exp"
+                        and it.attr in self.all_expr_classes
+                    ):
+                        local_cls.add(it.attr)
+                    else:
+                        all_exp = False
+                        break
+                if all_exp and local_cls:
+                    found_cls.update(local_cls)
+        res = frozenset(found_cls) if (has_self_attr and found_cls) else None
+        self._guarded_reader_cache[ck] = res
+        return res
+
     def _guarded_isinstance_exprs(self, attr: str, readers: list[tuple[str, int]]) -> list[str] | None:
         """If EVERY reader line `(rfile, rline)` of `attr` is an `if` statement whose test is a
         top-level `and` conjunction containing BOTH `self.<attr>` (non-negated) AND
         `isinstance(..., exp.<Cls> | (exp.<Cls1>, ...))`, return sorted subclasses of all `<Cls>`."""
         if not readers or len(readers) > 4:
             return None
+        _gcache = getattr(self, "_guarded_isinstance_cache", None)
+        if _gcache is None:
+            _gp = Path("/app/guarded_isinstance.marshal")
+            if _gp.is_file():
+                try:
+                    _gcache = marshal.loads(_gp.read_bytes())
+                except Exception:
+                    _gcache = {}
+            else:
+                _gcache = {}
+            self._guarded_isinstance_cache = _gcache
+        if attr in _gcache:
+            return _gcache[attr]
         expr_classes: set[str] = set()
         for rfile, rline in readers:
-            tree = self._parse_base_ast(rfile)
-            if tree is None:
-                return None
-            matched_if: ast.If | None = None
-            for node in ast.walk(tree):
-                if isinstance(node, ast.If):
-                    t_start = getattr(node.test, "lineno", 0)
-                    t_end = getattr(node.test, "end_lineno", t_start)
-                    if t_start <= rline <= t_end:
-                        matched_if = node
-                        break
-            if matched_if is None or not isinstance(matched_if.test, ast.BoolOp) or not isinstance(matched_if.test.op, ast.And):
-                return None
-            has_self_attr = False
-            found_cls: set[str] = set()
-            for part in matched_if.test.values:
-                if (
-                    isinstance(part, ast.Attribute)
-                    and part.attr == attr
-                    and isinstance(part.value, ast.Name)
-                    and part.value.id == "self"
-                ):
-                    has_self_attr = True
-                elif (
-                    isinstance(part, ast.Call)
-                    and isinstance(part.func, ast.Name)
-                    and part.func.id == "isinstance"
-                    and len(part.args) == 2
-                ):
-                    arg2 = part.args[1]
-                    items = arg2.elts if isinstance(arg2, ast.Tuple) else [arg2]
-                    local_cls: set[str] = set()
-                    all_exp = bool(items)
-                    for it in items:
-                        if (
-                            isinstance(it, ast.Attribute)
-                            and isinstance(it.value, ast.Name)
-                            and it.value.id == "exp"
-                            and it.attr in self.all_expr_classes
-                        ):
-                            local_cls.add(it.attr)
-                        else:
-                            all_exp = False
-                            break
-                    if all_exp and local_cls:
-                        found_cls.update(local_cls)
-            if not (has_self_attr and found_cls):
+            found_cls = self._guarded_isinstance_for_reader(attr, rfile, rline)
+            if found_cls is None:
                 return None
             expr_classes.update(found_cls)
         if not expr_classes:
@@ -696,6 +834,9 @@ class CandidateEngine:
         return sorted(subs)
 
     def _rev_import_closure(self, rel: str) -> set[str]:
+        cached = self._rev_closure_cache.get(rel)
+        if cached is not None:
+            return cached
         rev_graph = self._get_rev_import_graph()
         closure: set[str] = {rel}
         stack = [rel]
@@ -705,10 +846,15 @@ class CandidateEngine:
                 if nxt not in closure:
                     closure.add(nxt)
                     stack.append(nxt)
+        self._rev_closure_cache[rel] = closure
         return closure
 
     def _expand_class_and_copiers(self, class_name: str, attr: str = "*") -> list[str]:
         """BFS over class_subclasses + AST class_children + class_aliases + attr_copiers/class_copiers."""
+        ck = (class_name, attr)
+        cached = self._expand_cache.get(ck)
+        if cached is not None:
+            return cached
         dep = self._get_class_dep_graph()
         class_children = dep["class_children"]
         attr_copiers = dep["attr_copiers"]
@@ -758,12 +904,17 @@ class CandidateEngine:
                     if (dst_cls, "*") not in visited_pairs:
                         queue.append((dst_cls, "*"))
 
-        return sorted(visited_classes)
+        res = sorted(visited_classes)
+        self._expand_cache[ck] = res
+        return res
 
-    def _get_rev_import_graph(self) -> dict[str, set[str]]:
+    def _get_rev_import_graph(self) -> dict[str, Any]:
         """Lazily build EXACT top-level static reverse-import graph across sqlglot/**/*.py
         (ignoring TYPE_CHECKING blocks, docstrings, comments, and function-local imports)."""
         if self._rev_import_graph is not None:
+            return self._rev_import_graph
+        if self._static_meta is not None:
+            self._rev_import_graph = {k: frozenset(v) for k, v in self._static_meta["rev_import_graph"].items()}
             return self._rev_import_graph
         mod_to_file: dict[str, str] = {}
         sg_dir = self.sqlglot_root / "sqlglot"
@@ -878,6 +1029,7 @@ class CandidateEngine:
             if self.maps_dir is not None:
                 p = self.maps_dir / "dict_maps.zlib"
                 if p.exists():
+                    import zlib
                     self._dict_keys_by_oa = marshal.loads(zlib.decompress(p.read_bytes()))
                     return self._dict_keys_by_oa
             self._dict_keys_by_oa = {}
@@ -900,6 +1052,7 @@ class CandidateEngine:
         p = self.maps_dir / "line_cov" / f"{idx}.zlib"
         if not p.exists():
             return None
+        import zlib
         lm = marshal.loads(zlib.decompress(p.read_bytes()))
         self._line_cov_cache[rel] = lm
         return lm
@@ -922,6 +1075,7 @@ class CandidateEngine:
         if not p.exists():
             self._loaded_subtests[rnum] = []
             return []
+        import zlib
         groups = marshal.loads(zlib.decompress(p.read_bytes()))
         self._loaded_subtests[rnum] = groups
         return groups
@@ -933,6 +1087,13 @@ class CandidateEngine:
             txt = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
             self._file_cache[rel_path] = txt
         return txt
+
+    def _read_base_lines(self, rel_path: str) -> list[str]:
+        lines = self._file_lines_cache.get(rel_path)
+        if lines is None:
+            lines = self._read_base_file(rel_path).splitlines()
+            self._file_lines_cache[rel_path] = lines
+        return lines
 
     def _to_rnums(self, mtids: list[int] | set[int]) -> set[int]:
         if self._identity_map:
@@ -1003,6 +1164,9 @@ class CandidateEngine:
     def _subclasses_of(self, class_name: str | None) -> list[str]:
         if not class_name:
             return []
+        cached = self._subclasses_cache.get(class_name)
+        if cached is not None:
+            return cached
         subs = set(self.maps["class_subclasses"].get(class_name, []))
         if not subs and "." in class_name:
             leaf = class_name.rsplit(".", 1)[-1]
@@ -1012,7 +1176,9 @@ class CandidateEngine:
                 subs.add(dsub)
         if not subs:
             subs.add(class_name)
-        return sorted(subs)
+        res = sorted(subs)
+        self._subclasses_cache[class_name] = res
+        return res
 
     def _tests_covering_lines(self, rel: str, lines: set[int]) -> set[int]:
         lm = self._get_line_cov(rel)
@@ -1036,15 +1202,7 @@ class CandidateEngine:
             return out
 
         # Transitive static reverse-import closure across sqlglot/
-        rev_graph = self._get_rev_import_graph()
-        closure: set[str] = {rel}
-        stack = [rel]
-        while stack:
-            cur = stack.pop()
-            for nxt in rev_graph.get(cur, ()):
-                if nxt not in closure:
-                    closure.add(nxt)
-                    stack.append(nxt)
+        closure = self._rev_import_closure(rel)
 
         touches_dialect_pkg = False
         for f in closure:
@@ -1310,7 +1468,7 @@ class CandidateEngine:
             return True
         if rfile == "sqlglot/parser.py" and unit.class_name and "JSONPath" in unit.class_name:
             return True
-        lines = self._read_base_file(rfile).splitlines()
+        lines = self._read_base_lines(rfile)
         line_txt = lines[rline - 1].strip() if 0 < rline <= len(lines) else ""
         if f"IsPredicatePrecedence.{attr}" in line_txt:
             return True
@@ -1556,15 +1714,7 @@ class CandidateEngine:
                 # Collect both sqlglot.typing.* modules AND all Dialect/copier classes in reverse-import closure!
                 mod_owner = rel.removesuffix(".py").replace("/", ".")
                 owner_set: set[str] = {mod_owner}
-                rev_graph = self._get_rev_import_graph()
-                closure: set[str] = {rel}
-                stack = [rel]
-                while stack:
-                    cur = stack.pop()
-                    for nxt in rev_graph.get(cur, ()):
-                        if nxt not in closure:
-                            closure.add(nxt)
-                            stack.append(nxt)
+                closure = self._rev_import_closure(rel)
                 for cf in closure:
                     if cf.startswith("sqlglot/typing/"):
                         owner_set.add(cf.removesuffix(".py").replace("/", "."))
@@ -1704,18 +1854,39 @@ class CandidateEngine:
                                 if ck.startswith("E:"):
                                     for sc in self._subclasses_of(ck[2:]):
                                         exact_dm.update(dmap.get(f"E:{sc}", ()))
+                    non_rt_extra: set[int] = set()
+                    readers_d = self.maps["attr_readers"].get(attr, [])
+                    if readers_d:
+                        rev_cl = self._rev_import_closure(rel)
+                        owners_set = set(owners)
+                        for rfile, rline in readers_d:
+                            if (
+                                rfile in rev_cl
+                                and rfile != rel
+                                and rline in self._get_non_runtime_info(rfile)[0]
+                                and not self._is_covered_same_attr_copy(rfile, rline, attr, owners_set, unit)
+                            ):
+                                non_rt_extra.update(self._to_rnums(self.maps["file_cov"].get(rfile, [])))
+                                non_rt_extra.update(self._tests_for_broken_import(rfile))
                     dialect_hits_d = self._dialect_hits_for_owners(owners)
                     hits = (
                         self._to_rnums(exact_dm)
                         | (self._dep_always_keep_rnums & (dialect_hits_d | self._to_rnums(self.maps["file_cov"].get(rel, []))))
                         | self._tests_covering_lines(rel, unit.old_lines)
+                        | non_rt_extra
                     )
                     if unit.class_name and unit.class_name.split(".")[0] not in self.all_dialect_family:
                         hits.update(self._to_rnums(self.maps["file_cov"].get(rel, [])))
                     candidates.update(hits)
-                    spec = ("dict_key", (owners, attr, unit.dict_keys, rel, unit.old_lines))
+                    if unit.dict_added_keys or unit.dict_deleted_keys:
+                        spec: tuple[str, Any] = ("dict_meta", owners)
+                    else:
+                        spec = ("dict_keys", (owners, attr, unit.dict_keys, rel, unit.old_lines))
                     for rnum in hits:
-                        if rnum in has_sub:
+                        if rnum in non_rt_extra:
+                            for tag in has_sub.get(rnum, ()):
+                                self._add_subtest_filter(subtest_filters, rnum, tag, None)
+                        elif rnum in has_sub:
                             deferred_subtests.setdefault(rnum, []).append(spec)
                     return
 
@@ -1998,12 +2169,12 @@ class CandidateEngine:
                     filtered_readers: list[tuple[str, int]] = []
                     for rfile, rline in readers:
                         if is_gen_cls and (rfile == "sqlglot/parser.py" or rfile.startswith("sqlglot/parsers/")):
-                            r_lines = self._read_base_file(rfile).splitlines()
+                            r_lines = self._read_base_lines(rfile)
                             r_txt = r_lines[rline - 1] if 0 < rline <= len(r_lines) else ""
                             if f"self.{attr}" in r_txt and "dialect" not in r_txt.lower() and "generator" not in r_txt.lower():
                                 continue
                         elif is_par_cls and (rfile == "sqlglot/generator.py" or rfile.startswith("sqlglot/generators/")):
-                            r_lines = self._read_base_file(rfile).splitlines()
+                            r_lines = self._read_base_lines(rfile)
                             r_txt = r_lines[rline - 1] if 0 < rline <= len(r_lines) else ""
                             if f"self.{attr}" in r_txt and "dialect" not in r_txt.lower() and "parser" not in r_txt.lower():
                                 continue
@@ -2376,6 +2547,7 @@ class CandidateEngine:
             new_text = apply_file_patch(old_text, fp)
 
             if rel.endswith(".py"):
+                cmp_ag = self._get_cmp_agree() if _diff_has_identity_or_eq_change(fp) else None
                 ana = analyze_python_change(
                     rel,
                     old_text,
@@ -2385,7 +2557,8 @@ class CandidateEngine:
                     pure_enums=self.pure_enums,
                     strict_enum_attrs=self.strict_enum_attrs,
                     ignore_docstrings=self.ignore_docstrings,
-                    cmp_agree=self.cmp_agree,
+                    cmp_agree=cmp_ag,
+                    base_ast_index=self._base_ast_index,
                 )
                 if ana.is_noop:
                     continue
@@ -2423,6 +2596,17 @@ class CandidateEngine:
 
                 if (
                     (rel == "tests/test_parser.py" and any("test_max_nodes" in fn for fn in ana.changed_funcs))
+                    or rel in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py")
+                    or (
+                        rel == "sqlglot/parser.py"
+                        and (
+                            any(
+                                fn in ("Parser.expression", "Parser.__init__", "Parser._reset", "Parser.parse")
+                                for fn in ana.changed_funcs
+                            )
+                            or any(u.kind == "module_other" for u in ana.units)
+                        )
+                    )
                     or any(
                         hl.startswith(("+", "-"))
                         and not hl[1:].lstrip().startswith("#")
@@ -2457,10 +2641,7 @@ class CandidateEngine:
                             "__new__", "__init_subclass__", "__set_name__", "__class_getitem__",
                             "_generate_next_value_", "_build_dispatch", "sql_names",
                         )
-                        or (
-                            (not unit.class_name or unit.is_cached_func or unit.has_nested_func)
-                            and any(self._is_func_called_at_import(rel, meth_name)[:2])
-                        )
+                        or any(self._is_func_called_at_import(rel, meth_name)[:2])
                     ):
                         all_hot_func = False
                         file_has_non_hot = True
@@ -2469,16 +2650,20 @@ class CandidateEngine:
                 # Include test_lazy_load on eager-imported files ONLY when import behavior could change!
                 if (
                     self.lazy_load_test_num is not None
-                    and file_has_non_hot
                     and self.lazy_load_test_num in self._to_rnums(self.maps["dyn_import_to_tests"].get(rel, []))
                     and (
                         ana.syntax_error
                         or fp.is_deleted
                         or fp.is_new
-                        or any(u.kind == "module_other" for u in ana.units)
+                        or any(u.kind != "func_body" for u in ana.units)
+                        or any(
+                            self._is_func_called_at_import(rel, (u.symbol_name or "").rsplit(".", 1)[-1])[0]
+                            for u in ana.units
+                            if u.kind == "func_body"
+                        )
                         or any(
                             hl.startswith(("+", "-"))
-                            and any(tok in hl for tok in ("import ", "from ", "Dialect", "_classes", "_try_load"))
+                            and any(tok in hl for tok in ("import ", "from ", "Dialect", "_classes", "_try_load", "importlib", "__import__"))
                             for h in fp.hunks
                             for hl in h.lines
                         )

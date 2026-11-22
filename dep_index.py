@@ -1,5 +1,5 @@
 """Build-time exact (receiver_cls, attr_name), (receiver_cls, TRANSFORMS, expr_cls),
-and (receiver_cls, dict_attr, key_with_misses) dependency index (Wave 2A / v5).
+(receiver_cls, dict_attr, key_with_misses), method, and module-level function dependency index.
 
 Generated inside Docker at build time from pinned sqlglot@eb11aec (0 bytes in Git).
 Stored uncompressed at /app/dep_index.marshal (~1-2 MB, loads in ~8 ms in parent before os.fork()).
@@ -10,9 +10,12 @@ Soundness invariant (first-divergence proof):
     with non-data descriptors (_AttrSpy) recording exact runtime receiver class names.
   - Wraps tracked dict tables via receiver-bound _BoundSpyDict recording BOTH hits AND misses
     for __getitem__, get, __contains__, plus "*" wildcard for __iter__, keys, values, items,
-    copy, __len__, __bool__, __eq__, __ne__, __repr__.
+    copy, __len__, __bool__, __eq__, __ne__, __or__, __ror__, update, __repr__.
   - Instruments Generator.sql to record exact (GenCls, ExprCls) dispatch (BOTH hits AND misses!)
     plus direct TRANSFORMS reads.
+  - Wraps non-micro methods on Dialect/Parser/Generator subclasses + core Parser/Generator.
+  - Wraps module-level helper functions passing AST Gate 1 (not called at import / not factory)
+    AND exhaustive gc.get_referrers Gate 2 (100% of live heap references rebound).
   - Always preserves reflection tests, subprocess tests (test_lazy_load), entry-point tests,
     and any test not cleanly observed during build collection in `always_keep_mtids`.
 """
@@ -20,22 +23,13 @@ Soundness invariant (first-divergence proof):
 from __future__ import annotations
 
 import ast
-import importlib
-import inspect
 import marshal
-import os
-import sys
-import time
-import unittest
-import zlib
-from concurrent.futures import ProcessPoolExecutor
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
 DEP_INDEX_PATH = Path("/app/dep_index.marshal")
 
-# Tracked dict attributes on Generator and Parser (runtime lookups via _BoundSpyDict including misses!)
+# Tracked dict attributes on Generator, Parser, and Dialect (runtime lookups via _BoundSpyDict including misses!)
 TRACKED_GEN_DICTS: frozenset[str] = frozenset({
     "TRANSFORMS",
     "TYPE_MAPPING",
@@ -44,6 +38,13 @@ TRACKED_GEN_DICTS: frozenset[str] = frozenset({
     "TYPE_PARAM_SETTINGS",
     "TIME_PART_SINGULARS",
     "AFTER_HAVING_MODIFIER_TRANSFORMS",
+})
+
+TRACKED_DIALECT_DICTS: frozenset[str] = frozenset({
+    "EXPRESSION_METADATA",
+    "COLUMN_ALIAS_PRECEDENCE",
+    "DEFAULT_FUNCTIONS_COLUMN_NAMES",
+    "SET_OP_DISTINCT_BY_DEFAULT",
 })
 
 TRACKED_PAR_DICTS: frozenset[str] = frozenset({
@@ -100,7 +101,7 @@ TRACKED_PAR_DICTS: frozenset[str] = frozenset({
     "USABLES",
 })
 
-ALL_TRACKED_DICTS: frozenset[str] = TRACKED_GEN_DICTS | TRACKED_PAR_DICTS
+ALL_TRACKED_DICTS: frozenset[str] = TRACKED_GEN_DICTS | TRACKED_PAR_DICTS | TRACKED_DIALECT_DICTS
 
 # Dialect/Tokenizer metaclass attributes baked at class-definition time (handled via dialect_meta_attrs)
 META_SKIP_ATTRS: frozenset[str] = frozenset({
@@ -112,10 +113,59 @@ META_SKIP_ATTRS: frozenset[str] = frozenset({
     "STRING_ESCAPES", "BYTE_STRING_ESCAPES", "IDENTIFIER_ESCAPES",
     "SUPPORTED_JSON_PATH_PARTS", "DATE_PART_MAPPING", "TIME_MAPPING",
     "FORMAT_MAPPING", "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING",
-    "CREATABLE_KIND_MAPPING", "UNESCAPED_SEQUENCES", "ESCAPED_SEQUENCES",
+    "CREATABLE_KIND_MAPPING", "INVERSE_CREATABLE_KIND_MAPPING",
+    "UNESCAPED_SEQUENCES", "ESCAPED_SEQUENCES",
     "VALID_INTERVAL_UNITS", "TIME_TRIE", "FORMAT_TRIE", "INVERSE_TIME_TRIE",
     "INVERSE_FORMAT_TRIE", "SET_TRIE", "SHOW_TRIE", "COERCES_TO",
 })
+
+# Ultra-hot core micro-methods excluded from method wrapping to keep Docker build fast (<3s overhead).
+# Edits to excluded methods safely fall back to fine_tokens=None while still keeping stage-reuse!
+_GEN_MICRO_METHODS: frozenset[str] = frozenset({
+    "__init__", "generate", "preprocess", "sql", "seg", "sep", "indent",
+    "expressions", "wrap", "pad_comment", "maybe_comment", "sanitize_comment",
+    "_replace_line_breaks", "func", "binary", "unary", "format_args",
+    "normalize_func", "escape_str", "format_time", "unsupported",
+    "_warn_unsupported_arg", "_move_ctes_to_top_level", "modifiers",
+    "properties", "locate_properties", "comments_sql",
+    "identifier_sql", "column_sql", "literal_sql", "table_sql",
+    "alias_sql", "select_sql", "from_sql", "where_sql", "and_sql",
+    "or_sql", "eq_sql", "paren_sql", "star_sql", "var_sql",
+    "datatype_sql", "anonymous_sql",
+})
+
+_PAR_MICRO_METHODS: frozenset[str] = frozenset({
+    "__init__", "parse", "parse_into", "_parse", "reset", "_reset",
+    "_advance", "_retreat", "_match", "_match_set", "_match_pair",
+    "_match_text_seq", "_match_texts", "_match_l_paren", "_match_r_paren",
+    "_expect", "_curr", "_next", "_prev", "_index", "expression",
+    "validate_expression", "raise_error", "check_errors", "_find_sql",
+    "_parse_statement", "_parse_expression", "_parse_conjunction",
+    "_parse_disjunction", "_parse_equality", "_parse_comparison",
+    "_parse_range", "_parse_bitwise", "_parse_term", "_parse_factor",
+    "_parse_unary", "_parse_type", "_parse_types", "_parse_column",
+    "_parse_column_ops", "_parse_column_def", "_parse_primary",
+    "_parse_field", "_parse_id_var", "_parse_var", "_parse_identifier",
+    "_parse_alias", "_parse_csv", "_parse_wrapped", "_parse_wrapped_csv",
+    "_parse_wrapped_id_vars", "_parse_tokens", "_parse_select",
+    "_parse_projections", "_parse_from", "_parse_where", "_parse_table",
+    "_parse_table_parts", "_parse_function", "_parse_function_args",
+    "_parse_number", "_parse_string", "_parse_placeholder", "_parse_null",
+    "_parse_boolean", "_parse_star", "_parse_parens", "_parse_binary",
+    "_parse_set_operations", "_parse_joins", "_parse_join",
+    "_parse_order", "_parse_ordered", "_parse_group", "_parse_having",
+    "_parse_limit", "_parse_offset", "_parse_cte", "_parse_with",
+    "_parse_subquery", "_parse_derived_table_values", "_parse_dot",
+})
+
+_OPT_HOT_FUNCS: frozenset[str] = frozenset({
+    "is_true", "is_false", "is_null", "is_zero", "is_complement",
+    "always_true", "always_false", "flatten", "uniq_sort",
+    "walk_in_scope", "find_in_scope", "find_all_in_scope",
+    "_simplify", "simplify", "traverse_scope", "build_scope", "_build_scope",
+})
+
+_CELL_TYPE = type((lambda x: (lambda: x))(0).__closure__[0])  # type: ignore[index]
 
 # Reflection / subprocess / meta test files always kept by dep_index
 ALWAYS_KEEP_TEST_FILES: frozenset[str] = frozenset({
@@ -133,9 +183,88 @@ _SEPARATELY_HANDLED_TEST_IDS: frozenset[str] = frozenset({
     "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
 })
 
+_ENUM_CLS: type | None = None
+_IMPORT_CALLED_CACHE: dict[str, tuple[frozenset[str], frozenset[tuple[str, str]]]] = {}
+
+
+def _cls_key(cls: type) -> str:
+    """Stable class key matching patch_analyzer's class_name (preserves nested e.g. 'BigQuery.Tokenizer')."""
+    qn = cls.__qualname__
+    return qn if ("." in qn and "<locals>" not in qn) else cls.__name__
+
+
+def _scan_import_time_funcs(sg_root: Path) -> tuple[frozenset[str], frozenset[tuple[str, str]]]:
+    """Static AST Gate 1: find (1) all function names called at module/class-body import time
+    anywhere in sqlglot/, and (2) all (mod_name, fn_name) factories returning a closure/partial."""
+    key = str(sg_root)
+    cached = _IMPORT_CALLED_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    called_at_import: set[str] = set()
+    factories: set[tuple[str, str]] = set()
+    sg_pkg = sg_root / "sqlglot"
+
+    def _collect_import_calls(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for dec in getattr(node, "decorator_list", ()):
+                _collect_import_calls(dec)
+            for d in getattr(node.args, "defaults", ()):
+                _collect_import_calls(d)
+            for d in getattr(node.args, "kw_defaults", ()):
+                if d is not None:
+                    _collect_import_calls(d)
+            return
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Name):
+                called_at_import.add(f.id)
+            elif isinstance(f, ast.Attribute):
+                called_at_import.add(f.attr)
+        for ch in ast.iter_child_nodes(node):
+            _collect_import_calls(ch)
+
+    def _is_factory_func(fn_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        inner_def_names: set[str] = set()
+        for sub in ast.walk(fn_node):
+            if sub is not fn_node and isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                inner_def_names.add(sub.name)
+        for st in ast.walk(fn_node):
+            if isinstance(st, ast.Return) and st.value is not None:
+                v = st.value
+                if isinstance(v, ast.Lambda):
+                    return True
+                if isinstance(v, ast.Name) and v.id in inner_def_names:
+                    return True
+                if isinstance(v, ast.Call):
+                    cf = v.func
+                    cname = cf.id if isinstance(cf, ast.Name) else (cf.attr if isinstance(cf, ast.Attribute) else "")
+                    if cname in ("partial", "preprocess"):
+                        return True
+        return False
+
+    if sg_pkg.is_dir():
+        for pyf in sg_pkg.rglob("*.py"):
+            try:
+                tree = ast.parse(pyf.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                continue
+            _collect_import_calls(tree)
+            rel = str(pyf.relative_to(sg_root))
+            mod_name = rel.removesuffix("/__init__.py").removesuffix(".py").replace("/", ".")
+            for stmt in tree.body:
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if _is_factory_func(stmt):
+                        factories.add((mod_name, stmt.name))
+
+    res = (frozenset(called_at_import), frozenset(factories))
+    _IMPORT_CALLED_CACHE[key] = res
+    return res
+
 
 def canon_runtime_key(k: Any, exp_expr_cls: type) -> str | None:
     """Canonicalize a runtime dict key into a stable marshal-safe string."""
+    global _ENUM_CLS
     tk = type(k)
     if tk is str:
         return f"S:{k}"
@@ -145,8 +274,10 @@ def canon_runtime_key(k: Any, exp_expr_cls: type) -> str | None:
         return f"B:{int(k)}"
     if isinstance(k, type) and issubclass(k, exp_expr_cls):
         return f"E:{k.__name__}"
-    if isinstance(k, Enum):
-        # Unify DType and DataType.Type under M:DType.<NAME>
+    if _ENUM_CLS is None:
+        from enum import Enum
+        _ENUM_CLS = Enum
+    if isinstance(k, _ENUM_CLS):
         en = "DType" if tk.__name__ in ("Type", "DType") else tk.__name__
         return f"M:{en}.{k.name}"
     return None
@@ -168,14 +299,12 @@ def canon_source_key(kr: str, all_expr_classes: set[str]) -> str | None:
         return f"B:{1 if s == 'True' else 0}"
     if s.isdigit() or (s[0] == "-" and s[1:].isdigit()):
         return f"I:{int(s)}"
-    # exp.Foo or Foo
     parts = s.split(".")
     last = parts[-1]
     if len(parts) == 2 and parts[0] == "exp" and last in all_expr_classes:
         return f"E:{last}"
     if len(parts) == 1 and last in all_expr_classes:
         return f"E:{last}"
-    # TokenType.FOO, exp.DType.INT, exp.DataType.Type.INT, etc.
     if len(parts) >= 2 and last.isupper():
         en = parts[-2]
         if en in ("Type", "DType") and ("DataType" in parts or "DType" in parts):
@@ -242,6 +371,9 @@ class _BoundSpyDict(dict):
 
     def update(self, *args: Any, **kwargs: Any) -> None:
         self._rec_all()
+        for a in args:
+            if isinstance(a, _BoundSpyDict):
+                a._rec_all()
         self._raw.update(*args, **kwargs)
         super().update(*args, **kwargs)
 
@@ -288,11 +420,17 @@ class _BoundSpyDict(dict):
 
     def __eq__(self, other: Any) -> bool:
         self._rec_all()
-        return self._raw == (other._raw if isinstance(other, _BoundSpyDict) else other)
+        if isinstance(other, _BoundSpyDict):
+            other._rec_all()
+            return self._raw == other._raw
+        return self._raw == other
 
     def __ne__(self, other: Any) -> bool:
         self._rec_all()
-        return self._raw != (other._raw if isinstance(other, _BoundSpyDict) else other)
+        if isinstance(other, _BoundSpyDict):
+            other._rec_all()
+            return self._raw != other._raw
+        return self._raw != other
 
     def __repr__(self) -> str:
         self._rec_all()
@@ -300,11 +438,17 @@ class _BoundSpyDict(dict):
 
     def __or__(self, other: Any) -> dict:
         self._rec_all()
-        return self._raw | (other._raw if isinstance(other, _BoundSpyDict) else other)
+        if isinstance(other, _BoundSpyDict):
+            other._rec_all()
+            return self._raw | other._raw
+        return self._raw | other
 
     def __ror__(self, other: Any) -> dict:
         self._rec_all()
-        return (other._raw if isinstance(other, _BoundSpyDict) else other) | self._raw
+        if isinstance(other, _BoundSpyDict):
+            other._rec_all()
+            return other._raw | self._raw
+        return other | self._raw
 
 
 class _AttrSpy:
@@ -322,7 +466,8 @@ class _AttrSpy:
         self._bound_cache: dict[str, _BoundSpyDict] | None = {} if is_dict else None
 
     def __get__(self, obj: Any, owner: type | None = None) -> Any:
-        recv = obj.__class__.__name__ if obj is not None else (owner.__name__ if owner is not None else "")
+        cls_ref = obj.__class__ if obj is not None else owner
+        recv = _cls_key(cls_ref) if cls_ref is not None else ""
         if self._is_dict:
             bc = self._bound_cache
             bd = bc.get(recv)  # type: ignore[union-attr]
@@ -334,20 +479,205 @@ class _AttrSpy:
         return self._val
 
 
+def _is_preprocess_list(lst: list) -> bool:
+    """True iff every non-frame referrer of `lst` is a closure cell of sqlglot.transforms.preprocess._to_sql."""
+    import gc
+    import inspect
+    import types
+
+    lrefs = []
+    for r in gc.get_referrers(lst):
+        if not isinstance(r, types.FrameType):
+            lrefs.append(r)
+    if not lrefs:
+        return False
+    for c in lrefs:
+        if type(c) is not _CELL_TYPE:
+            return False
+        crefs = []
+        for x in gc.get_referrers(c):
+            if not isinstance(x, types.FrameType):
+                crefs.append(x)
+        if not crefs:
+            return False
+        for tup in crefs:
+            if type(tup) is not tuple:
+                return False
+            trefs = []
+            for f in gc.get_referrers(tup):
+                if not isinstance(f, types.FrameType):
+                    trefs.append(f)
+            if not trefs:
+                return False
+            for fn in trefs:
+                if (
+                    not inspect.isfunction(fn)
+                    or getattr(fn, "__module__", "") != "sqlglot.transforms"
+                    or getattr(fn, "__qualname__", "") != "preprocess.<locals>._to_sql"
+                ):
+                    return False
+    return True
+
+
+def _audit_func_refs(
+    orig_fn: Any,
+    allowed_plain_dicts: dict[int, dict],
+) -> tuple[bool, list[tuple[dict, Any]], list[tuple[list, int]], list[tuple[type, str]], list[tuple[Any, list[tuple[dict, Any]]]]]:
+    """Exhaustive Gate 2 GC referrer audit for `orig_fn`.
+    CRITICAL: Uses ONLY plain `for` loops (zero generator expressions / nested scopes capturing
+    `orig_fn` or `r`) so Python never creates a closure cell referring to `orig_fn`!"""
+    import functools
+    import gc
+    import types
+
+    raw_refs = gc.get_referrers(orig_fn)
+    plan_dicts: list[tuple[dict, Any]] = []
+    plan_lists: list[tuple[list, int]] = []
+    plan_cls: list[tuple[type, str]] = []
+    plan_partials: list[tuple[Any, list[tuple[dict, Any]]]] = []
+    safe = True
+
+    for r in raw_refs:
+        if isinstance(r, types.FrameType):
+            continue
+        tr = type(r)
+        if tr is dict:
+            has_key_ref = False
+            for k in r.keys():
+                if k is orig_fn:
+                    has_key_ref = True
+                    break
+            if has_key_ref:
+                safe = False
+                break
+            if id(r) in allowed_plain_dicts:
+                matched_k: list[Any] = []
+                for k, v in r.items():
+                    if v is orig_fn:
+                        matched_k.append(k)
+                if not matched_k:
+                    safe = False
+                    break
+                for k in matched_k:
+                    plan_dicts.append((r, k))
+            else:
+                owners: list[type] = []
+                for x in gc.get_referrers(r):
+                    if isinstance(x, type) and getattr(x, "__module__", "").startswith("sqlglot."):
+                        owners.append(x)
+                matched_k2: list[Any] = []
+                for k, v in r.items():
+                    if v is orig_fn:
+                        matched_k2.append(k)
+                all_match = len(owners) == 1 and bool(matched_k2)
+                if all_match:
+                    owner_dict = owners[0].__dict__
+                    for k in matched_k2:
+                        if owner_dict.get(k) is not orig_fn:
+                            all_match = False
+                            break
+                if all_match:
+                    for k in matched_k2:
+                        plan_cls.append((owners[0], k))
+                else:
+                    safe = False
+                    break
+        elif tr is list:
+            if _is_preprocess_list(r):
+                idxs: list[int] = []
+                for i, v in enumerate(r):
+                    if v is orig_fn:
+                        idxs.append(i)
+                if not idxs:
+                    safe = False
+                    break
+                for i in idxs:
+                    plan_lists.append((r, i))
+            else:
+                safe = False
+                break
+        elif isinstance(r, functools.partial) and r.func is orig_fn:
+            bad_p = False
+            for a in r.args:
+                if a is orig_fn:
+                    bad_p = True
+                    break
+            if not bad_p:
+                for v in r.keywords.values():
+                    if v is orig_fn:
+                        bad_p = True
+                        break
+            if bad_p:
+                safe = False
+                break
+            prefs: list[Any] = []
+            for x in gc.get_referrers(r):
+                if not isinstance(x, types.FrameType):
+                    prefs.append(x)
+            if not prefs:
+                safe = False
+                break
+            p_binds: list[tuple[dict, Any]] = []
+            for pr in prefs:
+                if type(pr) is not dict or id(pr) not in allowed_plain_dicts:
+                    safe = False
+                    break
+                pr_key_ref = False
+                for k in pr.keys():
+                    if k is r:
+                        pr_key_ref = True
+                        break
+                if pr_key_ref:
+                    safe = False
+                    break
+                pk_list: list[Any] = []
+                for k, v in pr.items():
+                    if v is r:
+                        pk_list.append(k)
+                if not pk_list:
+                    safe = False
+                    break
+                for pk in pk_list:
+                    p_binds.append((pr, pk))
+            if not safe:
+                break
+            plan_partials.append((r, p_binds))
+        else:
+            safe = False
+            break
+
+    del raw_refs
+    return (safe and bool(plan_dicts)), plan_dicts, plan_lists, plan_cls, plan_partials
+
+
 def install_spies(
     on_attr: Any,
     on_key: Any,
     on_gen_dispatch: Any,
     on_method: Any | None = None,
-) -> tuple[set[str], set[str], Any]:
-    """Install _AttrSpy, _BoundSpyDict, Generator.sql dispatch spy, and optional dialect method spies
-    on Pure-Python /sqlglot. Returns (tracked_attrs, tracked_dicts, restore_fn)."""
+    on_func: Any | None = None,
+    sg_root: Path | None = None,
+) -> tuple[set[str], set[str], set[tuple[str, str]], set[tuple[str, str]], Any]:
+    """Install _AttrSpy, _BoundSpyDict, Generator.sql dispatch spy, dialect/core method spies,
+    and 100%-sound module-level function spies (via AST Gate 1 + gc.get_referrers Gate 2).
+    Returns (tracked_attrs, tracked_dicts, wrapped_methods, wrapped_funcs, restore_fn)."""
+    import functools
+    import gc
+    import importlib
+    import inspect
+    import sys
+    import sqlglot
     from sqlglot import Dialect, Dialects, exp
     from sqlglot.generator import Generator, _DISPATCH_CACHE, _build_dispatch
     from sqlglot.parser import Parser
     from sqlglot.tokens import Tokenizer
 
-    # Preload ALL dialects and pre-populate Generator _DISPATCH_CACHE BEFORE spying!
+    if sg_root is None:
+        sg_file = getattr(sqlglot, "__file__", None)
+        if sg_file:
+            sg_root = Path(sg_file).resolve().parent.parent
+
+    # Preload ALL dialects, PythonGenerator, typing/*, optimizer/*, and ALL subclasses BEFORE auditing!
     all_classes: set[type] = set()
     for d in Dialects:
         d_inst = Dialect.get_or_raise(d)
@@ -362,7 +692,6 @@ def install_spies(
     if Generator not in _DISPATCH_CACHE:
         _DISPATCH_CACHE[Generator] = _build_dispatch(Generator)
 
-    # Also ensure PythonGenerator is included!
     try:
         from sqlglot.generators.python import PythonGenerator
         for c in PythonGenerator.__mro__:
@@ -373,21 +702,160 @@ def install_spies(
     except Exception:
         pass
 
+    # Recursively capture ALL subclasses (including delegating wrappers like Athena _HiveGenerator!)
+    _sub_stack: list[type] = [Dialect, Parser, Generator, Tokenizer]
+    while _sub_stack:
+        _cur = _sub_stack.pop()
+        if _cur.__module__.startswith("sqlglot."):
+            all_classes.add(_cur)
+        for _sc in _cur.__subclasses__():
+            if _sc not in all_classes:
+                _sub_stack.append(_sc)
+
+    for _cls_g in list(all_classes):
+        if issubclass(_cls_g, Generator) and _cls_g not in _DISPATCH_CACHE:
+            _DISPATCH_CACHE[_cls_g] = _build_dispatch(_cls_g)
+
+    # Preload all sqlglot.typing.* and sqlglot.optimizer.* modules so cross-module imports are visible to GC!
+    if sg_root is not None:
+        for subpkg in ("typing", "optimizer"):
+            pdir = sg_root / "sqlglot" / subpkg
+            if pdir.is_dir():
+                for pyf in sorted(pdir.glob("*.py")):
+                    if pyf.name.startswith("__"):
+                        continue
+                    try:
+                        importlib.import_module(f"sqlglot.{subpkg}.{pyf.stem}")
+                    except Exception:
+                        pass
+
+    # ---- Step 1: 100%-Sound Module-Level Function Wrapping (BEFORE _AttrSpy wraps class dicts!) ----
+    wrapped_funcs: set[tuple[str, str]] = set()
+    saved_dict_entries: list[tuple[dict, Any, Any]] = []
+    saved_list_entries: list[tuple[list, int, Any]] = []
+    saved_cls_entries: list[tuple[type, str, Any]] = []
+
+    called_at_import, factory_funcs = _scan_import_time_funcs(sg_root) if sg_root is not None else (frozenset(), frozenset())
+
+    allowed_plain_dicts: dict[int, dict] = {}
+    for mname, mobj in list(sys.modules.items()):
+        if mobj is not None and mname.startswith("sqlglot."):
+            md = getattr(mobj, "__dict__", None)
+            if type(md) is dict:
+                allowed_plain_dicts[id(md)] = md
+                em = md.get("EXPRESSION_METADATA")
+                if type(em) is dict:
+                    allowed_plain_dicts[id(em)] = em
+                    for inner in em.values():
+                        if type(inner) is dict:
+                            allowed_plain_dicts[id(inner)] = inner
+    for cls in all_classes:
+        for attr_v in cls.__dict__.values():
+            if type(attr_v) is dict:
+                allowed_plain_dicts[id(attr_v)] = attr_v
+                for inner in attr_v.values():
+                    if type(inner) is dict:
+                        allowed_plain_dicts[id(inner)] = inner
+    for dmap in _DISPATCH_CACHE.values():
+        if type(dmap) is dict:
+            allowed_plain_dicts[id(dmap)] = dmap
+
+    def _is_target_func_mod(mn: str) -> bool:
+        if mn.startswith("sqlglot.parsers.") and mn != "sqlglot.parsers.base":
+            return True
+        if mn.startswith("sqlglot.generators."):
+            return True
+        if mn.startswith("sqlglot.dialects.") and mn not in ("sqlglot.dialects.dialect", "sqlglot.dialects.__init__"):
+            return True
+        if mn.startswith("sqlglot.typing."):
+            return True
+        if mn.startswith("sqlglot.optimizer.") and mn not in ("sqlglot.optimizer.optimizer", "sqlglot.optimizer.__init__"):
+            return True
+        return False
+
+    def _make_fwrap(_orig, _mn, _fn):
+        @functools.wraps(_orig)
+        def _fwrap(*args, **kwargs):
+            on_func(_mn, _fn)
+            return _orig(*args, **kwargs)
+        _fwrap._blast_fwrapped = True  # type: ignore[attr-defined]
+        return _fwrap
+
+    gc.collect()
+    target_mod_names = sorted(mn for mn in list(sys.modules.keys()) if _is_target_func_mod(mn))
+    for mn in target_mod_names:
+        mod_obj = sys.modules.get(mn)
+        if mod_obj is None:
+            continue
+        is_opt_mod = mn.startswith("sqlglot.optimizer.")
+        md_cur = mod_obj.__dict__
+        fn_names: list[str] = []
+        for k in list(md_cur.keys()):
+            v = md_cur.get(k)
+            if (
+                inspect.isfunction(v)
+                and getattr(v, "__module__", None) == mn
+                and getattr(v, "__name__", None) == k
+                and not getattr(v, "_blast_fwrapped", False)
+                and not (k.startswith("__") and k.endswith("__"))
+            ):
+                fn_names.append(k)
+        del v
+        for fn_name in fn_names:
+            if fn_name in called_at_import or (mn, fn_name) in factory_funcs:
+                continue
+            if is_opt_mod and fn_name in _OPT_HOT_FUNCS:
+                continue
+            orig_fn = md_cur.get(fn_name)
+            if not inspect.isfunction(orig_fn):
+                continue
+
+            ok_fn, plan_dicts, plan_lists, plan_cls, plan_partials = _audit_func_refs(orig_fn, allowed_plain_dicts)
+            if not ok_fn:
+                continue
+
+            wrapped_funcs.add((mn, fn_name))
+            if on_func is not None:
+                f_wrapped = _make_fwrap(orig_fn, mn, fn_name)
+                for d_obj, k in plan_dicts:
+                    saved_dict_entries.append((d_obj, k, orig_fn))
+                    d_obj[k] = f_wrapped
+                for l_obj, idx in plan_lists:
+                    saved_list_entries.append((l_obj, idx, orig_fn))
+                    l_obj[idx] = f_wrapped
+                for c_obj, cname_k in plan_cls:
+                    saved_cls_entries.append((c_obj, cname_k, orig_fn))
+                    setattr(c_obj, cname_k, f_wrapped)
+                for p_obj, p_binds in plan_partials:
+                    new_p = functools.partial(f_wrapped, *p_obj.args, **p_obj.keywords)
+                    for pr, pk in p_binds:
+                        saved_dict_entries.append((pr, pk, p_obj))
+                        pr[pk] = new_p
+
+    # ---- Step 2: Wrap UPPERCASE Class Attributes & Tracked Dicts via _AttrSpy ----
     saved_attrs: list[tuple[type, str, Any]] = []
+    saved_method_dict_entries: list[tuple[dict[Any, Any], Any, Any]] = []
     tracked_attrs: set[str] = set()
     tracked_dicts: set[str] = set()
+    raw_tracked_dicts: list[dict[Any, Any]] = []
 
     for cls in all_classes:
         is_gen = issubclass(cls, Generator)
         is_par = issubclass(cls, Parser)
+        is_dial = issubclass(cls, Dialect)
         for name, val in list(cls.__dict__.items()):
             if not name.isupper() or name.startswith("_") or name in META_SKIP_ATTRS:
                 continue
             if callable(val) or isinstance(val, (classmethod, staticmethod, property, type)):
                 continue
             if isinstance(val, dict):
-                if (is_gen and name in TRACKED_GEN_DICTS) or (is_par and name in TRACKED_PAR_DICTS):
+                if (
+                    (is_gen and name in TRACKED_GEN_DICTS)
+                    or (is_par and name in TRACKED_PAR_DICTS)
+                    or (is_dial and name in TRACKED_DIALECT_DICTS)
+                ):
                     saved_attrs.append((cls, name, val))
+                    raw_tracked_dicts.append(val)
                     setattr(cls, name, _AttrSpy(name, val, True, on_attr, on_key, exp.Expr))
                     tracked_dicts.add(name)
             else:
@@ -395,22 +863,27 @@ def install_spies(
                 setattr(cls, name, _AttrSpy(name, val, False, on_attr, on_key, exp.Expr))
                 tracked_attrs.add(name)
 
-    # Optional: wrap non-dunder methods defined in sqlglot/parsers/*.py and sqlglot/generators/*.py
+    # ---- Step 3: Wrap Non-Dunder Methods on Dialects, Parsers, Generators, and Core Parser/Generator ----
     wrapped_methods: set[tuple[str, str]] = set()
-    if on_method is not None:
-        for cls in all_classes:
-            mod = cls.__module__
-            if not (mod.startswith("sqlglot.parsers.") or mod.startswith("sqlglot.generators.")):
+    for cls in all_classes:
+        mod = cls.__module__
+        is_core_gen = cls is Generator
+        is_core_par = cls is Parser
+        is_sub_pg = (mod.startswith("sqlglot.parsers.") and mod != "sqlglot.parsers.base") or mod.startswith("sqlglot.generators.")
+        is_sub_dial = mod.startswith("sqlglot.dialects.") and mod not in ("sqlglot.dialects.dialect", "sqlglot.dialects.__init__")
+        if not (is_sub_pg or is_sub_dial or is_core_gen or is_core_par):
+            continue
+        cname = _cls_key(cls)
+        skip_m = _GEN_MICRO_METHODS if is_core_gen else (_PAR_MICRO_METHODS if is_core_par else frozenset())
+        for mname, mval in list(cls.__dict__.items()):
+            if mname != "__init__" and mname.startswith("__") and mname.endswith("__"):
                 continue
-            if mod in ("sqlglot.parsers.base",):
+            if mname in skip_m:
                 continue
-            cname = cls.__name__
-            for mname, mval in list(cls.__dict__.items()):
-                if mname.startswith("__") and mname.endswith("__"):
-                    continue
-                if inspect.isfunction(mval):
+            if inspect.isfunction(mval):
+                wrapped_methods.add((cname, mname))
+                if on_method is not None:
                     saved_attrs.append((cls, mname, mval))
-                    wrapped_methods.add((cname, mname))
 
                     def _make_mwrap(orig_fn, _cn, _mn):
                         def _mwrap(*args, **kwargs):
@@ -422,28 +895,17 @@ def install_spies(
 
                     wrapped = _make_mwrap(mval, cname, mname)
                     setattr(cls, mname, wrapped)
-                    # Also update _DISPATCH_CACHE if this method is referenced anywhere in dispatch!
-                    if issubclass(cls, Generator):
-                        for gcls_c, dmap in _DISPATCH_CACHE.items():
-                            if issubclass(gcls_c, cls):
-                                for ek, fn in list(dmap.items()):
-                                    if fn is mval:
-                                        dmap[ek] = wrapped
-
-    # Also compute wrapped_methods set even when on_method is None (so dep_index exports it!)
-    else:
-        for cls in all_classes:
-            mod = cls.__module__
-            if not (mod.startswith("sqlglot.parsers.") or mod.startswith("sqlglot.generators.")):
-                continue
-            if mod in ("sqlglot.parsers.base",):
-                continue
-            cname = cls.__name__
-            for mname, mval in cls.__dict__.items():
-                if mname.startswith("__") and mname.endswith("__"):
-                    continue
-                if inspect.isfunction(mval):
-                    wrapped_methods.add((cname, mname))
+                    # Update ALL Generator _DISPATCH_CACHE entries (including cross-dialect copiers!)
+                    for dmap in _DISPATCH_CACHE.values():
+                        for ek, fn in list(dmap.items()):
+                            if fn is mval:
+                                dmap[ek] = wrapped
+                    # Update bare method references inside tracked Parser/Generator dicts!
+                    for rdict in raw_tracked_dicts:
+                        for dk, dv in list(rdict.items()):
+                            if dv is mval:
+                                saved_method_dict_entries.append((rdict, dk, mval))
+                                rdict[dk] = wrapped
 
     # Wrap Generator.sql for exact (GenCls, ExprCls) dispatch (hits + misses!)
     orig_gen_sql = Generator.sql
@@ -458,18 +920,26 @@ def install_spies(
             if value:
                 return self.sql(value)
             return ""
-        on_gen_dispatch(self.__class__.__name__, expression.__class__.__name__)
+        on_gen_dispatch(_cls_key(self.__class__), expression.__class__.__name__)
         return orig_gen_sql(self, expression, None, comment)
 
     Generator.sql = _spy_gen_sql  # type: ignore[method-assign]
 
     def _restore() -> None:
         Generator.sql = orig_gen_sql  # type: ignore[method-assign]
-        for cls, name, val in saved_attrs:
+        for rdict, dk, orig_v in reversed(saved_method_dict_entries):
+            rdict[dk] = orig_v
+        for cls, name, val in reversed(saved_attrs):
             setattr(cls, name, val)
+        for c_obj, cname_k, orig_v in reversed(saved_cls_entries):
+            setattr(c_obj, cname_k, orig_v)
+        for l_obj, idx, orig_v in reversed(saved_list_entries):
+            l_obj[idx] = orig_v
+        for d_obj, k, orig_v in reversed(saved_dict_entries):
+            d_obj[k] = orig_v
         _DISPATCH_CACHE.clear()
 
-    return tracked_attrs, tracked_dicts, wrapped_methods, _restore
+    return tracked_attrs, tracked_dicts, wrapped_methods, wrapped_funcs, _restore
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +947,10 @@ def install_spies(
 # ---------------------------------------------------------------------------
 
 def _collect_dep_worker(args: tuple[str, list[str], dict[str, int]]) -> dict[str, Any]:
+    import importlib
+    import sys
+    import unittest
+
     sg_root, test_files, tid_to_mtid = args
     sys.path.insert(0, sg_root)
     sys.path.insert(0, "/app")
@@ -527,9 +1001,10 @@ def _collect_dep_worker(args: tuple[str, list[str], dict[str, int]]) -> dict[str
         elif t == -2:
             setup_disp.add((recv, ecls))
 
-    tracked_attrs, tracked_dicts, wrapped_methods, restore = install_spies(_on_attr, _on_key, _on_disp)
+    tracked_attrs, tracked_dicts, wrapped_methods, wrapped_funcs, restore = install_spies(
+        _on_attr, _on_key, _on_disp, sg_root=Path(sg_root)
+    )
 
-    # Preload fast helpers for special heavy tests
     import duckdb
     import tests.helpers as th
     from sqlglot import Dialect, Dialects, exp, parse_one, transpile
@@ -547,8 +1022,6 @@ def _collect_dep_worker(args: tuple[str, list[str], dict[str, int]]) -> dict[str
             except Exception:
                 continue
 
-            # Patch heavy TestOptimizer / TestExecutor / TestParser / TestGenerator methods to run fast
-            # while still exercising 100% of their Dialect/Parser/Generator/PythonGenerator attribute & dispatch reads!
             if tf == "tests/test_optimizer.py":
                 import tests.test_optimizer as topt
                 opt_db = Path("/app/duckdb_opt.db")
@@ -590,8 +1063,6 @@ def _collect_dep_worker(args: tuple[str, list[str], dict[str, int]]) -> dict[str
                                 ex.sql(dialect="duckdb")
 
                 topt.TestOptimizer.check_file = _fast_cf
-                # Skip slow DuckDB execution in test_optimize_in_nulls / correlated_all (still parses + optimizes + generates duckdb SQL!)
-                orig_in_nulls = topt.TestOptimizer.test_optimize_in_nulls
 
                 def _fast_in_nulls_dep(self):
                     for where in ("", " WHERE y.b IS NOT NULL", " WHERE y.b IS NULL", " WHERE FALSE", " WHERE y.c = x.a", " WHERE y.b = x.a"):
@@ -627,7 +1098,6 @@ def _collect_dep_worker(args: tuple[str, list[str], dict[str, int]]) -> dict[str
 
                 topt.TestOptimizer.test_optimize_correlated_all = _fast_corr_dep
 
-                # Slim 10000-UNION scope stress test
                 orig_scope = topt.TestOptimizer.test_scope
 
                 def _slim_scope(self):
@@ -662,7 +1132,6 @@ def _collect_dep_worker(args: tuple[str, list[str], dict[str, int]]) -> dict[str
                         if args.get("execute"):
                             opt = optimize(expr, s_ds, leave_tables_isolated=True)
                             plan = Plan(opt)
-                            # Traverse all expressions in plan via PythonGenerator
                             for step in plan.dag:
                                 for attr_v in step.__dict__.values():
                                     if isinstance(attr_v, exp.Expr):
@@ -709,7 +1178,6 @@ def _collect_dep_worker(args: tuple[str, list[str], dict[str, int]]) -> dict[str
 
                 tgen.TestGenerator.test_generator_memory = _fast_gen_mem_dep
 
-            # Collect all unittest.TestCase subclasses defined in this module
             loader = unittest.defaultTestLoader
             suite = loader.loadTestsFromModule(mod)
             by_cls: dict[type, list[unittest.TestCase]] = {}
@@ -759,7 +1227,6 @@ def _collect_dep_worker(args: tuple[str, list[str], dict[str, int]]) -> dict[str
                     finally:
                         cur_mtid[0] = -1
 
-                # Union setUpClass reads into every test of cls!
                 for mtid in cls_mtids:
                     for k in setup_attr:
                         attr_reads.setdefault(k, set()).add(mtid)
@@ -784,31 +1251,57 @@ def _collect_dep_worker(args: tuple[str, list[str], dict[str, int]]) -> dict[str
         "tracked_attrs": sorted(tracked_attrs),
         "tracked_dicts": sorted(tracked_dicts),
         "wrapped_methods": sorted(wrapped_methods),
+        "wrapped_funcs": sorted(wrapped_funcs),
     }
 
 
-def build_dep_index(sg_root: Path, core_maps_path: Path = Path("/app/maps/core_maps.zlib"), out_path: Path = DEP_INDEX_PATH) -> tuple[int, int, int, int, int]:
-    """Build /app/dep_index.marshal across all 60 test files in 4 parallel processes."""
+def build_dep_index(
+    sg_root: Path,
+    core_maps_path: Path = Path("/app/maps/core_maps.zlib"),
+    out_path: Path = DEP_INDEX_PATH,
+    n_workers: int | None = None,
+) -> tuple[int, int, int, int, int]:
+    """Build /app/dep_index.marshal across all 60 test files in parallel processes."""
+    import os
+    import time
+    import zlib
+    from concurrent.futures import ProcessPoolExecutor
+
     t0 = time.perf_counter()
-    maps = marshal.loads(zlib.decompress(core_maps_path.read_bytes()))
+    raw_core = Path("/app/maps_raw/core_maps.marshal")
+    if raw_core.is_file():
+        maps = marshal.loads(raw_core.read_bytes())
+    else:
+        maps = marshal.loads(zlib.decompress(core_maps_path.read_bytes()))
     test_ids: list[str] = maps["test_ids"]
     tid_to_mtid = {tid: i for i, tid in enumerate(test_ids)}
 
-    all_tfiles = sorted(
-        {tid.split("::")[0] for tid in test_ids}
-    )
-    # Balance test files across 4 workers (put test_optimizer & test_executor on separate workers!)
-    n_workers = min(4, os.cpu_count() or 2)
+    all_tfiles = sorted({tid.split("::")[0] for tid in test_ids})
+    if n_workers is None:
+        n_workers = min(4, os.cpu_count() or 2)
+    n_workers = max(1, n_workers)
     buckets: list[list[str]] = [[] for _ in range(n_workers)]
-    heavy_first = [
-        "tests/test_optimizer.py",
-        "tests/test_executor.py",
-        "tests/dialects/test_dialect.py",
-        "tests/dialects/test_snowflake.py",
-    ]
-    ordered = [f for f in heavy_first if f in all_tfiles] + [f for f in all_tfiles if f not in heavy_first]
-    for i, tf in enumerate(ordered):
-        buckets[i % n_workers].append(tf)
+    # Keep tests/test_optimizer.py solo when >=2 workers; LPT-balance all remaining files by weighted size!
+    if n_workers >= 2 and "tests/test_optimizer.py" in all_tfiles:
+        buckets[0].append("tests/test_optimizer.py")
+        rem_files = [f for f in all_tfiles if f != "tests/test_optimizer.py"]
+        loads = [0] * (n_workers - 1)
+
+        def _weight(tf: str) -> int:
+            p = sg_root / tf
+            sz = p.stat().st_size if p.is_file() else 1000
+            return sz * 4 if tf == "tests/test_executor.py" else sz
+
+        for tf in sorted(rem_files, key=lambda f: -_weight(f)):
+            bi = min(range(n_workers - 1), key=loads.__getitem__)
+            buckets[bi + 1].append(tf)
+            loads[bi] += _weight(tf)
+    else:
+        loads = [0] * n_workers
+        for tf in sorted(all_tfiles, key=lambda f: -((sg_root / f).stat().st_size if (sg_root / f).is_file() else 1000)):
+            bi = min(range(n_workers), key=loads.__getitem__)
+            buckets[bi].append(tf)
+            loads[bi] += (sg_root / tf).stat().st_size if (sg_root / tf).is_file() else 1000
 
     merged_attr: dict[tuple[str, str], set[int]] = {}
     merged_dict: dict[tuple[str, str, str], set[int]] = {}
@@ -818,9 +1311,10 @@ def build_dep_index(sg_root: Path, core_maps_path: Path = Path("/app/maps/core_m
     tracked_attrs: set[str] = set()
     tracked_dicts: set[str] = set()
     wrapped_methods: set[tuple[str, str]] = set()
+    wrapped_funcs: set[tuple[str, str]] = set()
 
     tasks = [(str(sg_root), b, tid_to_mtid) for b in buckets if b]
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+    with ProcessPoolExecutor(max_workers=len(tasks)) as pool:
         for res in pool.map(_collect_dep_worker, tasks):
             for k, v in res["attr_reads"].items():
                 merged_attr.setdefault(k, set()).update(v)
@@ -833,8 +1327,8 @@ def build_dep_index(sg_root: Path, core_maps_path: Path = Path("/app/maps/core_m
             tracked_attrs.update(res["tracked_attrs"])
             tracked_dicts.update(res["tracked_dicts"])
             wrapped_methods.update(res["wrapped_methods"])
+            wrapped_funcs.update(res["wrapped_funcs"])
 
-    # Any test in maps["test_ids"] that was NOT cleanly observed stays in always_keep_mtids!
     always_keep: set[int] = set(failed_all)
     for mtid, tid in enumerate(test_ids):
         if tid in _SEPARATELY_HANDLED_TEST_IDS:
@@ -843,7 +1337,6 @@ def build_dep_index(sg_root: Path, core_maps_path: Path = Path("/app/maps/core_m
         if tf in ALWAYS_KEEP_TEST_FILES or tid in ALWAYS_KEEP_TEST_IDS or mtid not in seen_all:
             always_keep.add(mtid)
 
-    # Group dict_reads by (recv, attr) -> {key: list[mtid]} for fast O(1) lookup
     dict_by_ra: dict[tuple[str, str], dict[str, list[int]]] = {}
     for (r, a, ck), mtids in merged_dict.items():
         dict_by_ra.setdefault((r, a), {})[ck] = sorted(mtids)
@@ -855,21 +1348,42 @@ def build_dep_index(sg_root: Path, core_maps_path: Path = Path("/app/maps/core_m
         "tracked_attrs": sorted(tracked_attrs),
         "tracked_dicts": sorted(tracked_dicts),
         "wrapped_methods": sorted(wrapped_methods),
+        "wrapped_funcs": sorted(wrapped_funcs),
         "always_keep_mtids": sorted(always_keep),
     }
     blob = marshal.dumps(payload)
     out_path.write_bytes(blob)
+    meta_payload = {
+        "tracked_attrs": payload["tracked_attrs"],
+        "tracked_dicts": payload["tracked_dicts"],
+        "wrapped_methods": payload["wrapped_methods"],
+        "wrapped_funcs": payload["wrapped_funcs"],
+    }
+    (out_path.parent / "dep_meta.marshal").write_bytes(marshal.dumps(meta_payload))
     dt = time.perf_counter() - t0
     print(
         f"[dep_index] seen={len(seen_all)}/{len(test_ids)} always_keep={len(always_keep)} "
         f"attrs={len(merged_attr)} dicts={len(merged_dict)} disp={len(merged_disp)} "
-        f"({len(blob)/1024:.0f} KB) in {dt:.1f}s",
+        f"wm={len(wrapped_methods)} wf={len(wrapped_funcs)} ({len(blob)/1024:.0f} KB) in {dt:.1f}s",
         flush=True,
     )
     return len(seen_all), len(always_keep), len(merged_attr), len(merged_dict), len(blob)
 
 
+DEP_META_PATH = Path("/app/dep_meta.marshal")
 _DEP_INDEX_CACHE: dict[str, Any] | None = None
+_DEP_META_CACHE: dict[str, Any] | None = None
+
+
+def load_dep_meta(path: Path = DEP_META_PATH) -> dict[str, Any] | None:
+    global _DEP_META_CACHE
+    if _DEP_META_CACHE is None:
+        if path.is_file():
+            try:
+                _DEP_META_CACHE = marshal.loads(path.read_bytes())
+            except Exception:
+                _DEP_META_CACHE = None
+    return _DEP_META_CACHE
 
 
 def load_dep_index(path: Path = DEP_INDEX_PATH) -> dict[str, Any] | None:

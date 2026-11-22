@@ -20,6 +20,28 @@ def duration_ms(seconds: float) -> int:
     return math.floor(seconds * 1000 + 0.5)
 
 
+def _pigeonhole_lb(durs_desc: Sequence[int], total_ms: int, w: int) -> int:
+    """Exact O(1) lower bound combining max_d, average load, and pigeonhole bounds.
+
+    Among the top q*w + 1 items (sorted descending), at least q + 1 must share one of the w
+    workers, so the makespan is at least the sum of the q + 1 smallest among them.
+    """
+    n = len(durs_desc)
+    lb = durs_desc[0]
+    avg = (total_ms + w - 1) // w
+    if avg > lb:
+        lb = avg
+    max_q = (n - 1) // w
+    if max_q > 4:
+        max_q = 4
+    for q in range(1, max_q + 1):
+        end = q * w + 1
+        ph = sum(durs_desc[end - q - 1 : end])
+        if ph > lb:
+            lb = ph
+    return lb
+
+
 def _lpt_pack(items: list[tuple[int, int]], w: int) -> tuple[int, list[list[int]], list[int]]:
     """Longest-Processing-Time-first greedy packing. Items must be sorted descending by dur."""
     workers: list[list[int]] = [[] for _ in range(w)]
@@ -42,14 +64,13 @@ def _improve_pack(
     dur_by_num: dict[int, int],
     lb: int,
 ) -> tuple[int, list[list[int]], list[int]]:
-    """Fast 1-move and 2-swap local search to close any LPT gap to lower bound."""
+    """Fast 1-move, 1-for-1 swap, and bounded 2-for-1 / 1-for-2 swap local search."""
     w = len(workers)
     makespan = max(loads)
     if makespan <= lb:
         return makespan, workers, loads
 
     n_items = sum(len(wk) for wk in workers)
-    # For large item sets, LPT is already within ~1ms of LB; skip costly O(n^2) 2-swaps!
     if n_items > 100 and makespan <= lb + 2:
         return makespan, workers, loads
     max_iters = 8 if n_items > 80 else 64
@@ -83,7 +104,7 @@ def _improve_pack(
         if improved:
             continue
 
-        # 2-swap: swap an item in heaviest worker with a smaller item in another worker
+        # 1-for-1 swap: swap an item in heaviest worker with a smaller item in another worker
         for idx_a, a in enumerate(hi_items):
             da = dur_by_num[a]
             for lo in range(w):
@@ -105,10 +126,132 @@ def _improve_pack(
                     break
             if improved:
                 break
+        if improved:
+            continue
+
+        # Bounded 2-for-1 and 1-for-2 swaps (closes hard multi-item partitions including n > 40)
+        if n_items <= 80 and len(hi_items) <= 24:
+            nh = len(hi_items)
+            hi_durs = [dur_by_num[a] for a in hi_items]
+            for i1 in range(nh):
+                d1 = hi_durs[i1]
+                if d1 == 0:
+                    continue
+                for i2 in range(i1 + 1, nh):
+                    d12 = d1 + hi_durs[i2]
+                    for lo in range(w):
+                        if lo == hi:
+                            continue
+                        lo_items = workers[lo]
+                        if len(lo_items) > 24:
+                            continue
+                        slack = makespan - loads[lo]
+                        for idx_b, b in enumerate(lo_items):
+                            diff = d12 - dur_by_num[b]
+                            if 0 < diff < slack:
+                                a2 = hi_items.pop(i2)
+                                a1 = hi_items.pop(i1)
+                                lo_items[idx_b] = a1
+                                lo_items.append(a2)
+                                hi_items.append(b)
+                                loads[hi] -= diff
+                                loads[lo] += diff
+                                improved = True
+                                break
+                        if improved:
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if improved:
+                continue
+
+            for idx_a, da in enumerate(hi_durs):
+                if da == 0:
+                    continue
+                for lo in range(w):
+                    if lo == hi:
+                        continue
+                    lo_items = workers[lo]
+                    nl = len(lo_items)
+                    if nl < 2 or nl > 24:
+                        continue
+                    slack = makespan - loads[lo]
+                    lo_durs = [dur_by_num[b] for b in lo_items]
+                    for j1 in range(nl):
+                        db1 = lo_durs[j1]
+                        for j2 in range(j1 + 1, nl):
+                            diff = da - (db1 + lo_durs[j2])
+                            if 0 < diff < slack:
+                                a = hi_items[idx_a]
+                                b2 = lo_items.pop(j2)
+                                b1 = lo_items.pop(j1)
+                                hi_items[idx_a] = b1
+                                hi_items.append(b2)
+                                lo_items.append(a)
+                                loads[hi] -= diff
+                                loads[lo] += diff
+                                improved = True
+                                break
+                        if improved:
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
         if not improved:
             break
 
     return max(loads), workers, loads
+
+
+def _exact_w2_dp(
+    items: list[tuple[int, int]],
+    total_ms: int,
+    ub: int,
+    lb: int,
+) -> tuple[int, list[list[int]]] | None:
+    """Exact bitset subset-sum DP for w == 2 (works for ANY n <= 250, typically <0.2ms!)."""
+    pos_items = [(num, dur) for num, dur in items if dur > 0]
+    n = len(pos_items)
+    half = total_ms // 2
+    if n <= 2 or n > 250 or half > 200_000:
+        return None
+    target_s = total_ms - lb
+    if target_s < 0:
+        target_s = 0
+    mask = (1 << (half + 1)) - 1
+    bits = 1
+    dp: list[int] = [1]
+    for _, d in pos_items:
+        bits = (bits | (bits << d)) & mask
+        dp.append(bits)
+        if target_s <= half and ((bits >> target_s) & 1):
+            break
+
+    best_s = target_s if (target_s <= half and ((bits >> target_s) & 1)) else (bits.bit_length() - 1)
+    opt_ms = total_ms - best_s
+    if opt_ms >= ub:
+        return None
+
+    w0: list[int] = []
+    w1: list[int] = []
+    processed = len(dp) - 1
+    for idx in range(processed, n):
+        w1.append(pos_items[idx][0])
+    rem = best_s
+    for idx in range(processed - 1, -1, -1):
+        num, d = pos_items[idx]
+        if rem >= d and ((dp[idx] >> (rem - d)) & 1):
+            w0.append(num)
+            rem -= d
+        else:
+            w1.append(num)
+    for num, dur in items:
+        if dur == 0:
+            w0.append(num)
+    return opt_ms, [w0, w1]
 
 
 def _exact_bnb(
@@ -116,39 +259,53 @@ def _exact_bnb(
     w: int,
     ub: int,
     lb: int,
-    node_limit: int = 4000,
+    node_limit: int = 15000,
 ) -> tuple[int, list[list[int]]] | None:
     """Bounded branch-and-bound for exact makespan when local search didn't hit LB.
 
-    Only considers items with dur > 0 (zero-ms items can go on any worker).
+    Uses duplicate-item symmetry breaking (exact with stable ascending load order),
+    identical-bin-load symmetry breaking, and O(1) last-item leaf evaluation.
     """
     pos_items = [(num, dur) for num, dur in items if dur > 0]
     n = len(pos_items)
     if n <= w or n > 40:
         return None
 
+    durs = [d for _, d in pos_items]
     best_ms = ub
     best_assign: list[int] | None = None
     loads = [0] * w
     assign = [0] * n
     nodes = 0
+    last_idx = n - 1
 
-    def dfs(idx: int, cur_max: int) -> None:
+    def dfs(idx: int, cur_max: int, prev_bin: int) -> None:
         nonlocal best_ms, best_assign, nodes
         nodes += 1
         if nodes > node_limit:
             return
         if cur_max >= best_ms:
             return
-        if idx == n:
-            best_ms = cur_max
-            best_assign = assign.copy()
+
+        dur = durs[idx]
+        if idx == last_idx:
+            min_b = 0
+            min_l = loads[0]
+            for b in range(1, w):
+                if loads[b] < min_l:
+                    min_l = loads[b]
+                    min_b = b
+            nl = min_l + dur
+            cand_max = nl if nl > cur_max else cur_max
+            if cand_max < best_ms:
+                best_ms = cand_max
+                assign[idx] = min_b
+                best_assign = assign.copy()
             return
 
-        _, dur = pos_items[idx]
+        start_b = prev_bin if (idx > 0 and dur == durs[idx - 1]) else 0
         seen_loads: set[int] = set()
-        # Try bins in ascending load order (pruning identical bin loads for symmetry breaking)
-        order = sorted(range(w), key=loads.__getitem__)
+        order = sorted(range(start_b, w), key=loads.__getitem__)
         for b in order:
             lb_bin = loads[b]
             if lb_bin in seen_loads:
@@ -159,12 +316,12 @@ def _exact_bnb(
             seen_loads.add(lb_bin)
             loads[b] = new_load
             assign[idx] = b
-            dfs(idx + 1, new_load if new_load > cur_max else cur_max)
+            dfs(idx + 1, new_load if new_load > cur_max else cur_max, b)
             loads[b] = lb_bin
             if best_ms <= lb or nodes > node_limit:
                 return
 
-    dfs(0, 0)
+    dfs(0, 0, 0)
     if best_assign is None:
         return None
 
@@ -183,8 +340,9 @@ def pack_optimal(test_nums: Sequence[int], dur_by_num: dict[int, int]) -> tuple[
         return 0, []
 
     items = sorted(((n, dur_by_num[n]) for n in test_nums), key=lambda x: (-x[1], x[0]))
-    total_ms = sum(d for _, d in items)
-    max_d = items[0][1]
+    durs_desc = [d for _, d in items]
+    total_ms = sum(durs_desc)
+    max_d = durs_desc[0]
     n = len(items)
 
     # w = 1 baseline
@@ -193,22 +351,31 @@ def pack_optimal(test_nums: Sequence[int], dur_by_num: dict[int, int]) -> tuple[
 
     max_w = min(MAX_WORKERS, n)
     for w in range(2, max_w + 1):
-        lb = max(max_d, (total_ms + w - 1) // w)
+        lb = _pigeonhole_lb(durs_desc, total_ms, w)
         if lb + WORKER_COST_MS * w >= best_cost:
+            if (total_ms + w - 1) // w <= max_d:
+                break
             continue
 
         ms, workers, loads = _lpt_pack(items, w)
         if ms > lb:
             ms, workers, loads = _improve_pack(workers, loads, dur_by_num, lb)
-        if ms > lb and ms + WORKER_COST_MS * w >= best_cost - 500:
-            res = _exact_bnb(items, w, min(ms, best_cost - WORKER_COST_MS * w), lb)
-            if res is not None and res[0] < ms:
-                ms, workers = res
+        if ms > lb:
+            ub_need = min(ms, best_cost - WORKER_COST_MS * w)
+            if ub_need > lb:
+                if w == 2 and n <= 250 and total_ms <= 400_000:
+                    res = _exact_w2_dp(items, total_ms, ub_need, lb)
+                else:
+                    res = _exact_bnb(items, w, ub_need, lb)
+                if res is not None and res[0] < ms:
+                    ms, workers = res
 
         cost = ms + WORKER_COST_MS * w
         if cost < best_cost:
             best_cost = cost
             best_workers = [wk for wk in workers if wk]
+            if ms <= max_d:
+                break
 
     return best_cost, best_workers
 
@@ -251,8 +418,10 @@ def fast_cost_ms(test_nums: Sequence[int] | set[int], dur_by_num: dict[int, int]
     best_cost = total_ms + WORKER_COST_MS
     max_w = min(MAX_WORKERS, n)
     for w in range(2, max_w + 1):
-        lb = max(max_d, (total_ms + w - 1) // w)
+        lb = _pigeonhole_lb(durs, total_ms, w)
         if lb + WORKER_COST_MS * w >= best_cost:
+            if (total_ms + w - 1) // w <= max_d:
+                break
             continue
         loads = [0] * w
         for d in durs:
@@ -263,9 +432,12 @@ def fast_cost_ms(test_nums: Sequence[int] | set[int], dur_by_num: dict[int, int]
                     bl = loads[i]
                     bi = i
             loads[bi] = bl + d
-        cost = max(loads) + WORKER_COST_MS * w
+        ms = max(loads)
+        cost = ms + WORKER_COST_MS * w
         if cost < best_cost:
             best_cost = cost
+            if ms <= max_d:
+                break
     return best_cost
 
 

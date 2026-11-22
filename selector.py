@@ -8,8 +8,6 @@ import marshal
 import os
 import sys
 import time
-import unittest  # Must be imported before sqlglot (exp.UNITTEST = True)
-import zlib
 from pathlib import Path
 
 # Prevent any .pyc writes on read-only filesystem
@@ -21,7 +19,6 @@ sys.stdout = sys.stderr
 
 from candidate_engine import CandidateEngine
 from packer import duration_ms, pack_optimal
-from runner import verify_batch
 
 DATA_DIR = Path(os.environ.get("BLAST_DATA_DIR", "/data"))
 SQLGLOT_ROOT = Path(os.environ.get("SQLGLOT_ROOT", "/sqlglot"))
@@ -30,14 +27,13 @@ MAPS_DIR = Path(os.environ.get("BLAST_MAPS_DIR", str(Path(__file__).resolve().pa
 
 def main() -> None:
     t0 = time.perf_counter()
-    import runner as _runner
+    t_mono0 = time.monotonic()
 
     # Scale wall-clock safety deadline with batch size (180s Practice <=45 commits, 270s Final >45 commits)
     patch_paths = sorted((DATA_DIR / "commits").glob("*.patch"))
     n_commits = len(patch_paths)
     default_budget = 155.0 if n_commits <= 45 else 240.0
     budget = float(os.environ.get("BLAST_BUDGET", default_budget))
-    _runner.DEADLINE = time.monotonic() + budget
 
     # 1. Load runtime tests.json
     tests_list: list[dict] = json.loads((DATA_DIR / "tests.json").read_text(encoding="utf-8"))["tests"]
@@ -49,6 +45,7 @@ def main() -> None:
     if raw_core.exists():
         maps = marshal.loads(raw_core.read_bytes())
     else:
+        import zlib
         core_path = MAPS_DIR / "core_maps.zlib"
         if not core_path.exists():
             core_path = MAPS_DIR / "blast_maps.zlib"
@@ -64,7 +61,13 @@ def main() -> None:
     t_plan = time.perf_counter()
 
     # 4. Verify all non-noop commits with Dual-Fork + Fail-Fast + Slack Absorption
-    selected_by_commit = verify_batch(plans, maps, num_to_test, dur_by_num, SQLGLOT_ROOT, engine=engine)
+    if any(not p.is_noop for p in plans):
+        import unittest  # noqa: F401  # Must be imported before sqlglot (exp.UNITTEST = True)
+        import runner as _runner
+        _runner.DEADLINE = t_mono0 + budget
+        selected_by_commit = _runner.verify_batch(plans, maps, num_to_test, dur_by_num, SQLGLOT_ROOT, engine=engine)
+    else:
+        selected_by_commit = {p.commit: [] for p in plans}
     t_verify = time.perf_counter()
 
     # 5. Pack optimally (<= 8 workers) and emit strict JSONL to REAL_STDOUT
