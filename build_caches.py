@@ -145,15 +145,48 @@ def main() -> None:
     # 2. Pure-Python pre-parsed TPC-DS & TPC-H CSV tables
     n_tbl, tbl_bytes = _build_tpc_tables(sg_root)
 
-    # 3. Per-query uncompressed TPC-DS AST & Plan caches for /sqlglot (and /sqlglot-c if present)
+    # 3. Per-query uncompressed TPC-DS AST & Plan caches for /sqlglot, /sqlglot-c, and /sqlglot-c-base
     n_py = _build_tpc_cache_for_root("/sqlglot", "/app/tpc_cache_py")
     n_c = 0
     if Path("/sqlglot-c/sqlglot").is_dir():
         n_c = _build_tpc_cache_for_root("/sqlglot-c", "/app/tpc_cache_c")
+    n_cb = 0
+    if Path("/sqlglot-c-base/sqlglot").is_dir():
+        n_cb = _build_tpc_cache_for_root("/sqlglot-c-base", "/app/tpc_cache_cb")
+
+    # 4. Precompute exact baseline PythonExecutor result (columns, rows) for all 57 TPC-DS queries
+    #    so duckdb-only commits skip PythonExecutor completely (~300x faster)!
+    rows_code = """
+import pickle, sys
+from pathlib import Path
+sys.path.insert(0, "/sqlglot")
+sys.path.insert(0, "/app")
+import runner, candidate_engine as ce, tests.helpers as th
+from sqlglot.executor.python import PythonExecutor
+from sqlglot.executor.table import Table, ensure_tables
+
+runner._install_fast_python_executor(ce.CommitPlan(commit="cache", is_noop=False))
+tables = {}
+for tname in th.TPCDS_SCHEMA:
+    ct, rs = pickle.loads(Path(f"/app/tpc_tables/tpcds/{tname}.pkl").read_bytes())
+    tables[tname] = Table(columns=ct, rows=list(rs))
+out = Path("/app/tpc_rows")
+out.mkdir(parents=True, exist_ok=True)
+cnt = 0
+for p in sorted(Path("/app/tpc_cache_py").glob("*.pkl")):
+    qi = int(p.stem)
+    _, plan = pickle.loads(p.read_bytes())
+    tbl = PythonExecutor(tables=ensure_tables(tables)).execute(plan)
+    (out / f"{qi}.pkl").write_bytes(pickle.dumps((tuple(tbl.columns), list(tbl.rows)), protocol=pickle.HIGHEST_PROTOCOL))
+    cnt += 1
+print(cnt)
+"""
+    res_r = subprocess.run([sys.executable, "-c", rows_code], capture_output=True, text=True, check=True)
+    n_rows = int(res_r.stdout.strip().splitlines()[-1])
 
     print(
         f"[build_caches] fixtures={len(fixture_pairs)}p/{len(fixture_singles)}s ({len(fix_blob)/1024:.1f} KB), "
-        f"tpc_tables={n_tbl} ({tbl_bytes/1024:.1f} KB), tpc_cache py={n_py} c={n_c} "
+        f"tpc_tables={n_tbl} ({tbl_bytes/1024:.1f} KB), tpc_cache py={n_py} c={n_c} cb={n_cb} rows={n_rows} "
         f"in {time.perf_counter() - t0:.2f}s",
         flush=True,
     )

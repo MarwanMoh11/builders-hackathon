@@ -1360,6 +1360,19 @@ class CandidateEngine:
                             ("sqlglot/parser.py", {2557, 2848}),
                             ("sqlglot/generator.py", {1403, 1932}),
                         ]
+                    elif attr == "SHOW_PARSERS":
+                        meta_line_specs = [
+                            ("sqlglot/parser.py", {10083}),
+                            ("sqlglot/parsers/singlestore.py", {197}),
+                        ]
+                    elif attr == "SET_PARSERS":
+                        meta_line_specs = [
+                            ("sqlglot/parser.py", {10118}),
+                            ("sqlglot/parsers/duckdb.py", {328}),
+                            ("sqlglot/parsers/mysql.py", {259}),
+                            ("sqlglot/parsers/spark.py", {64}),
+                            ("sqlglot/parsers/teradata.py", {191}),
+                        ]
                     elif attr in ("TIME_MAPPING", "FORMAT_MAPPING", "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING"):
                         ml_by_file: dict[str, set[int]] = {"sqlglot/time.py": set(range(1, 120))}
                         for ta in (
@@ -1520,6 +1533,19 @@ class CandidateEngine:
                     cls_meta_specs = [
                         ("sqlglot/parser.py", {2557, 2848}),
                         ("sqlglot/generator.py", {1403, 1932}),
+                    ]
+                elif attr == "SHOW_PARSERS":
+                    cls_meta_specs = [
+                        ("sqlglot/parser.py", {10083}),
+                        ("sqlglot/parsers/singlestore.py", {197}),
+                    ]
+                elif attr == "SET_PARSERS":
+                    cls_meta_specs = [
+                        ("sqlglot/parser.py", {10118}),
+                        ("sqlglot/parsers/duckdb.py", {328}),
+                        ("sqlglot/parsers/mysql.py", {259}),
+                        ("sqlglot/parsers/spark.py", {64}),
+                        ("sqlglot/parsers/teradata.py", {191}),
                     ]
 
                 if cls_meta_specs is not None:

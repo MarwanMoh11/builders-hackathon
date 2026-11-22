@@ -1115,8 +1115,10 @@ def _fast_compare_rows(
 
 
 _SQLGLOT_C_ROOT = Path("/sqlglot-c")
-_COMPILED_C_FILES_CACHE: frozenset[str] | None = None
-_TPC_CACHE_BY_Q: dict[tuple[bool, int], Any] = {}
+_SQLGLOT_CB_ROOT = Path("/sqlglot-c-base")
+_COMPILED_C_FILES_CACHE: dict[Path, frozenset[str]] = {}
+_TPC_CACHE_BY_Q: dict[tuple[str, int], Any] = {}
+_TPC_ROWS_BY_Q: dict[int, Any] = {}
 _FIXTURE_CACHE: dict[str, Any] | None = None
 _SPEED_SCALE: float = 1.0
 
@@ -1130,24 +1132,25 @@ _PURE_ONLY_TEST_IDS: frozenset[str] = frozenset({
 })
 
 
-def _get_compiled_c_files() -> frozenset[str]:
-    """Discover exact .py relative paths that have compiled .so counterparts in /sqlglot-c."""
-    global _COMPILED_C_FILES_CACHE
-    if _COMPILED_C_FILES_CACHE is not None:
-        return _COMPILED_C_FILES_CACHE
-    sg_c = _SQLGLOT_C_ROOT / "sqlglot"
+def _get_compiled_c_files(root: Path = _SQLGLOT_C_ROOT) -> frozenset[str]:
+    """Discover exact .py relative paths that have compiled .so counterparts in `root`."""
+    cached = _COMPILED_C_FILES_CACHE.get(root)
+    if cached is not None:
+        return cached
+    sg_c = root / "sqlglot"
     if not sg_c.is_dir():
-        _COMPILED_C_FILES_CACHE = frozenset()
-        return _COMPILED_C_FILES_CACHE
+        _COMPILED_C_FILES_CACHE[root] = frozenset()
+        return _COMPILED_C_FILES_CACHE[root]
     out: set[str] = set()
     for p in sg_c.rglob("*.so"):
-        rel = p.relative_to(_SQLGLOT_C_ROOT).as_posix()
+        rel = p.relative_to(root).as_posix()
         stem_part = rel.split(".cpython-", 1)[0]
         if stem_part.endswith("__mypyc"):
             continue
         out.add(stem_part + ".py")
-    _COMPILED_C_FILES_CACHE = frozenset(out)
-    return _COMPILED_C_FILES_CACHE
+    res = frozenset(out)
+    _COMPILED_C_FILES_CACHE[root] = res
+    return res
 
 
 def _unpack_expr(x: Any) -> Any:
@@ -1184,12 +1187,12 @@ def _load_fixture_cache() -> dict[str, Any]:
     return _FIXTURE_CACHE
 
 
-def _load_tpc_cache_query(qidx: int, is_c_root: bool) -> Any:
+def _load_tpc_cache_query(qidx: int, root_tag: str) -> Any:
     """Lazy per-query uncompressed TPC-DS AST/Plan loader (~2ms/query vs ~950ms monolithic!)."""
-    key = (is_c_root, qidx)
+    key = (root_tag, qidx)
     if key in _TPC_CACHE_BY_Q:
         return _TPC_CACHE_BY_Q[key]
-    base = Path("/app/tpc_cache_c" if is_c_root else "/app/tpc_cache_py")
+    base = Path(f"/app/tpc_cache_{root_tag}")
     p = base / f"{qidx}.pkl"
     if p.exists():
         try:
@@ -1199,6 +1202,22 @@ def _load_tpc_cache_query(qidx: int, is_c_root: bool) -> Any:
         except Exception:
             pass
     _TPC_CACHE_BY_Q[key] = None
+    return None
+
+
+def _load_tpc_rows_query(qidx: int) -> Any:
+    """Lazy per-query baseline PythonExecutor (columns, rows) loader for zero-executor duckdb checks."""
+    if qidx in _TPC_ROWS_BY_Q:
+        return _TPC_ROWS_BY_Q[qidx]
+    p = Path(f"/app/tpc_rows/{qidx}.pkl")
+    if p.exists():
+        try:
+            val = pickle.loads(p.read_bytes())
+            _TPC_ROWS_BY_Q[qidx] = val
+            return val
+        except Exception:
+            pass
+    _TPC_ROWS_BY_Q[qidx] = None
     return None
 
 
@@ -1991,7 +2010,13 @@ def _patch_executor_module(
             )
         )
         from sqlglot.expressions import core as _sg_ec
-        is_c_root = (getattr(_sg_ec, "__file__", "") or "").endswith(".so")
+        _ec_file = getattr(_sg_ec, "__file__", "") or ""
+        if "/sqlglot-c-base/" in _ec_file:
+            root_tag = "cb"
+        elif "/sqlglot-c/" in _ec_file or _ec_file.endswith(".so"):
+            root_tag = "c"
+        else:
+            root_tag = "py"
 
         rem_outer_init = signal.getitimer(signal.ITIMER_REAL)[0]
         outer_has_timer = rem_outer_init > 0.0
@@ -2086,7 +2111,7 @@ def _patch_executor_module(
                         and qm.get("execute")
                         and not fixture_touched
                     )
-                    cached_entry = _load_tpc_cache_query(qidx, is_c_root) if (tpc_opt_cache_ok and base_ok) else None
+                    cached_entry = _load_tpc_cache_query(qidx, root_tag) if (tpc_opt_cache_ok and base_ok) else None
                     if duckdb_only_tpc and base_ok and cached_entry is not None:
                         duck_sql = transpile(sql, write="duckdb")[0]
                         duck_hash = hashlib.blake2b(duck_sql.encode(), digest_size=12).hexdigest()
@@ -2095,17 +2120,18 @@ def _patch_executor_module(
                             done_w += q_weights[q_pos]
                             q_done += 1
                             continue
-                        ran_heavy = True
-                        plan = cached_entry[1]
                         expr = parse_one(sql)
-                        q_tables = {}
-                        t_names = []
-                        for tbl in find_tables(expr):
-                            name = tbl.name
-                            q_tables[name] = tables[name]
-                            t_names.append(name)
-                        tables_ = ensure_tables(q_tables)
-                        table = PythonExecutor(tables=tables_).execute(plan)
+                        t_names = [tbl.name for tbl in find_tables(expr)]
+                        cached_rows = _load_tpc_rows_query(qidx)
+                        if cached_rows is not None:
+                            from sqlglot.executor.table import Table as _ETbl
+                            table = _ETbl(columns=cached_rows[0], rows=cached_rows[1])
+                        else:
+                            ran_heavy = True
+                            plan = cached_entry[1]
+                            q_tables = {name: tables[name] for name in t_names}
+                            tables_ = ensure_tables(q_tables)
+                            table = PythonExecutor(tables=tables_).execute(plan)
                     elif cached_entry is not None and not executor_init_touched:
                         expr = None
                         duck_sql = None
@@ -2805,6 +2831,7 @@ def _execute_commit_verification(
     ACTIVE_ENGINE = engine
     LAST_FAILED_TPCDS_QIDX = 0
     is_c_root = (sqlglot_root == _SQLGLOT_C_ROOT)
+    is_cb_root = (sqlglot_root == _SQLGLOT_CB_ROOT)
 
     _install_fast_test_patches(maps, commit_plan, sqlglot_root)
 
@@ -3192,12 +3219,15 @@ def _execute_commit_verification(
     # the buckets keep an early overshoot from condemning hundreds of cheap tests.
     cal_act = [0.0, 0.0, 0.0, 0.0]
     cal_est = [0.0, 0.0, 0.0, 0.0]
-    _CAL_PRIOR = (0.90, 0.75, 0.60, 0.70) if is_c_root else (1.65, 1.35, 1.0, 1.15)
+    _CAL_PRIOR = (
+        (0.90, 0.75, 0.60, 0.70) if is_c_root else
+        ((1.15, 1.00, 0.85, 0.95) if is_cb_root else (1.65, 1.35, 1.0, 1.15))
+    )
     _CAL_W0 = (250.0, 250.0, 1e12, 120.0)
 
     def _rho(c: int) -> float:
         r = (cal_act[c] + _CAL_PRIOR[c] * _CAL_W0[c]) / (cal_est[c] + _CAL_W0[c])
-        lo = 0.25 if is_c_root else 0.40
+        lo = 0.25 if (is_c_root or is_cb_root) else 0.40
         return lo if r < lo else (3.5 if r > 3.5 else r)
 
     def _cal_idx(t: int) -> int:
@@ -3701,8 +3731,10 @@ def verify_batch(
 
     # NOTE: duckdb, numpy, pandas are imported lazily ONLY when a test actually executes them!
     os.environ["SKIP_INTEGRATION"] = "0"
-    compiled_c_files = _get_compiled_c_files()
+    compiled_c_files = _get_compiled_c_files(_SQLGLOT_C_ROOT)
     has_sqlglot_c = bool(compiled_c_files) and _SQLGLOT_C_ROOT.is_dir()
+    compiled_cb_files = _get_compiled_c_files(_SQLGLOT_CB_ROOT)
+    has_sqlglot_cb = bool(compiled_cb_files) and _SQLGLOT_CB_ROOT.is_dir()
 
     lazy_tid = next(
         (n for n, t in num_to_test.items() if t["id"].endswith("::test_lazy_load")),
@@ -3719,11 +3751,24 @@ def verify_batch(
         touched = set(plan.patched_files) | set(plan.deleted_files)
         return touched.isdisjoint(compiled_c_files)
 
+    def _can_use_cb(plan: CommitPlan) -> bool:
+        if not has_sqlglot_cb:
+            return False
+        touched = set(plan.patched_files) | set(plan.deleted_files)
+        return touched.isdisjoint(compiled_cb_files)
+
     # Helper to run a full_fork commit in a clean child BEFORE sqlglot is imported in parent!
     def _run_full_fork_child(plan: CommitPlan, root_override: Path | None = None) -> list[int]:
-        use_root = root_override if root_override is not None else (_SQLGLOT_C_ROOT if _can_use_c(plan) else sqlglot_root)
-        # Ensure use_root is first on sys.path (never mix /sqlglot and /sqlglot-c!)
-        for rp in (str(sqlglot_root), str(_SQLGLOT_C_ROOT)):
+        if root_override is not None:
+            use_root = root_override
+        elif _can_use_c(plan):
+            use_root = _SQLGLOT_C_ROOT
+        elif _can_use_cb(plan):
+            use_root = _SQLGLOT_CB_ROOT
+        else:
+            use_root = sqlglot_root
+        # Ensure use_root is first on sys.path (never mix /sqlglot, /sqlglot-c, /sqlglot-c-base!)
+        for rp in (str(sqlglot_root), str(_SQLGLOT_C_ROOT), str(_SQLGLOT_CB_ROOT)):
             while rp in sys.path:
                 sys.path.remove(rp)
         sys.path.insert(0, str(use_root))
@@ -3803,11 +3848,17 @@ def verify_batch(
         return eager_f, lazy_f, hot_f, fix_f
 
     c_plans_all: list[CommitPlan] = []
+    cb_plans_all: list[CommitPlan] = []
     py_plans_all: list[CommitPlan] = []
     pure_hold_by_commit: dict[str, tuple[CommitPlan, set[int]]] = {}
 
     for p in active_plans:
+        target_bucket: list[CommitPlan] | None = None
         if _can_use_c(p):
+            target_bucket = c_plans_all
+        elif _can_use_cb(p):
+            target_bucket = cb_plans_all
+        if target_bucket is not None:
             ph = p.candidates & pure_only_tids
             if ph and p.candidates <= pure_only_tids:
                 py_plans_all.append(p)
@@ -3816,13 +3867,14 @@ def verify_batch(
                 c_p.candidates = p.candidates - ph
                 c_p.force_report = p.force_report - ph
                 pure_hold_by_commit[p.commit] = (p, ph)
-                c_plans_all.append(c_p)
+                target_bucket.append(c_p)
             else:
-                c_plans_all.append(p)
+                target_bucket.append(p)
         else:
             py_plans_all.append(p)
 
     c_eager, c_lazy, c_hot, c_fix = _split_plans(c_plans_all)
+    cb_eager, cb_lazy, cb_hot, cb_fix = _split_plans(cb_plans_all)
 
     # Preload pure-Python fixture cache (zero sqlglot imports!) and shared subtest maps ONCE before os.fork()!
     _load_fixture_cache()
@@ -3855,7 +3907,7 @@ def verify_batch(
         """Runs inside ONE forked child that imports sqlglot core from `warm_root` ONCE:
         Phase A: runs wz_lazy in 1ms CoW forks with zero-dialect & deferred-dialect shared test modules preloaded!
         Phase B: pre-imports remaining shared test modules, freezes heap, then runs wz_hot FIRST and wz_fix AFTER."""
-        for rp in (str(sqlglot_root), str(_SQLGLOT_C_ROOT)):
+        for rp in (str(sqlglot_root), str(_SQLGLOT_C_ROOT), str(_SQLGLOT_CB_ROOT)):
             while rp in sys.path:
                 sys.path.remove(rp)
         sys.path.insert(0, str(warm_root))
@@ -4125,11 +4177,15 @@ def verify_batch(
                 except Exception:
                     results[cid] = _safe_fallback_tests(plan)
 
-    # Tier 1: C-accelerated /sqlglot-c (eager forks + C-Warm Zygote)
+    # Tier 1: C-accelerated /sqlglot-c (94 mods, pure-Python optimizer/*; eager forks + C-Warm Zygote)
     if has_sqlglot_c and c_plans_all:
         _run_tier(_SQLGLOT_C_ROOT, c_eager, c_lazy, c_hot, c_fix)
 
-    # Resolve tiny _PURE_ONLY_TIDS held aside from C-runs: absorb for free if zero slack cost, else verify in Pure tier!
+    # Tier 2: C-base /sqlglot-c-base (22 core mods; covers parsers/*, generators/*, parser.py, generator.py!)
+    if has_sqlglot_cb and cb_plans_all:
+        _run_tier(_SQLGLOT_CB_ROOT, cb_eager, cb_lazy, cb_hot, cb_fix)
+
+    # Resolve tiny _PURE_ONLY_TIDS held aside from C/C-base runs: absorb for free if zero slack cost, else verify in Pure tier!
     pure_tail_map: dict[str, str] = {}
     for orig_cid, (orig_plan, ph) in pure_hold_by_commit.items():
         c_fail = set(results.get(orig_cid, []))

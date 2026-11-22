@@ -1,10 +1,11 @@
-"""Parallel 4-core clang builder for Official sqlglotc (104 modules from sqlglotc/setup.py).
+"""Parallel 4-core clang builder for 3-tier sqlglotc (0 bytes in git repo).
 
-Runs inside Dockerfile Stage 1 (adds 0 bytes to git repo).
-Uses mypycify(separate=True) for codegen, then compiles all ~208 extensions in true
-parallel across all available CPU cores (LPT-sorted largest .c first), applying
--O1 -DNDEBUG to the 29 hot core/expression/optimizer/executor/python-gen modules and
--O0 -DNDEBUG to the remaining 75 dialect/minor modules.
+Modes:
+  no_opt (default): 94 modules (all official sqlglotc EXCEPT sqlglot/optimizer/*),
+    so optimizer/* commits ALSO run with 100% C-compiled Parser/Generator/Expr/Tokenizer/Table!
+  base: 22 core modules (expressions/*, tokenizer_core, trie, helper, time, serde, errors, table),
+    so parsers/*, generators/*, parser.py, generator.py commits get 4.1x faster imports + 1.44x speedup!
+  full: all 104 official sqlglotc modules.
 """
 
 from __future__ import annotations
@@ -58,48 +59,80 @@ def _subpkg_files(sg_dir: Path, sub: str, files: list[str] | None = None) -> lis
 
 def main() -> None:
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/sqlglot-c")
+    mode = sys.argv[2] if len(sys.argv) > 2 else "no_opt"
     os.chdir(root)
     os.environ["MYPYPATH"] = str(root)
     sg_dir = root / "sqlglot"
 
-    # Exact 104 modules from official sqlglotc/setup.py
-    source_files = [
-        "sqlglot/anonymize.py",
-        "sqlglot/errors.py",
-        "sqlglot/generator.py",
-        "sqlglot/helper.py",
-        "sqlglot/lineage.py",
-        "sqlglot/parser.py",
-        "sqlglot/serde.py",
-        "sqlglot/time.py",
-        "sqlglot/tokenizer_core.py",
-        "sqlglot/trie.py",
-        *_subpkg_files(sg_dir, "expressions"),
-        *_subpkg_files(sg_dir, "generators"),
-        *_subpkg_files(
-            sg_dir,
-            "optimizer",
-            [
-                "scope.py",
-                "resolver.py",
-                "isolate_table_selects.py",
-                "normalize_identifiers.py",
-                "qualify.py",
-                "qualify_tables.py",
-                "qualify_columns.py",
-                "simplify.py",
-                "annotate_types.py",
-                "canonicalize_internal_names.py",
-            ],
-        ),
-        *_subpkg_files(sg_dir, "parsers"),
-        *_subpkg_files(sg_dir, "executor", ["table.py"]),
-    ]
+    if mode == "base":
+        source_files = [
+            "sqlglot/errors.py",
+            "sqlglot/helper.py",
+            "sqlglot/serde.py",
+            "sqlglot/time.py",
+            "sqlglot/tokenizer_core.py",
+            "sqlglot/trie.py",
+            *_subpkg_files(sg_dir, "expressions"),
+            *_subpkg_files(sg_dir, "executor", ["table.py"]),
+        ]
+    elif mode == "no_opt":
+        source_files = [
+            "sqlglot/anonymize.py",
+            "sqlglot/errors.py",
+            "sqlglot/generator.py",
+            "sqlglot/helper.py",
+            "sqlglot/lineage.py",
+            "sqlglot/parser.py",
+            "sqlglot/serde.py",
+            "sqlglot/time.py",
+            "sqlglot/tokenizer_core.py",
+            "sqlglot/trie.py",
+            *_subpkg_files(sg_dir, "expressions"),
+            *_subpkg_files(sg_dir, "generators"),
+            *_subpkg_files(sg_dir, "parsers"),
+            *_subpkg_files(sg_dir, "executor", ["table.py"]),
+        ]
+    else:
+        source_files = [
+            "sqlglot/anonymize.py",
+            "sqlglot/errors.py",
+            "sqlglot/generator.py",
+            "sqlglot/helper.py",
+            "sqlglot/lineage.py",
+            "sqlglot/parser.py",
+            "sqlglot/serde.py",
+            "sqlglot/time.py",
+            "sqlglot/tokenizer_core.py",
+            "sqlglot/trie.py",
+            *_subpkg_files(sg_dir, "expressions"),
+            *_subpkg_files(sg_dir, "generators"),
+            *_subpkg_files(
+                sg_dir,
+                "optimizer",
+                [
+                    "scope.py",
+                    "resolver.py",
+                    "isolate_table_selects.py",
+                    "normalize_identifiers.py",
+                    "qualify.py",
+                    "qualify_tables.py",
+                    "qualify_columns.py",
+                    "simplify.py",
+                    "annotate_types.py",
+                    "canonicalize_internal_names.py",
+                ],
+            ),
+            *_subpkg_files(sg_dir, "parsers"),
+            *_subpkg_files(sg_dir, "executor", ["table.py"]),
+        ]
 
     t0 = time.time()
     exts = mypycify(source_files, opt_level="1", debug_level="0", separate=True, verbose=False)
     t_gen = time.time() - t0
-    print(f"[sqlglotc] mypyc codegen ({len(source_files)} files -> {len(exts)} exts): {t_gen:.1f}s", flush=True)
+    print(
+        f"[sqlglotc:{mode}] mypyc codegen ({len(source_files)} files -> {len(exts)} exts): {t_gen:.1f}s",
+        flush=True,
+    )
 
     py_inc = sysconfig.get_path("include")
     ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
@@ -109,7 +142,6 @@ def main() -> None:
     cc = shutil.which("clang") or "gcc"
     n_workers = max(1, os.cpu_count() or 4)
 
-    # Build parallel compile jobs sorted largest source first (LPT) so big files never straggle!
     jobs: list[tuple[int, str, list[str], list[str], str, bool]] = []
     n_hot = 0
     for ext in exts:
@@ -121,14 +153,16 @@ def main() -> None:
         if parts[0] == "sqlglot":
             dst_so = str(sg_dir.joinpath(*parts[1:-1], parts[-1] + ext_suffix))
         else:
-            # Shared runtime lib (HASH__mypyc) lives inside sqlglot/ so sqlglot/__init__.py finds it
             dst_so = str(sg_dir / (ext.name + ext_suffix))
         incs = [py_inc, *ext.include_dirs]
         total_sz = sum(os.path.getsize(s) for s in ext.sources if os.path.exists(s))
         jobs.append((total_sz, ext.name, list(ext.sources), incs, dst_so, is_hot))
 
     jobs.sort(key=lambda x: -x[0])
-    print(f"[sqlglotc] compiling {len(jobs)} exts ({n_hot} -O1, {len(jobs)-n_hot} -O0) with {cc} -j{n_workers}", flush=True)
+    print(
+        f"[sqlglotc:{mode}] compiling {len(jobs)} exts ({n_hot} -O1, {len(jobs)-n_hot} -O0) with {cc} -j{n_workers}",
+        flush=True,
+    )
 
     base_flags = [
         "-fPIC",
@@ -172,13 +206,12 @@ def main() -> None:
             fut.result()
     t_cc = time.time() - t_cc0
 
-    # Clean intermediate build artifacts to keep final layer slim
     shutil.rmtree(root / "build", ignore_errors=True)
     for egg in root.glob("*.egg-info"):
         shutil.rmtree(egg, ignore_errors=True)
 
     print(
-        f"[sqlglotc] DONE in {time.time() - t0:.1f}s (codegen={t_gen:.1f}s, parallel_cc={t_cc:.1f}s, workers={n_workers})",
+        f"[sqlglotc:{mode}] DONE in {time.time() - t0:.1f}s (codegen={t_gen:.1f}s, parallel_cc={t_cc:.1f}s, workers={n_workers})",
         flush=True,
     )
 
