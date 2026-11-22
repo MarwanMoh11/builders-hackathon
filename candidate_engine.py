@@ -24,6 +24,7 @@ from patch_analyzer import (
     diff_sql_fixture_pairs,
     parse_unified_diff,
 )
+import dep_index as _di
 
 
 @dataclass
@@ -112,6 +113,17 @@ class CandidateEngine:
         self._line_cov_inline: dict[str, dict[int, list[int]]] | None = maps.get("line_cov")
         self._line_cov_index: dict[str, int] = maps.get("line_cov_index", {})
         self._line_cov_cache: dict[str, dict[int, list[int]]] = {}
+
+        # Optional build-time exact (receiver_cls, attr/dispatch/dict_with_misses) dependency index (Wave 2A)
+        self._dep_index: dict[str, Any] | None = _di.load_dep_index()
+        if self._dep_index is not None:
+            self._dep_tracked_attrs: frozenset[str] = frozenset(self._dep_index.get("tracked_attrs", ()))
+            self._dep_tracked_dicts: frozenset[str] = frozenset(self._dep_index.get("tracked_dicts", ()))
+            self._dep_always_keep_rnums: set[int] = self._to_rnums(self._dep_index.get("always_keep_mtids", ()))
+        else:
+            self._dep_tracked_attrs = frozenset()
+            self._dep_tracked_dicts = frozenset()
+            self._dep_always_keep_rnums = set()
 
         self.typing_test_num = self.id_to_num.get(
             "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
@@ -1553,8 +1565,7 @@ class CandidateEngine:
 
             dep_graph = self._get_class_dep_graph()
 
-            # CATASTROPHIC FIX (#6.1): Generator.TRANSFORMS is copied via C PyDict_Merge into _DISPATCH_CACHE,
-            # bypassing TrackedDict! Always derive hits from dialect_hits & expr_hits (or full dialect_hits).
+            # CATASTROPHIC FIX (#6.1) + Wave 2A Exact Generator.sql Dispatch Index (hits + misses!):
             if attr == "TRANSFORMS":
                 dialect_hits = self._dialect_hits_for_owners(owners)
                 mtid_hits_t: set[int] = set()
@@ -1567,6 +1578,48 @@ class CandidateEngine:
                         for kr in unit.dict_keys:
                             mtid_hits_t.update(self._match_dict_key(o, attr, kr))
                 direct_hits = self._to_rnums(mtid_hits_t) | self._tests_covering_lines(rel, unit.old_lines)
+
+                # Wave 2A: Exact (GenCls, ExprCls) dispatch + direct TRANSFORMS reads (works for adds/edits/deletes!)
+                if (
+                    self._dep_index is not None
+                    and unit.dict_keys is not None
+                    and not (attr in dep_graph["attr_mutators"] and unit.dict_deleted_keys)
+                ):
+                    all_expr_d = True
+                    expr_subs_d: set[str] = set()
+                    for kr in unit.dict_keys:
+                        ck = _di.canon_source_key(kr, self.all_expr_classes)
+                        if ck is not None and ck.startswith("E:"):
+                            for sc in self._subclasses_of(ck[2:]):
+                                expr_subs_d.add(sc)
+                        else:
+                            all_expr_d = False
+                            break
+                    if all_expr_d and expr_subs_d:
+                        gd = self._dep_index["gen_dispatch"]
+                        db_ra = self._dep_index["dict_by_ra"]
+                        exact_m: set[int] = set()
+                        for o in owners:
+                            for sc in expr_subs_d:
+                                exact_m.update(gd.get((o, sc), ()))
+                            t_map = db_ra.get((o, "TRANSFORMS"))
+                            if t_map:
+                                exact_m.update(t_map.get("*", ()))
+                                for sc in expr_subs_d:
+                                    exact_m.update(t_map.get(f"E:{sc}", ()))
+                        hits = (
+                            self._to_rnums(exact_m)
+                            | (self._dep_always_keep_rnums & (dialect_hits | self._to_rnums(self.maps["file_cov"].get(rel, []))))
+                            | self._tests_covering_lines(rel, unit.old_lines)
+                        )
+                        if unit.class_name and unit.class_name.split(".")[0] not in self.all_dialect_family:
+                            hits.update(self._to_rnums(self.maps["file_cov"].get(rel, [])))
+                        candidates.update(hits)
+                        spec = ("transforms", (owners, sorted(expr_subs_d), rel, unit.old_lines))
+                        for rnum in hits:
+                            if rnum in has_sub:
+                                deferred_subtests.setdefault(rnum, []).append(spec)
+                        return
 
                 use_expr_inter = False
                 expr_subs: set[str] = set()
@@ -1603,6 +1656,54 @@ class CandidateEngine:
                     if rnum in has_sub:
                         deferred_subtests.setdefault(rnum, []).append(spec)
                 return
+
+            # Wave 2A: Exact receiver-bound dict lookup index (INCLUDING MISSES + "*" iteration!)
+            # Handles adds, edits, and deletes on tracked Parser/Generator dicts without dialect-wide fallback!
+            if (
+                self._dep_index is not None
+                and attr in self._dep_tracked_dicts
+                and attr not in _di.META_SKIP_ATTRS
+                and unit.dict_keys is not None
+                and not (
+                    attr in ({"SHOW_PARSERS", "SET_PARSERS", "NO_PAREN_FUNCTIONS", "QUERY_MODIFIER_PARSERS"} if unit.class_name == "Parser" else {"SHOW_PARSERS", "SET_PARSERS"})
+                    and bool(unit.dict_added_keys or unit.dict_deleted_keys)
+                )
+                and not (bool(unit.dict_deleted_keys) and attr in dep_graph["attr_mutators"])
+            ):
+                canon_ks: list[str] = []
+                all_ck_ok = True
+                for kr in unit.dict_keys:
+                    ck = _di.canon_source_key(kr, self.all_expr_classes)
+                    if ck is None:
+                        all_ck_ok = False
+                        break
+                    canon_ks.append(ck)
+                if all_ck_ok and canon_ks:
+                    db_ra = self._dep_index["dict_by_ra"]
+                    exact_dm: set[int] = set()
+                    for o in owners:
+                        dmap = db_ra.get((o, attr))
+                        if dmap:
+                            exact_dm.update(dmap.get("*", ()))
+                            for ck in canon_ks:
+                                exact_dm.update(dmap.get(ck, ()))
+                                if ck.startswith("E:"):
+                                    for sc in self._subclasses_of(ck[2:]):
+                                        exact_dm.update(dmap.get(f"E:{sc}", ()))
+                    dialect_hits_d = self._dialect_hits_for_owners(owners)
+                    hits = (
+                        self._to_rnums(exact_dm)
+                        | (self._dep_always_keep_rnums & (dialect_hits_d | self._to_rnums(self.maps["file_cov"].get(rel, []))))
+                        | self._tests_covering_lines(rel, unit.old_lines)
+                    )
+                    if unit.class_name and unit.class_name.split(".")[0] not in self.all_dialect_family:
+                        hits.update(self._to_rnums(self.maps["file_cov"].get(rel, [])))
+                    candidates.update(hits)
+                    spec = ("dict_key", (owners, attr, unit.dict_keys, rel, unit.old_lines))
+                    for rnum in hits:
+                        if rnum in has_sub:
+                            deferred_subtests.setdefault(rnum, []).append(spec)
+                    return
 
             tracked = any(attr in self.dict_keys_by_oa.get(o, {}) for o in owners)
             if tracked:
@@ -2040,6 +2141,47 @@ class CandidateEngine:
                     attr in self._get_non_runtime_info(rf)[1]
                     for rf in (rev_cl_c | core_meta_files)
                 )
+                # Wave 2A: Exact (receiver_cls, attr_name) read index (zero dialect cross-contamination!)
+                if (
+                    self._dep_index is not None
+                    and attr != "*"
+                    and attr in self._dep_tracked_attrs
+                    and attr not in self.dialect_meta_attrs
+                    and attr not in _di.META_SKIP_ATTRS
+                    and not has_non_rt_reader
+                    and not has_scoped_cb_ref
+                ):
+                    ar_map = self._dep_index["attr_reads"]
+                    owners_a = self._expand_class_and_copiers(unit.class_name, attr)
+                    exact_am: set[int] = set()
+                    for o in owners_a:
+                        exact_am.update(ar_map.get((o, attr), ()))
+                    exact_rnums = self._to_rnums(exact_am)
+                    spec_u: tuple[str, Any] = ("dialect_readers", (subs, base_cls, readers)) if readers else ("dialect", (subs, base_cls))
+                    if readers:
+                        g_exprs = self._guarded_isinstance_exprs(attr, readers)
+                        if g_exprs:
+                            g_hits: set[int] = set()
+                            for ec in g_exprs:
+                                g_hits.update(self._to_rnums(self.maps["expr_to_tests"].get(ec, [])))
+                            if exact_rnums & g_hits:
+                                exact_rnums = exact_rnums & g_hits
+                                spec_u = ("dialect_readers_exprs", (subs, base_cls, readers, g_exprs))
+                    hits = (
+                        exact_rnums
+                        | (self._dep_always_keep_rnums & (dialect_hits | self._to_rnums(self.maps["file_cov"].get(rel, []))))
+                        | non_rt_extra_c
+                        | self._tests_covering_lines(rel, unit.old_lines)
+                    )
+                    candidates.update(hits)
+                    for rnum in hits:
+                        if rnum in non_rt_extra_c:
+                            for tag in has_sub.get(rnum, ()):
+                                self._add_subtest_filter(subtest_filters, rnum, tag, None)
+                        elif rnum in has_sub:
+                            deferred_subtests.setdefault(rnum, []).append(spec_u)
+                    return
+
                 can_intersect = (
                     attr != "*"
                     and attr not in self.dialect_meta_attrs

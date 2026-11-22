@@ -1,24 +1,17 @@
-"""Dependency-checked stage-reuse replay & lazy DuckDB query cache (Wave 1 / v4).
+"""Dependency-checked stage-reuse replay (coarse + fine-grained), Executor replay,
+Lazy DuckDB query cache, and Lazy SQLite query cache (Wave 1 + Wave 2 / v5).
 
 All index data is generated at Docker build time from pinned sqlglot@eb11aec (0 bytes in Git):
-  1. /app/val_replay/<stem>.idx + <stem>.ast  -- per-dialect-test Validator operation index
-  2. /app/opt_replay/<file>.idx + <file>.ast  -- per-optimizer-fixture stage index + annotate_funcs/types
-  3. /app/duckdb_query_cache.pkl.zlib         -- read-only query-result cache for TestOptimizer DuckDB tests
-
-Soundness invariants:
-  - Replay activates ONLY when every patched file is a safe body/dict/attr edit inside
-    sqlglot/{generators,parsers,dialects}/*.py (excluding base/core files), with zero
-    deleted files, zero syntax errors, and verified clean import of all patched modules.
-  - Every dependency set records ALL Dialect, Parser, and Generator classes observed at
-    baseline during each stage (including indirect calls inside parse/optimize/generate).
-  - Structural AST identity (ast_struct_sig) verifies class name, ordered args, parent
-    pointers, arg_key, list index, comments, _type, _meta, and exact primitive/Enum types.
-  - Any missing cache record, non-deterministic observation, unsupported object type,
-    consumed return value, or active assert/mock context falls back to exact live execution.
+  1. /app/val_replay/<stem>.{idx,ast,fine}   -- Validator operation index + O(1) mmap ASTs + fine inverted index
+  2. /app/opt_replay/<name>.{idx,ast,fine}   -- Optimizer fixture + annotate_funcs/types + in_nulls/corr_all replay
+  3. /app/exec_replay.pkl.zlib               -- Non-TPC TestExecutor execute() stage-reuse cache
+  4. /app/duckdb_query_cache.pkl.zlib        -- Read-only query-result cache for TestOptimizer DuckDB tests
+  5. /app/sqlite_query_cache.pkl.zlib        -- Read-only query-result cache for SQLite optimizer/cross-join tests
 """
 
 from __future__ import annotations
 
+import array
 import hashlib
 import marshal
 import mmap
@@ -34,13 +27,16 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import dep_index as _di
+
 VAL_REPLAY_DIR = Path("/app/val_replay")
 OPT_REPLAY_DIR = Path("/app/opt_replay")
 DUCKDB_CACHE_PATH = Path("/app/duckdb_query_cache.pkl.zlib")
+SQLITE_CACHE_PATH = Path("/app/sqlite_query_cache.pkl.zlib")
+EXEC_REPLAY_PATH = Path("/app/exec_replay.pkl.zlib")
 
 _UNPACKABLE = object()
 
-# Cross-module non-class imports from sqlglot/parsers/* or sqlglot/generators/* into sqlglot/dialects/*
 _EXTRA_PARSER_TO_DIALECT: dict[str, tuple[str, ...]] = {
     "sqlglot/parsers/exasol.py": ("Exasol",),
     "sqlglot/parsers/singlestore.py": ("SingleStore",),
@@ -55,8 +51,10 @@ class ReplayScope:
     dirty_dials: frozenset[str]
     dirty_pars: frozenset[str]
     dirty_gens: frozenset[str]
+    dirty_opt_dials: frozenset[str]  # Extra dialects dirty ONLY inside optimize() (e.g. sqlglot/typing/*.py!)
     dirty_files: frozenset[str]
     is_gen_only: bool
+    fine_tokens: frozenset[tuple[Any, ...]] | None = None  # Exact fine-grained tokens for per-op filtering!
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +79,6 @@ def _get_exp_map(exp_mod: Any) -> dict[str, type]:
 
 
 def _hash_scalar(upd: Any, v: Any) -> bool:
-    """Hash a non-Expr scalar/container into blake2b. Returns False if unsupported."""
     if v is None:
         upd(b"N;")
         return True
@@ -131,8 +128,7 @@ def _hash_scalar(upd: Any, v: Any) -> bool:
 
 
 def ast_struct_sig(root: Any, exp_mod: Any) -> bytes | None:
-    """Compute a 16-byte exact structural AST fingerprint including parent/arg_key/index integrity.
-    Returns None if any AST invariant fails or an unsupported object type is encountered."""
+    """Compute a 16-byte exact structural AST fingerprint including parent/arg_key/index integrity."""
     Expr = exp_mod.Expr
     if not isinstance(root, Expr):
         return None
@@ -205,8 +201,7 @@ def ast_struct_sig(root: Any, exp_mod: Any) -> bytes | None:
 
 
 def pack_expr(root: Any, exp_mod: Any) -> Any:
-    """Pack an Expr tree into marshal-safe primitives portable across /sqlglot and /sqlglot-c.
-    Returns _UNPACKABLE if any node/value cannot be faithfully reconstructed."""
+    """Pack an Expr tree into marshal-safe primitives portable across /sqlglot and /sqlglot-c."""
     Expr = exp_mod.Expr
     exp_map = _get_exp_map(exp_mod)
 
@@ -280,8 +275,7 @@ def pack_expr(root: Any, exp_mod: Any) -> Any:
 
 
 def unpack_expr(packed: Any, exp_mod: Any) -> Any:
-    """Reconstruct a fresh Expr tree (with exact parent/arg_key/index/meta/type/comments)
-    using exp_mod (works identically for /sqlglot and /sqlglot-c!)."""
+    """Reconstruct a fresh Expr tree (exact parent/arg_key/index/meta/type/comments)."""
     Expr = exp_mod.Expr
     exp_map = _get_exp_map(exp_mod)
 
@@ -343,7 +337,7 @@ def norm_dialect_key(d: Any) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Soundness Gate: Classify Replay Scope from CommitPlan + Static Graphs
+# Soundness Gate: Classify Coarse + Fine-Grained Replay Scope
 # ---------------------------------------------------------------------------
 
 def classify_replay_scope(
@@ -373,12 +367,14 @@ def classify_replay_scope(
     all_dials = set(class_subs.get("Dialect", []))
     all_pars = set(class_subs.get("Parser", []))
     all_gens = set(class_subs.get("Generator", []))
+    all_exprs = set(class_subs.get("Expr", []))
 
     _SAFE_KINDS = frozenset({"func_body", "dict_key", "dict_lambda_body", "class_attr"})
 
     gen_files: set[str] = set()
     par_files: set[str] = set()
     dial_files: set[str] = set()
+    typing_files: set[str] = set()
 
     for rel in commit_plan.patched_files:
         if rel.startswith("sqlglot/generators/") and rel.endswith(".py") and rel != "sqlglot/generators/__init__.py":
@@ -387,6 +383,8 @@ def classify_replay_scope(
             par_files.add(rel)
         elif rel.startswith("sqlglot/dialects/") and rel.endswith(".py") and rel not in ("sqlglot/dialects/__init__.py", "sqlglot/dialects/dialect.py"):
             dial_files.add(rel)
+        elif rel.startswith("sqlglot/typing/") and rel.endswith(".py") and rel != "sqlglot/typing/__init__.py":
+            typing_files.add(rel)
         else:
             return None
 
@@ -406,9 +404,10 @@ def classify_replay_scope(
     dirty_dials: set[str] = set()
     dirty_pars: set[str] = set()
     dirty_gens: set[str] = set()
+    dirty_opt_dials: set[str] = set()
     dirty_files: set[str] = set(commit_plan.patched_files)
 
-    # 1. Propagate generator files (follow generator->generator rev-imports; reject unexpected core/parser importers)
+    # 1. Generator files
     q = list(gen_files)
     seen_g = set(gen_files)
     while q:
@@ -417,7 +416,6 @@ def classify_replay_scope(
         for cname in file_classes.get(f, ()):
             if cname in all_gens:
                 dirty_gens.add(cname)
-        # Check special generator attr re-exports into dialects
         ana = commit_plan.py_analyses.get(f)
         if ana is not None:
             for u in ana.units:
@@ -433,7 +431,7 @@ def classify_replay_scope(
             else:
                 return None
 
-    # 2. Propagate parser files (follow parser->parser AND parser->generator rev-imports)
+    # 2. Parser files
     q = list(par_files)
     seen_p = set(par_files)
     extra_gen_from_par: set[str] = set()
@@ -457,7 +455,6 @@ def classify_replay_scope(
             else:
                 return None
 
-    # Propagate any generators that import edited parsers (e.g. exasol/snowflake/teradata/tsql)
     q = list(extra_gen_from_par)
     seen_eg = set(extra_gen_from_par)
     while q:
@@ -471,7 +468,7 @@ def classify_replay_scope(
                 seen_eg.add(imp_f)
                 q.append(imp_f)
 
-    # 3. Propagate dialect files (marks Dialect + Parser + Generator + subclasses dirty!)
+    # 3. Dialect files
     q = list(dial_files)
     seen_d = set(dial_files)
     while q:
@@ -498,12 +495,33 @@ def classify_replay_scope(
             else:
                 return None
 
-    # Expand all subclasses
+    # 4. Typing files (affect ONLY optimize()/annotate_types stage for their dialect + subclasses!)
+    if typing_files:
+        q = list(typing_files)
+        seen_t = set(typing_files)
+        while q:
+            f = q.pop()
+            dirty_files.add(f)
+            for imp_f in rev_imp.get(f, ()):
+                if imp_f.startswith("sqlglot/typing/") and imp_f not in seen_t:
+                    seen_t.add(imp_f)
+                    q.append(imp_f)
+                elif imp_f.startswith("sqlglot/dialects/"):
+                    for cname in file_classes.get(imp_f, ()):
+                        if cname in all_dials:
+                            dirty_opt_dials.add(cname)
+                elif imp_f.startswith("tests/"):
+                    continue
+                elif imp_f != "sqlglot/optimizer/annotate_types.py":
+                    return None
+        if not dirty_opt_dials:
+            return None
+        dirty_opt_dials = _expand_subclasses(dirty_opt_dials)
+
     dirty_dials = _expand_subclasses(dirty_dials)
     dirty_pars = _expand_subclasses(dirty_pars)
     dirty_gens = _expand_subclasses(dirty_gens)
 
-    # For any dirty dialect, also mark its corresponding parser & generator classes dirty
     if dirty_dials:
         for f, classes in file_classes.items():
             if f.startswith("sqlglot/dialects/") and any(c in dirty_dials for c in classes):
@@ -517,8 +535,6 @@ def classify_replay_scope(
         dirty_pars = _expand_subclasses(dirty_pars)
         dirty_gens = _expand_subclasses(dirty_gens)
 
-    # Safety fallback: if a patched file defines no tracked class (e.g. only helper function),
-    # ensure its dialect stem's class family is marked dirty!
     for f in gen_files:
         if not any(c in dirty_gens for c in file_classes.get(f, ())):
             return None
@@ -529,17 +545,100 @@ def classify_replay_scope(
         if not any(c in dirty_dials for c in file_classes.get(f, ())):
             return None
 
+    # ---- Compute Fine-Grained Tokens for Per-Operation Filtering (Wave 2B) ----
+    # Only enabled when EVERY changed unit cleanly maps to exact tracked tokens!
+    fine_tokens: set[tuple[Any, ...]] | None = None
+    dep_idx = _di.load_dep_index()
+    if dep_idx is not None and not typing_files and not dial_files:
+        tracked_attrs = set(dep_idx.get("tracked_attrs", ()))
+        tracked_dicts = set(dep_idx.get("tracked_dicts", ()))
+        wrapped_methods = {tuple(x) for x in dep_idx.get("wrapped_methods", ())}
+        toks: set[tuple[Any, ...]] = set()
+        all_fine_ok = True
+        for rel, ana in commit_plan.py_analyses.items():
+            for u in ana.units:
+                if u.kind == "func_body":
+                    cname = u.class_name
+                    mname = u.symbol_name.rsplit(".", 1)[-1] if u.symbol_name else None
+                    if cname and mname and (cname, mname) in wrapped_methods:
+                        toks.add(("M", cname, mname))
+                    else:
+                        all_fine_ok = False
+                        break
+                elif u.kind == "class_attr":
+                    cname = u.class_name
+                    attr = u.symbol_name
+                    if (
+                        cname
+                        and attr
+                        and attr in tracked_attrs
+                        and attr not in _di.META_SKIP_ATTRS
+                    ):
+                        owners = engine._expand_class_and_copiers(cname, attr) if engine is not None else _expand_subclasses({cname})
+                        for o in owners:
+                            toks.add(("A", o, attr))
+                    else:
+                        all_fine_ok = False
+                        break
+                elif u.kind in ("dict_key", "dict_lambda_body"):
+                    cname = u.class_name
+                    attr = u.symbol_name
+                    if (
+                        cname
+                        and attr
+                        and u.dict_keys is not None
+                        and attr not in _di.META_SKIP_ATTRS
+                        and (attr == "TRANSFORMS" or attr in tracked_dicts)
+                    ):
+                        owners = engine._expand_class_and_copiers(cname, attr) if engine is not None else _expand_subclasses({cname})
+                        if attr == "TRANSFORMS":
+                            for kr in u.dict_keys:
+                                ck = _di.canon_source_key(kr, all_exprs)
+                                if ck is None or not ck.startswith("E:"):
+                                    all_fine_ok = False
+                                    break
+                                subs_e = _expand_subclasses({ck[2:]})
+                                for o in owners:
+                                    toks.add(("D", o, "TRANSFORMS", "*"))
+                                    for sc in subs_e:
+                                        toks.add(("T", o, sc))
+                                        toks.add(("D", o, "TRANSFORMS", f"E:{sc}"))
+                        else:
+                            for kr in u.dict_keys:
+                                ck = _di.canon_source_key(kr, all_exprs)
+                                if ck is None:
+                                    all_fine_ok = False
+                                    break
+                                for o in owners:
+                                    toks.add(("D", o, attr, "*"))
+                                    toks.add(("D", o, attr, ck))
+                                    if ck.startswith("E:"):
+                                        for sc in _expand_subclasses({ck[2:]}):
+                                            toks.add(("D", o, attr, f"E:{sc}"))
+                    else:
+                        all_fine_ok = False
+                        break
+                else:
+                    all_fine_ok = False
+                    break
+            if not all_fine_ok:
+                break
+        if all_fine_ok and toks:
+            fine_tokens = toks
+
     return ReplayScope(
         dirty_dials=frozenset(dirty_dials),
         dirty_pars=frozenset(dirty_pars),
         dirty_gens=frozenset(dirty_gens),
+        dirty_opt_dials=frozenset(dirty_opt_dials),
         dirty_files=frozenset(dirty_files),
-        is_gen_only=bool(gen_files and not par_files and not dial_files and not dirty_dials and not dirty_pars),
+        is_gen_only=bool(gen_files and not par_files and not dial_files and not typing_files and not dirty_dials and not dirty_pars),
+        fine_tokens=frozenset(fine_tokens) if fine_tokens is not None else None,
     )
 
 
 # ---------------------------------------------------------------------------
-# Lazy Runtime Shard Loaders (CoW-preloaded .idx + O(1) mmap byte-sliced .ast!)
+# Lazy Runtime Shard Loaders (CoW-preloaded .idx + O(1) mmap .ast + Lazy .fine!)
 # ---------------------------------------------------------------------------
 
 def _write_ast_table(asts: list[Any], ast_path: Path) -> list[tuple[int, int]]:
@@ -595,11 +694,66 @@ class _MmapAstStore:
 
 _RAW_VAL_IDX: dict[str, tuple[list, dict, dict, list[tuple[int, int]]] | None] = {}
 _RAW_OPT_IDX: dict[str, tuple[list, dict, list[tuple[int, int]]] | None] = {}
+_RAW_VAL_FTOC: dict[str, dict[Any, tuple[int, ...]] | None] = {}
+_RAW_OPT_FTOC: dict[str, dict[Any, tuple[int, ...]] | None] = {}
+
+
+def _write_fine_tables(inv_maps: tuple[dict[Any, set[int]], ...], fdat_path: Path, ftoc_path: Path) -> int:
+    """Write posting lists as raw uint32 array('I') in .fdat + compact tok->(off,len,...) TOC in .ftoc."""
+    all_toks: set[Any] = set()
+    for m in inv_maps:
+        all_toks.update(m.keys())
+    toc: dict[Any, tuple[int, ...]] = {}
+    pos = 0
+    with open(fdat_path, "wb") as f:
+        for tok in all_toks:
+            entry: list[int] = []
+            for m in inv_maps:
+                s = m.get(tok)
+                if s:
+                    b = array.array("I", sorted(s)).tobytes()
+                    f.write(b)
+                    entry.append(pos)
+                    entry.append(len(b))
+                    pos += len(b)
+                else:
+                    entry.append(0)
+                    entry.append(0)
+            toc[tok] = tuple(entry)
+    tb = marshal.dumps(toc)
+    ftoc_path.write_bytes(tb)
+    return pos + len(tb)
+
+
+def _query_fine_tables(
+    ftoc: dict[Any, tuple[int, ...]] | None,
+    fdat_path: Path,
+    fine_tokens: frozenset[tuple[Any, ...]],
+    n_maps: int,
+) -> tuple[set[int], ...] | None:
+    """O(k) pread lookup of exact posting lists for `fine_tokens` (~0.01ms vs ~10ms full unmarshal!)."""
+    if ftoc is None or not fdat_path.is_file():
+        return None
+    hits = [ftoc[tok] for tok in fine_tokens if tok in ftoc]
+    sets = tuple(set() for _ in range(n_maps))
+    if not hits:
+        return sets
+    fd = os.open(fdat_path, os.O_RDONLY)
+    try:
+        for entry in hits:
+            for i in range(n_maps):
+                ln = entry[2 * i + 1]
+                if ln:
+                    arr = array.array("I")
+                    arr.frombytes(os.pread(fd, ln, entry[2 * i]))
+                    sets[i].update(arr)
+    finally:
+        os.close(fd)
+    return sets
 
 
 def preload_all_replay_indices() -> None:
-    """Preload all uncompressed .idx marshal tables ONCE in parent before os.fork()
-    so every forked child shares them read-only via CoW with 0.00ms load overhead!"""
+    """Preload uncompressed .idx & .ftoc marshal tables ONCE in parent before os.fork() (0ms in children via CoW!)."""
     if VAL_REPLAY_DIR.is_dir():
         for p in VAL_REPLAY_DIR.glob("*.idx"):
             stem = p.stem
@@ -608,6 +762,13 @@ def preload_all_replay_indices() -> None:
                     _RAW_VAL_IDX[stem] = marshal.loads(p.read_bytes())
                 except Exception:
                     _RAW_VAL_IDX[stem] = None
+        for p in VAL_REPLAY_DIR.glob("*.ftoc"):
+            stem = p.stem
+            if stem not in _RAW_VAL_FTOC:
+                try:
+                    _RAW_VAL_FTOC[stem] = marshal.loads(p.read_bytes())
+                except Exception:
+                    _RAW_VAL_FTOC[stem] = None
     if OPT_REPLAY_DIR.is_dir():
         for p in OPT_REPLAY_DIR.glob("*.idx"):
             name = p.stem
@@ -616,10 +777,17 @@ def preload_all_replay_indices() -> None:
                     _RAW_OPT_IDX[name] = marshal.loads(p.read_bytes())
                 except Exception:
                     _RAW_OPT_IDX[name] = None
+        for p in OPT_REPLAY_DIR.glob("*.ftoc"):
+            name = p.stem
+            if name not in _RAW_OPT_FTOC:
+                try:
+                    _RAW_OPT_FTOC[name] = marshal.loads(p.read_bytes())
+                except Exception:
+                    _RAW_OPT_FTOC[name] = None
 
 
 class ValReplayShard:
-    __slots__ = ("stem", "deps_table", "parses", "edges", "dirty_flags", "_store")
+    __slots__ = ("stem", "deps_table", "parses", "edges", "dirty_flags", "dirty_pids", "dirty_eids", "_store")
 
     def __init__(
         self,
@@ -629,6 +797,8 @@ class ValReplayShard:
         edges: dict,
         ast_offsets: list[tuple[int, int]],
         ast_path: Path,
+        ftoc: dict[Any, tuple[int, ...]] | None,
+        fdat_path: Path,
         scope: ReplayScope,
     ) -> None:
         self.stem = stem
@@ -647,6 +817,15 @@ class ValReplayShard:
             )
             for ds, ps, gs in deps_table
         ]
+        self.dirty_pids: set[int] | None = None
+        self.dirty_eids: set[int] | None = None
+        if scope.fine_tokens is not None and any(self.dirty_flags):
+            try:
+                res = _query_fine_tables(ftoc, fdat_path, scope.fine_tokens, 2)
+                if res is not None:
+                    self.dirty_pids, self.dirty_eids = res
+            except Exception:
+                pass
 
     def get_expr(self, ast_idx: int, exp_mod: Any) -> Any:
         return self._store.get_expr(ast_idx, exp_mod)
@@ -688,14 +867,27 @@ def get_val_shard(test_file: str, scope: ReplayScope) -> ValReplayShard | None:
     if raw is None or not ast_path.is_file():
         _VAL_SHARD_CACHE[test_file] = None
         return None
+    ftoc = _RAW_VAL_FTOC.get(stem)
+    if ftoc is None and stem not in _RAW_VAL_FTOC:
+        fp = VAL_REPLAY_DIR / f"{stem}.ftoc"
+        if fp.is_file():
+            try:
+                ftoc = marshal.loads(fp.read_bytes())
+            except Exception:
+                ftoc = None
+        _RAW_VAL_FTOC[stem] = ftoc
+    fdat_path = VAL_REPLAY_DIR / f"{stem}.fdat"
     deps_table, parses, edges, ast_offsets = raw
-    shard = ValReplayShard(stem, deps_table, parses, edges, ast_offsets, ast_path, scope)
+    shard = ValReplayShard(stem, deps_table, parses, edges, ast_offsets, ast_path, ftoc, fdat_path, scope)
     _VAL_SHARD_CACHE[test_file] = shard
     return shard
 
 
 class OptReplayShard:
-    __slots__ = ("name", "deps_table", "rows", "dirty_flags", "_store")
+    __slots__ = (
+        "name", "deps_table", "rows", "dirty_flags", "dirty_opt_flags",
+        "dirty_p_rids", "dirty_o_rids", "dirty_f_rids", "dirty_e_rids", "_store",
+    )
 
     def __init__(
         self,
@@ -704,6 +896,8 @@ class OptReplayShard:
         rows: dict,
         ast_offsets: list[tuple[int, int]],
         ast_path: Path,
+        ftoc: dict[Any, tuple[int, ...]] | None,
+        fdat_path: Path,
         scope: ReplayScope,
     ) -> None:
         self.name = name
@@ -713,6 +907,7 @@ class OptReplayShard:
         dd = scope.dirty_dials
         dp = scope.dirty_pars
         dg = scope.dirty_gens
+        dod = scope.dirty_opt_dials
         self.dirty_flags: list[bool] = [
             bool(
                 (dd and any(x in dd for x in ds))
@@ -721,6 +916,25 @@ class OptReplayShard:
             )
             for ds, ps, gs in deps_table
         ]
+        self.dirty_opt_flags: list[bool] = (
+            [
+                self.dirty_flags[i] or bool(any(x in dod for x in deps_table[i][0]))
+                for i in range(len(deps_table))
+            ]
+            if dod
+            else self.dirty_flags
+        )
+        self.dirty_p_rids: set[int] | None = None
+        self.dirty_o_rids: set[int] | None = None
+        self.dirty_f_rids: set[int] | None = None
+        self.dirty_e_rids: set[int] | None = None
+        if scope.fine_tokens is not None and any(self.dirty_flags):
+            try:
+                res = _query_fine_tables(ftoc, fdat_path, scope.fine_tokens, 4)
+                if res is not None:
+                    self.dirty_p_rids, self.dirty_o_rids, self.dirty_f_rids, self.dirty_e_rids = res
+            except Exception:
+                pass
 
     def get_expr(self, ast_idx: int, exp_mod: Any) -> Any:
         return self._store.get_expr(ast_idx, exp_mod)
@@ -747,17 +961,29 @@ def get_opt_shard(name: str, scope: ReplayScope) -> OptReplayShard | None:
     if raw is None or not ast_path.is_file():
         _OPT_SHARD_CACHE[name] = None
         return None
+    ftoc = _RAW_OPT_FTOC.get(safe_name)
+    if ftoc is None and safe_name not in _RAW_OPT_FTOC:
+        fp = OPT_REPLAY_DIR / f"{safe_name}.ftoc"
+        if fp.is_file():
+            try:
+                ftoc = marshal.loads(fp.read_bytes())
+            except Exception:
+                ftoc = None
+        _RAW_OPT_FTOC[safe_name] = ftoc
+    fdat_path = OPT_REPLAY_DIR / f"{safe_name}.fdat"
     deps_table, rows, ast_offsets = raw
-    shard = OptReplayShard(name, deps_table, rows, ast_offsets, ast_path, scope)
+    shard = OptReplayShard(name, deps_table, rows, ast_offsets, ast_path, ftoc, fdat_path, scope)
     _OPT_SHARD_CACHE[name] = shard
     return shard
 
 
 # ---------------------------------------------------------------------------
-# Lazy DuckDB Query-Result Cache Proxy (Zero Engine Startup on Cache Hit!)
+# Lazy DuckDB & SQLite Query-Result Cache Proxies + Non-TPC Executor Replay
 # ---------------------------------------------------------------------------
 
 _DUCKDB_CACHE_DATA: dict[str, Any] | None = None
+_SQLITE_CACHE_DATA: dict[str, Any] | None = None
+_EXEC_REPLAY_DATA: dict[Any, Any] | None = None
 _READ_SQL_PREFIXES = ("SELECT", "WITH", "VALUES", "FROM", "TABLE", "(", "SUMMARIZE", "DESCRIBE", "EXPLAIN", "SHOW")
 
 
@@ -768,10 +994,36 @@ def load_duckdb_query_cache() -> dict[str, Any]:
             try:
                 _DUCKDB_CACHE_DATA = pickle.loads(zlib.decompress(DUCKDB_CACHE_PATH.read_bytes()))
             except Exception:
-                _DUCKDB_CACHE_DATA = {"queries": {}, "ddls": {}}
+                _DUCKDB_CACHE_DATA = {"queries": {}, "ddls": set()}
         else:
-            _DUCKDB_CACHE_DATA = {"queries": {}, "ddls": {}}
+            _DUCKDB_CACHE_DATA = {"queries": {}, "ddls": set()}
     return _DUCKDB_CACHE_DATA
+
+
+def load_sqlite_query_cache() -> dict[str, Any]:
+    global _SQLITE_CACHE_DATA
+    if _SQLITE_CACHE_DATA is None:
+        if SQLITE_CACHE_PATH.is_file():
+            try:
+                _SQLITE_CACHE_DATA = pickle.loads(zlib.decompress(SQLITE_CACHE_PATH.read_bytes()))
+            except Exception:
+                _SQLITE_CACHE_DATA = {"queries": {}, "ddls": set()}
+        else:
+            _SQLITE_CACHE_DATA = {"queries": {}, "ddls": set()}
+    return _SQLITE_CACHE_DATA
+
+
+def load_exec_replay() -> dict[Any, Any]:
+    global _EXEC_REPLAY_DATA
+    if _EXEC_REPLAY_DATA is None:
+        if EXEC_REPLAY_PATH.is_file():
+            try:
+                _EXEC_REPLAY_DATA = pickle.loads(zlib.decompress(EXEC_REPLAY_PATH.read_bytes()))
+            except Exception:
+                _EXEC_REPLAY_DATA = {}
+        else:
+            _EXEC_REPLAY_DATA = {}
+    return _EXEC_REPLAY_DATA
 
 
 def _is_pure_read_sql(sql: str) -> bool:
@@ -830,8 +1082,7 @@ class _CachedDuckCursor:
 
 
 class LazyCachedDuckConn:
-    """Drop-in lazy DuckDB connection proxy backed by build-time query cache.
-    Never imports or starts DuckDB on cache hits; replays DDL and executes real DuckDB on any miss."""
+    """Drop-in lazy DuckDB connection proxy backed by build-time query cache."""
 
     def __init__(self, init_tag: bytes, real_factory: Any, cache_enabled: bool = True) -> None:
         self._sig: bytes = init_tag
@@ -869,7 +1120,6 @@ class LazyCachedDuckConn:
                 return _CachedDuckCursor(cols, rows, self, query)
             return self._materialize().execute(query)
 
-        # DDL / DML statement
         next_sig = _ddl_step_sig(self._sig, query)
         if next_sig in cache["ddls"]:
             self._sig = next_sig
@@ -893,13 +1143,110 @@ class LazyCachedDuckConn:
         return getattr(self._materialize(), name)
 
 
+class _CachedSqliteCursor:
+    __slots__ = ("description", "_rows", "_pos")
+
+    def __init__(self, cols: tuple[str, ...], rows: list[tuple[Any, ...]]) -> None:
+        self.description = tuple((c, None, None, None, None, None, None) for c in cols) if cols else None
+        self._rows = rows
+        self._pos = 0
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        res = list(self._rows[self._pos:])
+        self._pos = len(self._rows)
+        return res
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        if self._pos >= len(self._rows):
+            return None
+        r = self._rows[self._pos]
+        self._pos += 1
+        return r
+
+
+class LazyCachedSqliteConn:
+    """Drop-in lazy sqlite3(':memory:') connection proxy backed by build-time query cache."""
+
+    def __init__(self, real_factory: Any, cache_enabled: bool = True) -> None:
+        self._sig: bytes = b"SQLITE"
+        self._real_factory = real_factory
+        self._cache_enabled = cache_enabled
+        self._real_conn: Any = None
+        self._pending_ddl: list[tuple[str, str]] = []
+
+    def _materialize(self) -> Any:
+        if self._real_conn is None:
+            conn = self._real_factory()
+            for kind, stmt in self._pending_ddl:
+                if kind == "exec":
+                    conn.execute(stmt)
+                else:
+                    conn.executescript(stmt)
+            self._pending_ddl.clear()
+            self._real_conn = conn
+        return self._real_conn
+
+    def execute(self, query: str, parameters: Any = None, *args: Any, **kwargs: Any) -> Any:
+        if self._real_conn is not None or not self._cache_enabled or parameters is not None or args or kwargs or type(query) is not str:
+            return self._materialize().execute(query, parameters, *args, **kwargs) if parameters is not None else self._materialize().execute(query, *args, **kwargs)
+        cache = load_sqlite_query_cache()
+        if _is_pure_read_sql(query):
+            hit = cache["queries"].get((self._sig, query))
+            if hit is not None:
+                return _CachedSqliteCursor(hit[0], hit[1])
+            return self._materialize().execute(query)
+        next_sig = _ddl_step_sig(self._sig, "E:" + query)
+        if next_sig in cache["ddls"]:
+            self._sig = next_sig
+            self._pending_ddl.append(("exec", query))
+            return _CachedSqliteCursor((), [])
+        return self._materialize().execute(query)
+
+    def executescript(self, script: str) -> Any:
+        if self._real_conn is not None or not self._cache_enabled or type(script) is not str:
+            return self._materialize().executescript(script)
+        cache = load_sqlite_query_cache()
+        next_sig = _ddl_step_sig(self._sig, "S:" + script)
+        if next_sig in cache["ddls"]:
+            self._sig = next_sig
+            self._pending_ddl.append(("script", script))
+            return _CachedSqliteCursor((), [])
+        return self._materialize().executescript(script)
+
+    def close(self) -> None:
+        if self._real_conn is not None:
+            self._real_conn.close()
+            self._real_conn = None
+
+    def __enter__(self) -> LazyCachedSqliteConn:
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._materialize(), name)
+
+
+def exec_call_key(sql: Any, schema: Any, tables: Any, dialect: Any) -> bytes | None:
+    """Compute an exact deterministic key for a TestExecutor execute(...) call."""
+    if type(sql) is not str:
+        return None
+    dk = norm_dialect_key(dialect)
+    if dk is None:
+        return None
+    try:
+        blob = pickle.dumps((sql, dk, schema, tables), protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        return None
+    return hashlib.blake2b(blob, digest_size=16).digest()
+
+
 # ---------------------------------------------------------------------------
 # Build-Time Collectors (run inside Dockerfile, 0 bytes in Git!)
 # ---------------------------------------------------------------------------
 
 def _install_stage_recorders() -> tuple[list[tuple[set[str], set[str], set[str]]], Any]:
-    """Instrument Dialect.get_or_raise, Tokenizer.tokenize, Parser.parse/parse_into,
-    and Generator.generate on Pure-Python /sqlglot to record exact class dependencies."""
     from sqlglot.dialects.dialect import Dialect
     from sqlglot.generator import Generator
     from sqlglot.parser import Parser
@@ -972,22 +1319,59 @@ def _install_stage_recorders() -> tuple[list[tuple[set[str], set[str], set[str]]
     return stack, _restore
 
 
+def _install_fine_spies(fine_stack: list[set[tuple[Any, ...]]]) -> Any:
+    """Install fine-grained spies recording into all active frames of fine_stack."""
+    def _on_attr(recv: str, attr: str) -> None:
+        if fine_stack:
+            tok = ("A", recv, attr)
+            for s in fine_stack:
+                s.add(tok)
+
+    def _on_key(recv: str, attr: str, ck: str) -> None:
+        if fine_stack:
+            tok = ("D", recv, attr, ck)
+            for s in fine_stack:
+                s.add(tok)
+
+    def _on_disp(recv: str, ecls: str) -> None:
+        if fine_stack:
+            tok = ("T", recv, ecls)
+            for s in fine_stack:
+                s.add(tok)
+
+    def _on_meth(def_cls: str, mname: str) -> None:
+        if fine_stack:
+            tok = ("M", def_cls, mname)
+            for s in fine_stack:
+                s.add(tok)
+
+    _, _, _, restore = _di.install_spies(_on_attr, _on_key, _on_disp, on_method=_on_meth)
+    return restore
+
+
 def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int, int]:
     sg_root, test_file, out_dir_str = args
     sys.path.insert(0, sg_root)
+    sys.path.insert(0, "/app")
     import importlib
     import unittest
     from sqlglot import ErrorLevel, UnsupportedError, exp, parse_one as sg_parse_one
     import tests.dialects.test_dialect as tdial
 
+    fine_stack: list[set[tuple[Any, ...]]] = []
+    restore_fine = _install_fine_spies(fine_stack)
     rec_stack, restore_rec = _install_stage_recorders()
 
     deps_list: list[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = []
     deps_to_id: dict[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], int] = {}
     asts: list[Any] = []
-    parses: dict[tuple[str, str], tuple[int, bytes, int]] = {}
-    edges: dict[tuple[str, str, str, str | None, bool, bool, int], int] = {}
+    parses: dict[tuple[str, str], tuple[int, bytes, int, int]] = {}
+    edges: dict[tuple[str, str, str, str | None, bool, bool, int], tuple[int, int]] = {}
     bad_parses: set[tuple[str, str]] = set()
+    p_fine_inv: dict[tuple[Any, ...], set[int]] = {}
+    g_fine_inv: dict[tuple[Any, ...], set[int]] = {}
+    next_pid = [0]
+    next_eid = [0]
 
     def _intern_deps(dset: set[str], pset: set[str], gset: set[str]) -> int:
         key = (tuple(sorted(dset)), tuple(sorted(pset)), tuple(sorted(gset)))
@@ -1005,7 +1389,7 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
         db, pb, gb = deps_list[b]
         return _intern_deps(set(da) | set(db), set(pa) | set(pb), set(ga) | set(gb))
 
-    def _record_parse(d_key: str, sql: str, expr: Any, dset: set[str], pset: set[str], gset: set[str]) -> bool:
+    def _record_parse(d_key: str, sql: str, expr: Any, dset: set[str], pset: set[str], gset: set[str], ftoks: set[tuple[Any, ...]]) -> bool:
         pk = (d_key, sql)
         if pk in bad_parses:
             return False
@@ -1021,9 +1405,12 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
                 bad_parses.add(pk)
                 parses.pop(pk, None)
                 return False
+            pid = prev[3]
             merged = _merge_dep_ids(prev[0], dep_id)
             if merged != prev[0]:
-                parses[pk] = (merged, sig, prev[2])
+                parses[pk] = (merged, sig, prev[2], pid)
+            for tok in ftoks:
+                p_fine_inv.setdefault(tok, set()).add(pid)
             return True
         packed = pack_expr(expr, exp)
         if packed is _UNPACKABLE:
@@ -1031,27 +1418,35 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
         else:
             ast_idx = len(asts)
             asts.append(packed)
-        parses[pk] = (dep_id, sig, ast_idx)
+        pid = next_pid[0]
+        next_pid[0] += 1
+        parses[pk] = (dep_id, sig, ast_idx, pid)
+        for tok in ftoks:
+            p_fine_inv.setdefault(tok, set()).add(pid)
         return True
 
     def _record_edge(
         rd: str, rsql: str, wd: str, expected: str | None, pretty: bool, identify: bool, ulevel: int,
-        dset: set[str], pset: set[str], gset: set[str],
+        dset: set[str], pset: set[str], gset: set[str], ftoks: set[tuple[Any, ...]],
     ) -> None:
         ek = (rd, rsql, wd, expected, bool(pretty), bool(identify), ulevel)
         dep_id = _intern_deps(dset, pset, gset)
         prev = edges.get(ek)
-        edges[ek] = dep_id if prev is None else _merge_dep_ids(prev, dep_id)
+        if prev is None:
+            eid = next_eid[0]
+            next_eid[0] += 1
+            edges[ek] = (dep_id, eid)
+        else:
+            eid = prev[1]
+            edges[ek] = (_merge_dep_ids(prev[0], dep_id), eid)
+        for tok in ftoks:
+            g_fine_inv.setdefault(tok, set()).add(eid)
 
-    # Track assertLogs/assertRaises/mock.patch contexts via a real class proxy (Python `with` resolves __enter__/__exit__ on type(cm)!)
     in_ctx = [0]
 
     class _RecCtxProxy:
         __slots__ = ("_cm",)
-
-        def __init__(self, cm: Any) -> None:
-            self._cm = cm
-
+        def __init__(self, cm: Any) -> None: self._cm = cm
         def __enter__(self) -> Any:
             in_ctx[0] += 1
             try:
@@ -1059,13 +1454,11 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
             except BaseException:
                 in_ctx[0] -= 1
                 raise
-
         def __exit__(self, *ea: Any) -> Any:
             try:
                 return self._cm.__exit__(*ea)
             finally:
                 in_ctx[0] -= 1
-
         def __getattr__(self, name: str) -> Any:
             return getattr(self._cm, name)
 
@@ -1094,18 +1487,11 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
 
     from unittest import mock as _umock
     _ope, _opx = _umock._patch.__enter__, _umock._patch.__exit__
-
     def _wpe(self):
-        r = _ope(self)
-        in_ctx[0] += 1
-        return r
-
+        r = _ope(self); in_ctx[0] += 1; return r
     def _wpx(self, *ei):
-        try:
-            return _opx(self, *ei)
-        finally:
-            in_ctx[0] -= 1
-
+        try: return _opx(self, *ei)
+        finally: in_ctx[0] -= 1
     _umock._patch.__enter__ = _wpe  # type: ignore[method-assign]
     _umock._patch.__exit__ = _wpx  # type: ignore[method-assign]
 
@@ -1117,97 +1503,84 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
     def _rec_vi(self, sql, write_sql=None, pretty=False, check_command_warning=False, identify=False):
         dk = norm_dialect_key(self.dialect)
         if (
-            in_ctx[0] > 0
-            or check_command_warning
-            or type(self).parse_one is not orig_po
-            or type(sql) is not str
-            or dk is None
-            or (write_sql is not None and type(write_sql) is not str)
+            in_ctx[0] > 0 or check_command_warning or type(self).parse_one is not orig_po
+            or type(sql) is not str or dk is None or (write_sql is not None and type(write_sql) is not str)
         ):
             return orig_vi(self, sql, write_sql=write_sql, pretty=pretty, check_command_warning=check_command_warning, identify=identify)
-        p_d, p_p, p_g = set(), set(), set()
-        rec_stack.append((p_d, p_p, p_g))
+        p_d, p_p, p_g, pf = set(), set(), set(), set()
+        rec_stack.append((p_d, p_p, p_g)); fine_stack.append(pf)
         try:
             expression = self.parse_one(sql)
         finally:
-            rec_stack.pop()
-        g_d, g_p, g_g = set(), set(), set()
-        rec_stack.append((g_d, g_p, g_g))
+            rec_stack.pop(); fine_stack.pop()
+        g_d, g_p, g_g, gf = set(), set(), set(), set()
+        rec_stack.append((g_d, g_p, g_g)); fine_stack.append(gf)
         try:
             actual = expression.sql(dialect=self.dialect, pretty=pretty, identify=identify)
         finally:
-            rec_stack.pop()
+            rec_stack.pop(); fine_stack.pop()
         expected = write_sql or sql
         self.assertEqual(expected, actual)
-        if _record_parse(dk, sql, expression, p_d, p_p, p_g):
-            _record_edge(dk, sql, dk, expected, bool(pretty), bool(identify), 0, g_d, g_p, g_g)
+        if _record_parse(dk, sql, expression, p_d, p_p, p_g, pf):
+            _record_edge(dk, sql, dk, expected, bool(pretty), bool(identify), 0, g_d, g_p, g_g, gf)
         return expression
 
     def _rec_vt(self, sql, write_sql, write_dialect=None):
         rd = norm_dialect_key(self.dialect)
         wd = norm_dialect_key(write_dialect)
         if (
-            in_ctx[0] > 0
-            or type(self).parse_one is not orig_po
-            or type(sql) is not str
-            or type(write_sql) is not str
-            or rd is None
-            or wd is None
+            in_ctx[0] > 0 or type(self).parse_one is not orig_po
+            or type(sql) is not str or type(write_sql) is not str or rd is None or wd is None
         ):
             return orig_vt(self, sql, write_sql, write_dialect=write_dialect)
-        p_d, p_p, p_g = set(), set(), set()
-        rec_stack.append((p_d, p_p, p_g))
+        p_d, p_p, p_g, pf = set(), set(), set(), set()
+        rec_stack.append((p_d, p_p, p_g)); fine_stack.append(pf)
         try:
             expression = self.parse_one(sql)
         finally:
-            rec_stack.pop()
-        g_d, g_p, g_g = set(), set(), set()
-        rec_stack.append((g_d, g_p, g_g))
+            rec_stack.pop(); fine_stack.pop()
+        g_d, g_p, g_g, gf = set(), set(), set(), set()
+        rec_stack.append((g_d, g_p, g_g)); fine_stack.append(gf)
         try:
             actual = expression.sql(dialect=write_dialect)
         finally:
-            rec_stack.pop()
+            rec_stack.pop(); fine_stack.pop()
         self.assertEqual(write_sql, actual)
-        if _record_parse(rd, sql, expression, p_d, p_p, p_g):
-            _record_edge(rd, sql, wd, write_sql, False, False, 0, g_d, g_p, g_g)
+        if _record_parse(rd, sql, expression, p_d, p_p, p_g, pf):
+            _record_edge(rd, sql, wd, write_sql, False, False, 0, g_d, g_p, g_g, gf)
         return expression
 
     def _rec_va(self, sql, read=None, write=None, pretty=False, identify=False):
         sd = norm_dialect_key(self.dialect)
-        if (
-            in_ctx[0] > 0
-            or type(self).parse_one is not orig_po
-            or type(sql) is not str
-            or sd is None
-        ):
+        if in_ctx[0] > 0 or type(self).parse_one is not orig_po or type(sql) is not str or sd is None:
             return orig_va(self, sql, read=read, write=write, pretty=pretty, identify=identify)
-        p_d, p_p, p_g = set(), set(), set()
-        rec_stack.append((p_d, p_p, p_g))
+        p_d, p_p, p_g, pf = set(), set(), set(), set()
+        rec_stack.append((p_d, p_p, p_g)); fine_stack.append(pf)
         try:
             expression = self.parse_one(sql)
         finally:
-            rec_stack.pop()
-        main_ok = _record_parse(sd, sql, expression, p_d, p_p, p_g)
+            rec_stack.pop(); fine_stack.pop()
+        main_ok = _record_parse(sd, sql, expression, p_d, p_p, p_g, pf)
 
         for read_dialect, read_sql in (read or {}).items():
             with self.subTest(f"{read_dialect} -> {sql}"):
                 rd = norm_dialect_key(read_dialect)
                 if rd is not None and type(read_sql) is str:
-                    rp_d, rp_p, rp_g = set(), set(), set()
-                    rec_stack.append((rp_d, rp_p, rp_g))
+                    rp_d, rp_p, rp_g, rpf = set(), set(), set(), set()
+                    rec_stack.append((rp_d, rp_p, rp_g)); fine_stack.append(rpf)
                     try:
                         rexpr = sg_parse_one(read_sql, read_dialect)
                     finally:
-                        rec_stack.pop()
-                    rg_d, rg_p, rg_g = set(), set(), set()
-                    rec_stack.append((rg_d, rg_p, rg_g))
+                        rec_stack.pop(); fine_stack.pop()
+                    rg_d, rg_p, rg_g, rgf = set(), set(), set(), set()
+                    rec_stack.append((rg_d, rg_p, rg_g)); fine_stack.append(rgf)
                     try:
                         out = rexpr.sql(self.dialect, unsupported_level=ErrorLevel.IGNORE, pretty=pretty, identify=identify)
                     finally:
-                        rec_stack.pop()
+                        rec_stack.pop(); fine_stack.pop()
                     self.assertEqual(out, sql)
-                    if _record_parse(rd, read_sql, rexpr, rp_d, rp_p, rp_g):
-                        _record_edge(rd, read_sql, sd, sql, bool(pretty), bool(identify), 1, rg_d, rg_p, rg_g)
+                    if _record_parse(rd, read_sql, rexpr, rp_d, rp_p, rp_g, rpf):
+                        _record_edge(rd, read_sql, sd, sql, bool(pretty), bool(identify), 1, rg_d, rg_p, rg_g, rgf)
                 else:
                     self.assertEqual(
                         sg_parse_one(read_sql, read_dialect).sql(
@@ -1220,27 +1593,27 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
             with self.subTest(f"{sql} -> {write_dialect}"):
                 wd = norm_dialect_key(write_dialect)
                 if write_sql is UnsupportedError:
-                    wg_d, wg_p, wg_g = set(), set(), set()
-                    rec_stack.append((wg_d, wg_p, wg_g))
+                    wg_d, wg_p, wg_g, wgf = set(), set(), set(), set()
+                    rec_stack.append((wg_d, wg_p, wg_g)); fine_stack.append(wgf)
                     try:
                         with self.assertRaises(UnsupportedError):
                             expression.sql(write_dialect, unsupported_level=ErrorLevel.RAISE)
                     finally:
-                        rec_stack.pop()
+                        rec_stack.pop(); fine_stack.pop()
                     if main_ok and wd is not None:
-                        _record_edge(sd, sql, wd, None, bool(pretty), bool(identify), 2, wg_d, wg_p, wg_g)
+                        _record_edge(sd, sql, wd, None, bool(pretty), bool(identify), 2, wg_d, wg_p, wg_g, wgf)
                 else:
-                    wg_d, wg_p, wg_g = set(), set(), set()
-                    rec_stack.append((wg_d, wg_p, wg_g))
+                    wg_d, wg_p, wg_g, wgf = set(), set(), set(), set()
+                    rec_stack.append((wg_d, wg_p, wg_g)); fine_stack.append(wgf)
                     try:
                         out = expression.sql(
                             write_dialect, unsupported_level=ErrorLevel.IGNORE, pretty=pretty, identify=identify
                         )
                     finally:
-                        rec_stack.pop()
+                        rec_stack.pop(); fine_stack.pop()
                     self.assertEqual(out, write_sql)
                     if main_ok and wd is not None and type(write_sql) is str:
-                        _record_edge(sd, sql, wd, write_sql, bool(pretty), bool(identify), 1, wg_d, wg_p, wg_g)
+                        _record_edge(sd, sql, wd, write_sql, bool(pretty), bool(identify), 1, wg_d, wg_p, wg_g, wgf)
 
     tdial.Validator.validate_identity = _rec_vi
     tdial.Validator.validate_transpile = _rec_vt
@@ -1250,7 +1623,6 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
         mod_name = test_file.removesuffix(".py").replace("/", ".")
         mod = importlib.import_module(mod_name)
         suite = unittest.defaultTestLoader.loadTestsFromModule(mod)
-        # Skip test_lazy_load (spawns subprocess) and slow non-validator stress test_values? No, run everything cleanly except test_lazy_load!
         filtered = unittest.TestSuite()
         for grp in suite:
             for tc in grp:
@@ -1263,6 +1635,7 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
             raise RuntimeError(f"val_replay collection failed in {test_file}: {res.failures[:2]} {res.errors[:2]}")
     finally:
         restore_rec()
+        restore_fine()
 
     out_dir = Path(out_dir_str)
     stem = Path(test_file).stem
@@ -1270,26 +1643,27 @@ def _collect_one_dialect_file(args: tuple[str, str, str]) -> tuple[str, int, int
     ast_offsets = _write_ast_table(asts, ast_path)
     idx_blob = marshal.dumps((deps_list, parses, edges, ast_offsets))
     (out_dir / f"{stem}.idx").write_bytes(idx_blob)
-    return stem, len(parses), len(edges), len(idx_blob) + ast_path.stat().st_size
+    fine_bytes = _write_fine_tables(
+        (p_fine_inv, g_fine_inv),
+        out_dir / f"{stem}.fdat",
+        out_dir / f"{stem}.ftoc",
+    )
+    return stem, len(parses), len(edges), len(idx_blob) + ast_path.stat().st_size + fine_bytes
 
 
 def build_val_replay(sg_root: Path, out_dir: Path = VAL_REPLAY_DIR) -> tuple[int, int, int]:
-    """Collect per-test-file Validator replay shards in parallel across 4 cores."""
+    """Collect per-test-file Validator replay shards (idx + mmap ast + fine inverted index) across 4 cores."""
     out_dir.mkdir(parents=True, exist_ok=True)
     test_files = sorted(
         str(p.relative_to(sg_root))
         for p in (sg_root / "tests/dialects").glob("test_*.py")
     )
     tasks = [(str(sg_root), tf, str(out_dir)) for tf in test_files]
-    tot_p = 0
-    tot_e = 0
-    tot_b = 0
+    tot_p = tot_e = tot_b = 0
     n_workers = min(4, os.cpu_count() or 2)
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
         for _, np_, ne_, nb_ in pool.map(_collect_one_dialect_file, tasks):
-            tot_p += np_
-            tot_e += ne_
-            tot_b += nb_
+            tot_p += np_; tot_e += ne_; tot_b += nb_
     return tot_p, tot_e, tot_b
 
 
@@ -1305,8 +1679,8 @@ def build_opt_replay_and_duckdb_cache(
     opt_dir: Path = OPT_REPLAY_DIR,
     duck_path: Path = DUCKDB_CACHE_PATH,
 ) -> tuple[int, int, int, int]:
-    """Collect Optimizer fixture replay shards (check_file + test_annotate_funcs + test_annotate_types)
-    AND the Lazy DuckDB Query-Result Cache for all TestOptimizer DuckDB tests."""
+    """Collect Optimizer fixture replay shards (check_file + annotate_funcs + annotate_types +
+    in_nulls + corr_all, WITH fine-grained .fine inverted indices!) AND Lazy DuckDB Query Cache."""
     opt_dir.mkdir(parents=True, exist_ok=True)
     code = f"""
 import ast as _ast, hashlib, json, marshal, pickle, sys, unittest, zlib
@@ -1320,15 +1694,19 @@ from sqlglot import exp, parse_one
 import tests.helpers as th
 import tests.test_optimizer as topt
 
+fine_stack = []
+restore_fine = rc._install_fine_spies(fine_stack)
 rec_stack, restore_rec = rc._install_stage_recorders()
 
-# ---- Part A: Collect opt_replay for check_file, test_annotate_funcs, test_annotate_types ----
 shard_builders = {{}}
 
 def get_builder(name):
     b = shard_builders.get(name)
     if b is None:
-        b = {{"deps_list": [], "deps_to_id": {{}}, "asts": [], "rows": {{}}}}
+        b = {{
+            "deps_list": [], "deps_to_id": {{}}, "asts": [], "rows": {{}},
+            "pf": {{}}, "of": {{}}, "ff": {{}}, "ef": {{}}, "next_rid": 0,
+        }}
         shard_builders[name] = b
     return b
 
@@ -1340,6 +1718,10 @@ def intern_dep(b, dset, pset, gset):
         b["deps_list"].append(key)
         b["deps_to_id"][key] = idx
     return idx
+
+def add_fine(inv, toks, rid):
+    for t in toks:
+        inv.setdefault(t, set()).add(rid)
 
 def record_check_file_shard(file, func, pretty=False, execute=None, **kwargs):
     b = get_builder(f"cf_{{file}}")
@@ -1361,16 +1743,16 @@ def record_check_file_shard(file, func, pretty=False, execute=None, **kwargs):
         if min_python := meta.get("execute_min_python"):
             fixture_execute = th.string_to_bool(fixture_execute) and sys.version_info >= tuple(map(int, min_python.split(".")))
 
-        p_d, p_p, p_g = set(), set(), set()
-        rec_stack.append((p_d, p_p, p_g))
+        p_d, p_p, p_g, pf = set(), set(), set(), set()
+        rec_stack.append((p_d, p_p, p_g)); fine_stack.append(pf)
         try:
             parsed = parse_one(sql, read=dialect)
         finally:
-            rec_stack.pop()
+            rec_stack.pop(); fine_stack.pop()
         p_sig = rc.ast_struct_sig(parsed, exp)
 
-        o_d, o_p, o_g = set(), set(), set()
-        rec_stack.append((o_d, o_p, o_g))
+        o_d, o_p, o_g, of = set(), set(), set(), set()
+        rec_stack.append((o_d, o_p, o_g)); fine_stack.append(of)
         try:
             optimized = func(parsed, **func_kwargs)
             for expression in optimized.walk():
@@ -1380,31 +1762,31 @@ def record_check_file_shard(file, func, pretty=False, execute=None, **kwargs):
                             assert child.arg_key == arg_key
                             assert child.parent is expression
         finally:
-            rec_stack.pop()
+            rec_stack.pop(); fine_stack.pop()
 
-        f_d, f_p, f_g = set(), set(), set()
-        rec_stack.append((f_d, f_p, f_g))
+        f_d, f_p, f_g, ff = set(), set(), set(), set()
+        rec_stack.append((f_d, f_p, f_g)); fine_stack.append(ff)
         try:
             actual = optimized.sql(pretty=pretty, dialect=dialect)
         finally:
-            rec_stack.pop()
+            rec_stack.pop(); fine_stack.pop()
         assert actual == expected, f"mismatch in {{file}} #{{i}}"
 
-        e_d, e_p, e_g = set(), set(), set()
+        e_d, e_p, e_g, ef = set(), set(), set(), set()
         if th.string_to_bool(fixture_execute):
-            rec_stack.append((e_d, e_p, e_g))
+            rec_stack.append((e_d, e_p, e_g)); fine_stack.append(ef)
             try:
                 for ex in (parse_one(sql, read=dialect), optimized):
                     if not isinstance(ex, (exp.Query, exp.Values)):
                         ex = exp.select(exp.alias_(ex, "_col_0"))
                     ex.sql(dialect="duckdb")
             finally:
-                rec_stack.pop()
+                rec_stack.pop(); fine_stack.pop()
 
         packed_opt = rc.pack_expr(optimized, exp)
         if p_sig is not None and packed_opt is not rc._UNPACKABLE:
-            ast_idx = len(b["asts"])
-            b["asts"].append(packed_opt)
+            ast_idx = len(b["asts"]); b["asts"].append(packed_opt)
+            rid = b["next_rid"]; b["next_rid"] = rid + 1
             b["rows"][(fname, bool(pretty), i)] = (
                 intern_dep(b, p_d, p_p, p_g),
                 p_sig,
@@ -1412,7 +1794,12 @@ def record_check_file_shard(file, func, pretty=False, execute=None, **kwargs):
                 ast_idx,
                 intern_dep(b, f_d, f_p, f_g),
                 intern_dep(b, e_d, e_p, e_g),
+                rid,
             )
+            add_fine(b["pf"], pf, rid)
+            add_fine(b["of"], of, rid)
+            add_fine(b["ff"], ff, rid)
+            add_fine(b["ef"], ef, rid)
 
 orig_cf = topt.TestOptimizer.check_file
 def _collect_cf(self, file, func, pretty=False, execute=None, only=None, **kwargs):
@@ -1427,10 +1814,7 @@ for node in _ast.walk(_topt_tree):
     if isinstance(node, _ast.ClassDef) and node.name == "TestOptimizer":
         for item in node.body:
             if isinstance(item, _ast.FunctionDef) and item.name.startswith("test_"):
-                if any(
-                    isinstance(n, _ast.Attribute) and n.attr == "check_file"
-                    for n in _ast.walk(item)
-                ):
+                if any(isinstance(n, _ast.Attribute) and n.attr == "check_file" for n in _ast.walk(item)):
                     cf_methods.append(item.name)
 
 topt.TestOptimizer.pool = None
@@ -1465,41 +1849,36 @@ for i, (meta, sql, expected) in enumerate(th.load_sql_fixture_pairs("optimizer/a
     d_str = meta.get("dialect") or ""
     full_sql = f"SELECT {{sql}} FROM tbl"
     for dialect in d_str.split(", "):
-        p_d, p_p, p_g = set(), set(), set()
-        rec_stack.append((p_d, p_p, p_g))
-        try:
-            parsed = parse_one(full_sql, read=dialect)
-        finally:
-            rec_stack.pop()
+        p_d, p_p, p_g, pf = set(), set(), set(), set()
+        rec_stack.append((p_d, p_p, p_g)); fine_stack.append(pf)
+        try: parsed = parse_one(full_sql, read=dialect)
+        finally: rec_stack.pop(); fine_stack.pop()
         p_sig = rc.ast_struct_sig(parsed, exp)
 
-        o_d, o_p, o_g = set(), set(), set()
-        rec_stack.append((o_d, o_p, o_g))
+        o_d, o_p, o_g, of = set(), set(), set(), set()
+        rec_stack.append((o_d, o_p, o_g)); fine_stack.append(of)
         try:
             result = topt.annotate_functions(parsed, schema=test_schema, dialect=dialect)
             for expression in result.walk():
                 for arg_key, arg in expression.args.items():
                     for child in arg if isinstance(arg, list) else [arg]:
                         if isinstance(child, exp.Expr):
-                            assert child.arg_key == arg_key
-                            assert child.parent is expression
+                            assert child.arg_key == arg_key and child.parent is expression
         finally:
-            rec_stack.pop()
+            rec_stack.pop(); fine_stack.pop()
 
-        eb_d, eb_p, eb_g = set(), set(), set()
-        rec_stack.append((eb_d, eb_p, eb_g))
-        try:
-            exp_dt = exp.DataType.build(expected, dialect=dialect)
-        finally:
-            rec_stack.pop()
+        eb_d, eb_p, eb_g, ebf = set(), set(), set(), set()
+        rec_stack.append((eb_d, eb_p, eb_g)); fine_stack.append(ebf)
+        try: exp_dt = exp.DataType.build(expected, dialect=dialect)
+        finally: rec_stack.pop(); fine_stack.pop()
 
-        f_d, f_p, f_g = set(), set(), set()
-        rec_stack.append((f_d, f_p, f_g))
+        f_d, f_p, f_g, ff = set(), set(), set(), set()
+        rec_stack.append((f_d, f_p, f_g)); fine_stack.append(ff)
         try:
             a_sql = result.type.sql(dialect)
             e_sql = exp_dt.sql(dialect)
         finally:
-            rec_stack.pop()
+            rec_stack.pop(); fine_stack.pop()
         assert a_sql == e_sql
 
         pk_rt = rc.pack_expr(result.type, exp)
@@ -1507,6 +1886,7 @@ for i, (meta, sql, expected) in enumerate(th.load_sql_fixture_pairs("optimizer/a
         if p_sig is not None and pk_rt is not rc._UNPACKABLE and pk_et is not rc._UNPACKABLE:
             rt_idx = len(b_af["asts"]); b_af["asts"].append(pk_rt)
             et_idx = len(b_af["asts"]); b_af["asts"].append(pk_et)
+            rid = b_af["next_rid"]; b_af["next_rid"] = rid + 1
             b_af["rows"][(i, dialect)] = (
                 intern_dep(b_af, p_d, p_p, p_g),
                 p_sig,
@@ -1515,48 +1895,48 @@ for i, (meta, sql, expected) in enumerate(th.load_sql_fixture_pairs("optimizer/a
                 intern_dep(b_af, eb_d, eb_p, eb_g),
                 et_idx,
                 intern_dep(b_af, f_d, f_p, f_g),
+                rid,
             )
+            add_fine(b_af["pf"], pf, rid)
+            add_fine(b_af["of"], of, rid)
+            add_fine(b_af["ff"], ff, rid)
+            add_fine(b_af["ef"], ebf, rid)
 
 # Collect test_annotate_types
 b_at = get_builder("annotate_types")
 for i, (meta, sql, expected) in enumerate(th.load_sql_fixture_pairs("optimizer/annotate_types.sql"), start=1):
     dialect = meta.get("dialect")
     d_key = dialect or ""
-    p_d, p_p, p_g = set(), set(), set()
-    rec_stack.append((p_d, p_p, p_g))
-    try:
-        parsed = parse_one(sql, read=dialect)
-    finally:
-        rec_stack.pop()
+    p_d, p_p, p_g, pf = set(), set(), set(), set()
+    rec_stack.append((p_d, p_p, p_g)); fine_stack.append(pf)
+    try: parsed = parse_one(sql, read=dialect)
+    finally: rec_stack.pop(); fine_stack.pop()
     p_sig = rc.ast_struct_sig(parsed, exp)
 
-    o_d, o_p, o_g = set(), set(), set()
-    rec_stack.append((o_d, o_p, o_g))
+    o_d, o_p, o_g, of = set(), set(), set(), set()
+    rec_stack.append((o_d, o_p, o_g)); fine_stack.append(of)
     try:
         result = topt.annotate_types(parsed, dialect=dialect)
         for expression in result.walk():
             for arg_key, arg in expression.args.items():
                 for child in arg if isinstance(arg, list) else [arg]:
                     if isinstance(child, exp.Expr):
-                        assert child.arg_key == arg_key
-                        assert child.parent is expression
+                        assert child.arg_key == arg_key and child.parent is expression
     finally:
-        rec_stack.pop()
+        rec_stack.pop(); fine_stack.pop()
 
-    eb_d, eb_p, eb_g = set(), set(), set()
-    rec_stack.append((eb_d, eb_p, eb_g))
-    try:
-        exp_dt = exp.DataType.build(expected, dialect=dialect)
-    finally:
-        rec_stack.pop()
+    eb_d, eb_p, eb_g, ebf = set(), set(), set(), set()
+    rec_stack.append((eb_d, eb_p, eb_g)); fine_stack.append(ebf)
+    try: exp_dt = exp.DataType.build(expected, dialect=dialect)
+    finally: rec_stack.pop(); fine_stack.pop()
 
-    f_d, f_p, f_g = set(), set(), set()
-    rec_stack.append((f_d, f_p, f_g))
+    f_d, f_p, f_g, ff = set(), set(), set(), set()
+    rec_stack.append((f_d, f_p, f_g)); fine_stack.append(ff)
     try:
         a_sql = result.type.sql(dialect)
         e_sql = exp_dt.sql(dialect)
     finally:
-        rec_stack.pop()
+        rec_stack.pop(); fine_stack.pop()
     assert a_sql == e_sql
 
     pk_rt = rc.pack_expr(result.type, exp)
@@ -1564,6 +1944,7 @@ for i, (meta, sql, expected) in enumerate(th.load_sql_fixture_pairs("optimizer/a
     if p_sig is not None and pk_rt is not rc._UNPACKABLE and pk_et is not rc._UNPACKABLE:
         rt_idx = len(b_at["asts"]); b_at["asts"].append(pk_rt)
         et_idx = len(b_at["asts"]); b_at["asts"].append(pk_et)
+        rid = b_at["next_rid"]; b_at["next_rid"] = rid + 1
         b_at["rows"][(i, d_key)] = (
             intern_dep(b_at, p_d, p_p, p_g),
             p_sig,
@@ -1572,9 +1953,108 @@ for i, (meta, sql, expected) in enumerate(th.load_sql_fixture_pairs("optimizer/a
             intern_dep(b_at, eb_d, eb_p, eb_g),
             et_idx,
             intern_dep(b_at, f_d, f_p, f_g),
+            rid,
         )
+        add_fine(b_at["pf"], pf, rid)
+        add_fine(b_at["of"], of, rid)
+        add_fine(b_at["ff"], ff, rid)
+        add_fine(b_at["ef"], ebf, rid)
+
+# Collect in_nulls (180 queries) and corr_all (60 queries) for DuckDB parser/generator stage replay!
+_tmp_to = topt.TestOptimizer("test_optimize_in_nulls")
+_tmp_to.setUp()
+opt_schema = _tmp_to.schema
+b_in = get_builder("in_nulls")
+for where in ("", " WHERE y.b IS NOT NULL", " WHERE y.b IS NULL", " WHERE FALSE", " WHERE y.c = x.a", " WHERE y.b = x.a"):
+    for pred in (f"x.a IN (SELECT y.b FROM y{{where}})", f"x.a = ANY (SELECT y.b FROM y{{where}})"):
+        for sql in (
+            f"SELECT x.a, {{pred}} AS r FROM x",
+            f"SELECT x.a, NOT ({{pred}}) AS r FROM x",
+            f"SELECT x.a, ({{pred}}) AND x.a > 1 AS r FROM x",
+            f"SELECT x.a, ({{pred}}) OR x.a > 1 AS r FROM x",
+            f"SELECT x.a FROM x WHERE NOT ({{pred}})",
+            f"SELECT x.a FROM x WHERE NOT (({{pred}}) AND x.a > 1)",
+            f"SELECT x.a FROM x WHERE ({{pred}}) IS NULL",
+            f"SELECT x.a FROM x WHERE COALESCE(({{pred}}), TRUE)",
+            f"SELECT x.a FROM x WHERE ({{pred}}) = FALSE",
+            f"SELECT x.a FROM x WHERE ({{pred}}) AND x.a > 1",
+            f"SELECT x.a FROM x WHERE ({{pred}}) OR x.a > 1",
+            f"SELECT x.a FROM x JOIN x AS x2 ON x.b = x2.b AND ({{pred}}) = FALSE",
+            f"SELECT x.a FROM x QUALIFY ROW_NUMBER() OVER (ORDER BY x.a) > 0 AND ({{pred}}) = FALSE",
+            f"SELECT x.a FROM x GROUP BY x.a HAVING ({{pred}}) IS NULL",
+            f"SELECT x.a FROM x ORDER BY ({{pred}}), x.a",
+        ):
+            p_d, p_p, p_g, pf = set(), set(), set(), set()
+            rec_stack.append((p_d, p_p, p_g)); fine_stack.append(pf)
+            try: parsed = parse_one(sql, read="duckdb")
+            finally: rec_stack.pop(); fine_stack.pop()
+            p_sig = rc.ast_struct_sig(parsed, exp)
+
+            o_d, o_p, o_g, of = set(), set(), set(), set()
+            rec_stack.append((o_d, o_p, o_g)); fine_stack.append(of)
+            try: optimized = topt.optimizer.optimize(parsed, schema=opt_schema, dialect="duckdb")
+            finally: rec_stack.pop(); fine_stack.pop()
+
+            f_d, f_p, f_g, ff = set(), set(), set(), set()
+            rec_stack.append((f_d, f_p, f_g)); fine_stack.append(ff)
+            try: optimized.sql("duckdb")
+            finally: rec_stack.pop(); fine_stack.pop()
+
+            pk_opt = rc.pack_expr(optimized, exp)
+            if p_sig is not None and pk_opt is not rc._UNPACKABLE:
+                ast_idx = len(b_in["asts"]); b_in["asts"].append(pk_opt)
+                rid = b_in["next_rid"]; b_in["next_rid"] = rid + 1
+                b_in["rows"][sql] = (
+                    intern_dep(b_in, p_d, p_p, p_g), p_sig,
+                    intern_dep(b_in, o_d, o_p, o_g), ast_idx,
+                    intern_dep(b_in, f_d, f_p, f_g), rid,
+                )
+                add_fine(b_in["pf"], pf, rid)
+                add_fine(b_in["of"], of, rid)
+                add_fine(b_in["ff"], ff, rid)
+
+b_ca = get_builder("corr_all")
+for col in ("b", "c"):
+    for op in ("=", "<>", ">", ">=", "<", "<="):
+        pred = f"x.a {{op}} ALL (SELECT y.{{col}} FROM y WHERE y.c = x.b)"
+        for sql in (
+            f"SELECT x.a, x.b, {{pred}} AS r FROM x",
+            f"SELECT x.a, x.b, {{pred}} AND x.b = 1 AS r FROM x",
+            f"SELECT x.a, x.b FROM x WHERE {{pred}}",
+            f"SELECT x.a, x.b FROM x WHERE NOT ({{pred}})",
+            f"SELECT x.a, x.b FROM x WHERE NOT {{pred}}",
+        ):
+            p_d, p_p, p_g, pf = set(), set(), set(), set()
+            rec_stack.append((p_d, p_p, p_g)); fine_stack.append(pf)
+            try: parsed = parse_one(sql, read="duckdb")
+            finally: rec_stack.pop(); fine_stack.pop()
+            p_sig = rc.ast_struct_sig(parsed, exp)
+
+            o_d, o_p, o_g, of = set(), set(), set(), set()
+            rec_stack.append((o_d, o_p, o_g)); fine_stack.append(of)
+            try: optimized = topt.optimizer.optimize(parsed, schema=opt_schema, dialect="duckdb")
+            finally: rec_stack.pop(); fine_stack.pop()
+
+            f_d, f_p, f_g, ff = set(), set(), set(), set()
+            rec_stack.append((f_d, f_p, f_g)); fine_stack.append(ff)
+            try: optimized.sql("duckdb")
+            finally: rec_stack.pop(); fine_stack.pop()
+
+            pk_opt = rc.pack_expr(optimized, exp)
+            if p_sig is not None and pk_opt is not rc._UNPACKABLE:
+                ast_idx = len(b_ca["asts"]); b_ca["asts"].append(pk_opt)
+                rid = b_ca["next_rid"]; b_ca["next_rid"] = rid + 1
+                b_ca["rows"][sql] = (
+                    intern_dep(b_ca, p_d, p_p, p_g), p_sig,
+                    intern_dep(b_ca, o_d, o_p, o_g), ast_idx,
+                    intern_dep(b_ca, f_d, f_p, f_g), rid,
+                )
+                add_fine(b_ca["pf"], pf, rid)
+                add_fine(b_ca["of"], of, rid)
+                add_fine(b_ca["ff"], ff, rid)
 
 restore_rec()
+restore_fine()
 
 opt_dir = Path({str(opt_dir)!r})
 tot_opt_rows = 0
@@ -1587,10 +2067,15 @@ for name, b in shard_builders.items():
     ast_offsets = rc._write_ast_table(b["asts"], ast_p)
     ib = marshal.dumps((b["deps_list"], b["rows"], ast_offsets))
     (opt_dir / f"{{safe_name}}.idx").write_bytes(ib)
+    fb_sz = rc._write_fine_tables(
+        (b["pf"], b["of"], b["ff"], b["ef"]),
+        opt_dir / f"{{safe_name}}.fdat",
+        opt_dir / f"{{safe_name}}.ftoc",
+    )
     tot_opt_rows += len(b["rows"])
-    tot_opt_bytes += len(ib) + ast_p.stat().st_size
+    tot_opt_bytes += len(ib) + ast_p.stat().st_size + fb_sz
 
-# ---- Part B: Collect Lazy DuckDB Query-Result Cache across all TestOptimizer DuckDB tests ----
+# ---- Part B: Collect Lazy DuckDB Query-Result Cache ----
 queries_cache = {{}}
 ddls_set = set()
 bad_queries = set()
@@ -1618,17 +2103,10 @@ class _RecDuckCursor:
                 queries_cache.pop(self._key, None)
         return rows
 
-    def fetchone(self):
-        return self._cur.fetchone()
-
-    def df(self):
-        return self._cur.df()
-
-    def fetchdf(self):
-        return self._cur.fetchdf()
-
-    def __getattr__(self, name):
-        return getattr(self._cur, name)
+    def fetchone(self): return self._cur.fetchone()
+    def df(self): return self._cur.df()
+    def fetchdf(self): return self._cur.fetchdf()
+    def __getattr__(self, name): return getattr(self._cur, name)
 
 class _RecDuckConn:
     def __init__(self, real_conn, init_sig):
@@ -1639,24 +2117,16 @@ class _RecDuckConn:
         if parameters is not None or a or kw or type(query) is not str:
             return self._conn.execute(query, parameters, *a, **kw) if parameters is not None else self._conn.execute(query, *a, **kw)
         if rc._is_pure_read_sql(query):
-            cur = self._conn.execute(query)
-            return _RecDuckCursor(cur, (self._sig, query))
+            return _RecDuckCursor(self._conn.execute(query), (self._sig, query))
         cur = self._conn.execute(query)
         self._sig = rc._ddl_step_sig(self._sig, query)
         ddls_set.add(self._sig)
         return cur
 
-    def close(self):
-        return self._conn.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *ea):
-        self.close()
-
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
+    def close(self): return self._conn.close()
+    def __enter__(self): return self
+    def __exit__(self, *ea): self.close()
+    def __getattr__(self, name): return getattr(self._conn, name)
 
 orig_connect = duckdb.connect
 def _rec_connect(*a, **kw):
@@ -1664,13 +2134,12 @@ def _rec_connect(*a, **kw):
         return _RecDuckConn(orig_connect(config={{"threads": 1}}), b"EMPTY")
     return orig_connect(*a, **kw)
 
-# Find all TestOptimizer methods using duckdb.connect or self.conn (excluding check_file which uses check_file_duckdb_hashes!)
 duck_methods = []
 for node in _ast.walk(_topt_tree):
     if isinstance(node, _ast.ClassDef) and node.name == "TestOptimizer":
         for item in node.body:
             if isinstance(item, _ast.FunctionDef) and item.name.startswith("test_"):
-                src_seg = _ast.get_source_segment((Path({str(sg_root)!r}) / "tests/test_optimizer.py").read_text(), item) or ""
+                src_seg = _ast.get_source_segment(_topt_src, item) or ""
                 if ("duckdb.connect" in src_seg or "self.conn" in src_seg) and "check_file" not in src_seg:
                     duck_methods.append(item.name)
                 elif item.name == "test_eliminate_joins":
@@ -1679,7 +2148,6 @@ for node in _ast.walk(_topt_tree):
 topt.duckdb.connect = _rec_connect
 opt_db_conn = orig_connect("/app/duckdb_opt.db", read_only=True, config={{"threads": 1}})
 topt.TestOptimizer.conn = _RecDuckConn(opt_db_conn, b"OPT_DB")
-# For test_eliminate_joins, skip check_file during DuckDB recording so we only record its raw self.conn query!
 topt.TestOptimizer.check_file = lambda *a, **kw: None
 for mname in duck_methods:
     tc = topt.TestOptimizer(mname)
@@ -1693,6 +2161,170 @@ dblob = zlib.compress(pickle.dumps({{"queries": queries_cache, "ddls": ddls_set}
 Path({str(duck_path)!r}).write_bytes(dblob)
 print(f"{{tot_opt_rows}} {{tot_opt_bytes}} {{len(queries_cache)}} {{len(dblob)}}")
 """
-    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"build_opt_replay_and_duckdb_cache failed ({res.returncode}):\n{res.stderr}\n{res.stdout}")
+    parts = res.stdout.strip().splitlines()[-1].split()
+    return int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+
+
+def build_exec_and_sqlite_cache(
+    sg_root: Path,
+    exec_path: Path = EXEC_REPLAY_PATH,
+    sqlite_path: Path = SQLITE_CACHE_PATH,
+) -> tuple[int, int, int, int]:
+    """Collect (1) Non-TPC TestExecutor execute() stage-reuse cache and (2) Lazy SQLite Query Cache."""
+    code = f"""
+import importlib, pickle, sqlite3, sys, unittest, zlib
+from pathlib import Path
+sys.path.insert(0, {str(sg_root)!r})
+sys.path.insert(0, "/app")
+
+import replay_cache as rc
+import runner
+from sqlglot import exp, parse_one
+from sqlglot.executor.python import PythonExecutor
+from sqlglot.executor.table import ensure_tables
+from sqlglot.helper import dict_depth
+from sqlglot.optimizer import optimize
+from sqlglot.optimizer.annotate_types import annotate_types
+from sqlglot.planner import Plan
+from sqlglot.schema import ensure_schema, flatten_schema, nested_get, nested_set
+import tests.test_executor as texec
+
+# ---- Part A: Collect non-TPC TestExecutor execute() stage-reuse cache ----
+exec_cache = {{}}
+bad_exec = set()
+orig_exec = texec.execute
+
+def _rec_exec(sql, schema=None, dialect=None, tables=None):
+    res_tbl = orig_exec(sql, schema=schema, dialect=dialect, tables=tables)
+    k = rc.exec_call_key(sql, schema, tables, dialect)
+    if k is not None and k not in bad_exec:
+        try:
+            tables_ = ensure_tables(tables, dialect=dialect)
+            s_eff = schema
+            if not s_eff:
+                s_eff = {{}}
+                flattened_tables = flatten_schema(tables_.mapping, depth=dict_depth(tables_.mapping))
+                for keys in flattened_tables:
+                    tbl = nested_get(tables_.mapping, *zip(keys, keys))
+                    assert tbl is not None
+                    for col in tbl.columns:
+                        val = tbl[0][col]
+                        ct = annotate_types(exp.convert(val), dialect=dialect).type or type(val).__name__
+                        nested_set(s_eff, [*keys, col], ct)
+            schema_obj = ensure_schema(s_eff, dialect=dialect)
+            if tables_.supported_table_args and tables_.supported_table_args != schema_obj.supported_table_args:
+                raise ValueError("table args mismatch")
+            opt = optimize(sql, schema_obj, leave_tables_isolated=True, dialect=dialect)
+            plan = Plan(opt)
+            det_h = runner._hash_plan_det(plan)
+            py_h = runner._hash_plan_py_code(plan)
+            pk_opt = rc.pack_expr(opt, exp)
+            if pk_opt is not rc._UNPACKABLE:
+                val = (pk_opt, det_h, py_h, tuple(res_tbl.columns), list(res_tbl.rows))
+                pickle.dumps(val, protocol=pickle.HIGHEST_PROTOCOL)
+                if k in exec_cache and exec_cache[k][1:] != val[1:]:
+                    bad_exec.add(k)
+                    exec_cache.pop(k, None)
+                else:
+                    exec_cache[k] = val
+        except Exception:
+            bad_exec.add(k)
+            exec_cache.pop(k, None)
+    return res_tbl
+
+texec.execute = _rec_exec
+texec.TestExecutor.setUpClass = classmethod(lambda cls: setattr(cls, "cache", {{}}))
+texec.TestExecutor.tearDownClass = classmethod(lambda cls: None)
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(texec.TestExecutor)
+filt = unittest.TestSuite()
+skip_e = {{"test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch", "test_agg_order"}}
+for tc in suite:
+    if getattr(tc, "_testMethodName", "") not in skip_e:
+        filt.addTest(tc)
+res = unittest.TestResult()
+filt.run(res)
+if not res.wasSuccessful():
+    raise RuntimeError(f"exec_replay collection failed: {{res.failures[:1]}} {{res.errors[:1]}}")
+eblob = zlib.compress(pickle.dumps(exec_cache, protocol=pickle.HIGHEST_PROTOCOL), 6)
+Path({str(exec_path)!r}).write_bytes(eblob)
+
+# ---- Part B: Collect Lazy SQLite Query Cache (test_optimize_cross_joins & test_simplify_between & test_optimizer) ----
+sq_queries = {{}}
+sq_ddls = set()
+sq_bad = set()
+
+class _RecSqCursor:
+    def __init__(self, real_cur, key):
+        self._cur = real_cur
+        self._key = key
+        self.description = real_cur.description
+    def fetchall(self):
+        rows = self._cur.fetchall()
+        if self._key is not None and self._key not in sq_bad:
+            try:
+                cols = tuple(d[0] for d in (self.description or ()))
+                pickle.dumps((cols, rows), protocol=pickle.HIGHEST_PROTOCOL)
+                prev = sq_queries.get(self._key)
+                if prev is None:
+                    sq_queries[self._key] = (cols, rows)
+                elif prev != (cols, rows):
+                    sq_bad.add(self._key)
+                    sq_queries.pop(self._key, None)
+            except Exception:
+                sq_bad.add(self._key)
+                sq_queries.pop(self._key, None)
+        return rows
+    def fetchone(self): return self._cur.fetchone()
+    def __getattr__(self, name): return getattr(self._cur, name)
+
+class _RecSqConn:
+    def __init__(self, real_conn):
+        self._conn = real_conn
+        self._sig = b"SQLITE"
+    def execute(self, query, parameters=None, *a, **kw):
+        if parameters is not None or a or kw or type(query) is not str:
+            return self._conn.execute(query, parameters, *a, **kw) if parameters is not None else self._conn.execute(query, *a, **kw)
+        if rc._is_pure_read_sql(query):
+            return _RecSqCursor(self._conn.execute(query), (self._sig, query))
+        cur = self._conn.execute(query)
+        self._sig = rc._ddl_step_sig(self._sig, "E:" + query)
+        sq_ddls.add(self._sig)
+        return cur
+    def executescript(self, script):
+        cur = self._conn.executescript(script)
+        if type(script) is str:
+            self._sig = rc._ddl_step_sig(self._sig, "S:" + script)
+            sq_ddls.add(self._sig)
+        return cur
+    def close(self): return self._conn.close()
+    def __enter__(self): return self
+    def __exit__(self, *ea): self.close()
+    def __getattr__(self, name): return getattr(self._conn, name)
+
+orig_sq_connect = sqlite3.connect
+def _rec_sq_connect(db, *a, **kw):
+    if db == ":memory:" and not a and not kw:
+        return _RecSqConn(orig_sq_connect(":memory:"))
+    return orig_sq_connect(db, *a, **kw)
+
+for mod_n in ("tests.test_optimize_cross_joins", "tests.test_simplify_between"):
+    m = importlib.import_module(mod_n)
+    m.sqlite3 = type("_SqMod", (), {{"connect": staticmethod(_rec_sq_connect), "sqlite_version_info": sqlite3.sqlite_version_info}})()
+    s = unittest.defaultTestLoader.loadTestsFromModule(m)
+    r = unittest.TestResult()
+    s.run(r)
+    if not r.wasSuccessful():
+        raise RuntimeError(f"sqlite cache failed in {{mod_n}}: {{r.failures[:1]}} {{r.errors[:1]}}")
+
+sblob = zlib.compress(pickle.dumps({{"queries": sq_queries, "ddls": sq_ddls}}, protocol=pickle.HIGHEST_PROTOCOL), 6)
+Path({str(sqlite_path)!r}).write_bytes(sblob)
+print(f"{{len(exec_cache)}} {{len(eblob)}} {{len(sq_queries)}} {{len(sblob)}}")
+"""
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"build_opt_replay_and_duckdb_cache failed ({res.returncode}):\n{res.stderr}\n{res.stdout}")
     parts = res.stdout.strip().splitlines()[-1].split()
     return int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])

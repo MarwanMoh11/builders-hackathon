@@ -242,18 +242,51 @@ print(cnt)
     res_r = subprocess.run([sys.executable, "-c", rows_code], capture_output=True, text=True, check=True)
     n_rows = int(res_r.stdout.strip().splitlines()[-1])
 
-    # 6. Build-time Validator replay index, Optimizer fixture replay index, and Lazy DuckDB Query Cache!
+    # 5b. Precompute post-qualify+pushdown_projections ASTs for all 57 TPC-DS execute queries
+    #     so late-stage optimizer commits (RULES[2:] & typing/*) skip ~70% of optimize() CPU!
+    pq_code = """
+import marshal, sys
+from pathlib import Path
+sys.path.insert(0, "/sqlglot")
+sys.path.insert(0, "/app")
+import replay_cache as rc, tests.helpers as th
+from sqlglot import exp, parse_one
+from sqlglot.optimizer import RULES, optimize
+from sqlglot.schema import ensure_schema
+
+s_ds = ensure_schema(th.TPCDS_SCHEMA)
+out = Path("/app/tpc_pq")
+out.mkdir(parents=True, exist_ok=True)
+cnt = 0
+for i, (args, sql, _) in enumerate(th.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"), 1):
+    if args.get("execute"):
+        pq = optimize(parse_one(sql), s_ds, rules=RULES[:2], leave_tables_isolated=True)
+        pk = rc.pack_expr(pq, exp)
+        if pk is not rc._UNPACKABLE:
+            (out / f"{i}.ast").write_bytes(marshal.dumps(pk))
+            cnt += 1
+print(cnt)
+"""
+    res_pq = subprocess.run([sys.executable, "-c", pq_code], capture_output=True, text=True, check=True)
+    n_pq = int(res_pq.stdout.strip().splitlines()[-1])
+
+    # 6. Build-time Exact Dep Index (Wave 2A), Fine-Grained Validator/Optimizer Replay (Wave 1+2B),
+    #    Executor Replay, Lazy DuckDB Cache, and Lazy SQLite Cache (Wave 2C)!
     t_rc = time.perf_counter()
+    import dep_index as di
     import replay_cache as rc
+    d_seen, d_keep, d_attrs, d_dicts, d_bytes = di.build_dep_index(sg_root)
     vp, ve, vb = rc.build_val_replay(sg_root)
     orows, obytes, dq, dbytes = rc.build_opt_replay_and_duckdb_cache(sg_root)
+    erows, ebytes, sq, sbytes = rc.build_exec_and_sqlite_cache(sg_root)
 
     print(
         f"[build_caches] fixtures={len(fixture_pairs)}p/{len(fixture_singles)}s ({len(fix_blob)/1024:.1f} KB), "
-        f"tpc_tables={n_tbl} ({tbl_bytes/1024:.1f} KB), tpc_cache py={n_py} c={n_c} cb={n_cb} rows={n_rows}, "
-        f"val_replay={vp}p/{ve}e ({vb/1024:.1f} KB), opt_replay={orows}r ({obytes/1024:.1f} KB), "
-        f"duckdb_cache={dq}q ({dbytes/1024:.1f} KB) [replay={time.perf_counter()-t_rc:.2f}s] "
-        f"in {time.perf_counter() - t0:.2f}s",
+        f"tpc_tables={n_tbl} ({tbl_bytes/1024:.1f} KB), tpc_cache py={n_py} c={n_c} cb={n_cb} rows={n_rows} pq={n_pq}, "
+        f"dep_index={d_seen}t/{d_keep}k ({d_bytes/1024:.0f} KB), "
+        f"val_replay={vp}p/{ve}e ({vb/1024:.0f} KB), opt_replay={orows}r ({obytes/1024:.0f} KB), "
+        f"duckdb={dq}q ({dbytes/1024:.1f} KB), exec_replay={erows}r ({ebytes/1024:.0f} KB), sqlite={sq}q ({sbytes/1024:.1f} KB) "
+        f"[w1+w2={time.perf_counter()-t_rc:.1f}s] total={time.perf_counter() - t0:.1f}s",
         flush=True,
     )
 

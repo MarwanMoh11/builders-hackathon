@@ -935,12 +935,17 @@ def _patch_optimizer_module(
                 if opt_shard is not None and not do_pickle:
                     rec = opt_shard.rows.get((fk_name, bool(pretty), row_idx))
                     if rec is not None:
-                        p_dep, p_sig, o_dep, opt_ast_idx, f_dep, e_dep = rec
+                        p_dep, p_sig, o_dep, opt_ast_idx, f_dep, e_dep, rid = rec
                         dflags = opt_shard.dirty_flags
-                        p_dirty = dflags[p_dep]
-                        o_dirty = dflags[o_dep]
-                        f_dirty = dflags[f_dep]
-                        e_dirty = do_exec and dflags[e_dep]
+                        doflags = opt_shard.dirty_opt_flags
+                        dp_r = opt_shard.dirty_p_rids
+                        do_r = opt_shard.dirty_o_rids
+                        df_r = opt_shard.dirty_f_rids
+                        de_r = opt_shard.dirty_e_rids
+                        p_dirty = dflags[p_dep] and (dp_r is None or rid in dp_r)
+                        o_dirty = doflags[o_dep] and (do_r is None or rid in do_r)
+                        f_dirty = dflags[f_dep] and (df_r is None or rid in df_r)
+                        e_dirty = do_exec and dflags[e_dep] and (de_r is None or rid in de_r)
                         if not o_dirty:
                             if not p_dirty:
                                 if not f_dirty and not e_dirty:
@@ -1063,6 +1068,11 @@ def _patch_optimizer_module(
             if shard is None:
                 return orig_af(self)
             dflags = shard.dirty_flags
+            doflags = shard.dirty_opt_flags
+            dp_r = shard.dirty_p_rids
+            do_r = shard.dirty_o_rids
+            df_r = shard.dirty_f_rids
+            de_r = shard.dirty_e_rids
             exp_mod = topt.exp
             test_schema = {
                 "tbl": {
@@ -1084,11 +1094,11 @@ def _patch_optimizer_module(
                 for dialect in d_str.split(", "):
                     rec = shard.rows.get((row_idx, dialect))
                     if rec is not None:
-                        p_dep, p_sig, o_dep, rt_idx, eb_dep, et_idx, f_dep = rec
-                        p_dirty = dflags[p_dep]
-                        o_dirty = dflags[o_dep]
-                        eb_dirty = dflags[eb_dep]
-                        f_dirty = dflags[f_dep]
+                        p_dep, p_sig, o_dep, rt_idx, eb_dep, et_idx, f_dep, rid = rec
+                        p_dirty = dflags[p_dep] and (dp_r is None or rid in dp_r)
+                        o_dirty = doflags[o_dep] and (do_r is None or rid in do_r)
+                        eb_dirty = dflags[eb_dep] and (de_r is None or rid in de_r)
+                        f_dirty = dflags[f_dep] and (df_r is None or rid in df_r)
                         if not o_dirty:
                             if not p_dirty:
                                 if not eb_dirty and not f_dirty:
@@ -1130,6 +1140,11 @@ def _patch_optimizer_module(
             if shard is None:
                 return orig_at(self)
             dflags = shard.dirty_flags
+            doflags = shard.dirty_opt_flags
+            dp_r = shard.dirty_p_rids
+            do_r = shard.dirty_o_rids
+            df_r = shard.dirty_f_rids
+            de_r = shard.dirty_e_rids
             exp_mod = topt.exp
             for i, (meta, sql, expected) in enumerate(
                 topt.load_sql_fixture_pairs("optimizer/annotate_types.sql"), start=1
@@ -1140,11 +1155,11 @@ def _patch_optimizer_module(
                 d_key = dialect or ""
                 rec = shard.rows.get((row_idx, d_key))
                 if rec is not None:
-                    p_dep, p_sig, o_dep, rt_idx, eb_dep, et_idx, f_dep = rec
-                    p_dirty = dflags[p_dep]
-                    o_dirty = dflags[o_dep]
-                    eb_dirty = dflags[eb_dep]
-                    f_dirty = dflags[f_dep]
+                    p_dep, p_sig, o_dep, rt_idx, eb_dep, et_idx, f_dep, rid = rec
+                    p_dirty = dflags[p_dep] and (dp_r is None or rid in dp_r)
+                    o_dirty = doflags[o_dep] and (do_r is None or rid in do_r)
+                    eb_dirty = dflags[eb_dep] and (de_r is None or rid in de_r)
+                    f_dirty = dflags[f_dep] and (df_r is None or rid in df_r)
                     if not o_dirty:
                         if not p_dirty:
                             if not eb_dirty and not f_dirty:
@@ -1179,10 +1194,17 @@ def _patch_optimizer_module(
 
         topt.TestOptimizer.test_annotate_types = _fast_annotate_types
 
-    # Exact DuckDB skip for test_optimize_in_nulls & test_optimize_correlated_all when optimized SQL unchanged
+    # Exact stage-reuse replay + DuckDB skip for test_optimize_in_nulls & test_optimize_correlated_all
     in_nulls_base = maps.get("opt_in_nulls_baseline", {})
     if in_nulls_base and "TestOptimizer.test_optimize_in_nulls" not in _skip_m:
         def _fast_in_nulls(self):
+            scope = ACTIVE_REPLAY_SCOPE
+            in_shard = (
+                rc.get_opt_shard("in_nulls", scope)
+                if (scope is not None and not helpers_patched and not getattr(topt, "_blast_topt_patched", False))
+                else None
+            )
+            exp_mod = topt.exp
             for where in (
                 "",
                 " WHERE y.b IS NOT NULL",
@@ -1213,6 +1235,46 @@ def _patch_optimizer_module(
                         f"SELECT x.a FROM x GROUP BY x.a HAVING ({predicate}) IS NULL",
                         f"SELECT x.a FROM x ORDER BY ({predicate}), x.a",
                     ):
+                        if in_shard is not None:
+                            rec = in_shard.rows.get(sql)
+                            if rec is not None:
+                                p_dep, p_sig, o_dep, opt_idx, f_dep, rid = rec
+                                df = in_shard.dirty_flags
+                                dof = in_shard.dirty_opt_flags
+                                p_d = df[p_dep] and (in_shard.dirty_p_rids is None or rid in in_shard.dirty_p_rids)
+                                o_d = dof[o_dep] and (in_shard.dirty_o_rids is None or rid in in_shard.dirty_o_rids)
+                                f_d = df[f_dep] and (in_shard.dirty_f_rids is None or rid in in_shard.dirty_f_rids)
+                                if not o_d:
+                                    if not p_d:
+                                        if not f_d:
+                                            continue
+                                        with self.subTest(sql=sql):
+                                            opt_sql = in_shard.get_expr(opt_idx, exp_mod).sql("duckdb")
+                                            if in_nulls_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
+                                                continue
+                                            expected = self.conn.execute(sql).fetchall()
+                                            actual = self.conn.execute(opt_sql).fetchall()
+                                            if "ORDER BY" in sql:
+                                                self.assertEqual(actual, expected)
+                                            else:
+                                                self.assertCountEqual(actual, expected)
+                                        continue
+                                    else:
+                                        with self.subTest(sql=sql):
+                                            parsed_live = topt.parse_one(sql, read="duckdb")
+                                            if rc.ast_struct_sig(parsed_live, exp_mod) == p_sig:
+                                                if not f_d:
+                                                    continue
+                                                opt_sql = in_shard.get_expr(opt_idx, exp_mod).sql("duckdb")
+                                                if in_nulls_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
+                                                    continue
+                                                expected = self.conn.execute(sql).fetchall()
+                                                actual = self.conn.execute(opt_sql).fetchall()
+                                                if "ORDER BY" in sql:
+                                                    self.assertEqual(actual, expected)
+                                                else:
+                                                    self.assertCountEqual(actual, expected)
+                                                continue
                         with self.subTest(sql=sql):
                             optimized = topt.optimizer.optimize(sql, schema=self.schema, dialect="duckdb")
                             opt_sql = optimized.sql("duckdb")
@@ -1231,6 +1293,13 @@ def _patch_optimizer_module(
     corr_base = maps.get("opt_corr_all_baseline", {})
     if corr_base and "TestOptimizer.test_optimize_correlated_all" not in _skip_m:
         def _fast_corr_all(self):
+            scope = ACTIVE_REPLAY_SCOPE
+            ca_shard = (
+                rc.get_opt_shard("corr_all", scope)
+                if (scope is not None and not helpers_patched and not getattr(topt, "_blast_topt_patched", False))
+                else None
+            )
+            exp_mod = topt.exp
             conn = None
             try:
                 for column in ("b", "c"):
@@ -1243,6 +1312,32 @@ def _patch_optimizer_module(
                             f"SELECT x.a, x.b FROM x WHERE NOT ({predicate})",
                             f"SELECT x.a, x.b FROM x WHERE NOT {predicate}",
                         ):
+                            if ca_shard is not None:
+                                rec = ca_shard.rows.get(sql)
+                                if rec is not None:
+                                    p_dep, p_sig, o_dep, opt_idx, f_dep, rid = rec
+                                    df = ca_shard.dirty_flags
+                                    dof = ca_shard.dirty_opt_flags
+                                    p_d = df[p_dep] and (ca_shard.dirty_p_rids is None or rid in ca_shard.dirty_p_rids)
+                                    o_d = dof[o_dep] and (ca_shard.dirty_o_rids is None or rid in ca_shard.dirty_o_rids)
+                                    f_d = df[f_dep] and (ca_shard.dirty_f_rids is None or rid in ca_shard.dirty_f_rids)
+                                    if not o_d:
+                                        if not p_d:
+                                            if not f_d:
+                                                continue
+                                            with self.subTest(sql=sql):
+                                                opt_sql = ca_shard.get_expr(opt_idx, exp_mod).sql("duckdb")
+                                                if corr_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
+                                                    continue
+                                        else:
+                                            with self.subTest(sql=sql):
+                                                parsed_live = topt.parse_one(sql, read="duckdb")
+                                                if rc.ast_struct_sig(parsed_live, exp_mod) == p_sig:
+                                                    if not f_d:
+                                                        continue
+                                                    opt_sql = ca_shard.get_expr(opt_idx, exp_mod).sql("duckdb")
+                                                    if corr_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
+                                                        continue
                             with self.subTest(sql=sql):
                                 optimized = topt.optimizer.optimize(sql, schema=self.schema, dialect="duckdb")
                                 self.assertIsNone(optimized.find(topt.exp.All))
@@ -2688,14 +2783,42 @@ def _patch_executor_module(
             for r in all_touched
         )
         py_exec_touched = executor_dir_touched or ("sqlglot/generators/python.py" in all_touched)
-        opt_or_duck_untouched = not any(
+        duck_untouched = not any(
             r.startswith((
                 "sqlglot/parser", "sqlglot/tokens", "sqlglot/tokenizer",
-                "sqlglot/generator", "sqlglot/dialects/", "sqlglot/expressions/",
-                "sqlglot/optimizer/", "sqlglot/typing/", "sqlglot/schema.py", "sqlglot/helper.py",
+                "sqlglot/expressions/",
             ))
+            or r in (
+                "sqlglot/generator.py", "sqlglot/generators/__init__.py", "sqlglot/generators/duckdb.py",
+                "sqlglot/dialects/__init__.py", "sqlglot/dialects/dialect.py", "sqlglot/dialects/duckdb.py",
+                "sqlglot/helper.py", "sqlglot/__init__.py",
+            )
             for r in all_touched
         )
+        _LATE_OPT_FILES = frozenset({
+            "sqlglot/optimizer/normalize.py",
+            "sqlglot/optimizer/unnest_subqueries.py",
+            "sqlglot/optimizer/pushdown_predicates.py",
+            "sqlglot/optimizer/optimize_joins.py",
+            "sqlglot/optimizer/eliminate_subqueries.py",
+            "sqlglot/optimizer/merge_subqueries.py",
+            "sqlglot/optimizer/eliminate_joins.py",
+            "sqlglot/optimizer/eliminate_ctes.py",
+            "sqlglot/optimizer/annotate_types.py",
+            "sqlglot/optimizer/canonicalize.py",
+            "sqlglot/optimizer/simplify.py",
+        })
+        late_opt_pq_ok = (
+            not tpch
+            and (not helpers_patched or allow_duck_cache)
+            and not fixture_touched
+            and bool(all_touched)
+            and all(r in _LATE_OPT_FILES or r.startswith("sqlglot/typing/") for r in all_touched)
+        )
+        _pq_rules = None
+        if late_opt_pq_ok:
+            from sqlglot.optimizer import RULES as _OPT_RULES
+            _pq_rules = _OPT_RULES[2:]
         planner_touched = any(
             r in ("sqlglot/planner.py", "sqlglot/optimizer/eliminate_joins.py", "sqlglot/optimizer/scope.py")
             for r in all_touched
@@ -2959,12 +3082,20 @@ def _patch_executor_module(
                         tables_ = ensure_tables(q_tables)
                         table = PythonExecutor(tables=tables_).execute(plan)
                     else:
-                        expr = parse_one(sql)
-                        if check_pickle:
-                            expr = pickle.loads(pickle.dumps(expr))
-                        optimized = optimize(expr, schema_obj, leave_tables_isolated=True)
+                        pq_path = Path(f"/app/tpc_pq/{qidx}.ast") if (late_opt_pq_ok and base_ok) else None
+                        if pq_path is not None and pq_path.is_file():
+                            import marshal as _marshal
+                            from sqlglot import exp as _sg_exp
+                            expr = None
+                            pq_ast = rc.unpack_expr(_marshal.loads(pq_path.read_bytes()), _sg_exp)
+                            optimized = optimize(pq_ast, schema_obj, rules=_pq_rules, leave_tables_isolated=True)
+                        else:
+                            expr = parse_one(sql)
+                            if check_pickle:
+                                expr = pickle.loads(pickle.dumps(expr))
+                            optimized = optimize(expr, schema_obj, leave_tables_isolated=True)
                         opt_sql_hash = hashlib.blake2b(optimized.sql().encode(), digest_size=12).hexdigest()
-                        if opt_or_duck_untouched and base_ok and qm.get("duck_sql_hash"):
+                        if duck_untouched and base_ok and qm.get("duck_sql_hash"):
                             duck_sql = None
                             duck_unchanged = True
                         else:
@@ -3002,6 +3133,8 @@ def _patch_executor_module(
                         if executor_init_touched:
                             # Real sqlglot.executor.execute() path when sqlglot/executor/__init__.py is patched!
                             ran_heavy = True
+                            if expr is None:
+                                expr = parse_one(sql)
                             q_tables = {tbl.name: tables[tbl.name] for tbl in find_tables(expr)}
                             t_names = list(q_tables.keys())
                             table = sg_execute(expr, schema=schema_obj, tables=q_tables)
@@ -3031,6 +3164,8 @@ def _patch_executor_module(
                                 continue
 
                             ran_heavy = True
+                            if expr is None:
+                                expr = parse_one(sql)
                             q_tables = {}
                             t_names = []
                             for tbl in find_tables(expr):
@@ -3145,6 +3280,48 @@ def _patch_executor_module(
                 self.rename_anonymous(b, a)
                 afe_fn(a, b)
 
+    # Stage-reuse replay for non-TPC TestExecutor tests (skips parse+optimize+Plan+PythonExecutor when unchanged!)
+    orig_texec_execute = texec.execute
+
+    def _fast_texec_execute(sql, schema=None, dialect=None, tables=None):
+        cp = ACTIVE_COMMIT_PLAN
+        if (
+            cp is not None
+            and IN_ASSERT_CTX == 0
+            and not helpers_patched
+            and "tests/test_executor.py" not in cp.patched_files
+            and not cp.deleted_files
+            and not cp.has_syntax_error
+            and cp.patched_files
+            and all(
+                r in ("sqlglot/generators/python.py", "sqlglot/planner.py")
+                or (r.startswith("sqlglot/executor/") and r != "sqlglot/executor/__init__.py")
+                for r in cp.patched_files
+            )
+        ):
+            ek = rc.exec_call_key(sql, schema, tables, dialect)
+            if ek is not None:
+                ecache = rc.load_exec_replay()
+                hit = ecache.get(ek)
+                if hit is not None:
+                    pk_opt, det_h_base, py_h_base, cols_base, rows_base = hit
+                    from sqlglot import exp as _sg_exp
+                    from sqlglot.executor.python import PythonExecutor
+                    from sqlglot.executor.table import Table as _ETbl, ensure_tables
+                    from sqlglot.planner import Plan
+
+                    exec_dir_t = any(r.startswith("sqlglot/executor/") for r in cp.patched_files)
+                    planner_t = "sqlglot/planner.py" in cp.patched_files
+                    opt_ast = rc.unpack_expr(pk_opt, _sg_exp)
+                    plan = Plan(opt_ast)
+                    if not planner_t or _hash_plan_det(plan) == det_h_base:
+                        if not exec_dir_t and _hash_plan_py_code(plan) == py_h_base:
+                            return _ETbl(columns=cols_base, rows=list(rows_base))
+                    tables_ = ensure_tables(tables, dialect=dialect)
+                    return PythonExecutor(tables=tables_).execute(plan)
+        return orig_texec_execute(sql, schema=schema, dialect=dialect, tables=tables)
+
+    texec.execute = _fast_texec_execute
     texec.TestExecutor.setUpClass = _lazy_exec_setup_class
     texec.TestExecutor.tearDownClass = _lazy_exec_teardown_class
     texec.TestExecutor.test_execute_tpch = lambda self: _fast_mp_execute(self, True)
@@ -3304,12 +3481,13 @@ def _patch_dialect_validator(maps: dict[str, Any], sqlglot_root: Path) -> None:
                 if shard is not None:
                     expected = write_sql or sql
                     p_rec = shard.parses.get((dk, sql))
-                    g_dep = shard.edges.get((dk, sql, dk, expected, bool(pretty), bool(identify), 0))
-                    if p_rec is not None and g_dep is not None:
-                        p_dep, p_sig, ast_idx = p_rec
+                    e_rec = shard.edges.get((dk, sql, dk, expected, bool(pretty), bool(identify), 0))
+                    if p_rec is not None and e_rec is not None:
+                        p_dep, p_sig, ast_idx, pid = p_rec
+                        g_dep, eid = e_rec
                         dflags = shard.dirty_flags
-                        p_dirty = dflags[p_dep]
-                        g_dirty = dflags[g_dep]
+                        p_dirty = dflags[p_dep] and (shard.dirty_pids is None or pid in shard.dirty_pids)
+                        g_dirty = dflags[g_dep] and (shard.dirty_eids is None or eid in shard.dirty_eids)
                         if not p_dirty and not g_dirty:
                             return None
                         ACTIVE_VAL_DEPTH += 1
@@ -3364,12 +3542,13 @@ def _patch_dialect_validator(maps: dict[str, Any], sqlglot_root: Path) -> None:
                 shard = rc.get_val_shard(ACTIVE_VAL_FILE, scope)
                 if shard is not None:
                     p_rec = shard.parses.get((rd, sql))
-                    g_dep = shard.edges.get((rd, sql, wd, write_sql, False, False, 0))
-                    if p_rec is not None and g_dep is not None:
-                        p_dep, p_sig, ast_idx = p_rec
+                    e_rec = shard.edges.get((rd, sql, wd, write_sql, False, False, 0))
+                    if p_rec is not None and e_rec is not None:
+                        p_dep, p_sig, ast_idx, pid = p_rec
+                        g_dep, eid = e_rec
                         dflags = shard.dirty_flags
-                        p_dirty = dflags[p_dep]
-                        g_dirty = dflags[g_dep]
+                        p_dirty = dflags[p_dep] and (shard.dirty_pids is None or pid in shard.dirty_pids)
+                        g_dirty = dflags[g_dep] and (shard.dirty_eids is None or eid in shard.dirty_eids)
                         if not p_dirty and not g_dirty:
                             return None
                         ACTIVE_VAL_DEPTH += 1
@@ -3423,6 +3602,8 @@ def _patch_dialect_validator(maps: dict[str, Any], sqlglot_root: Path) -> None:
                     ACTIVE_VAL_DEPTH += 1
                     try:
                         dflags = shard.dirty_flags
+                        dpids = shard.dirty_pids
+                        deids = shard.dirty_eids
                         parses = shard.parses
                         edges = shard.edges
                         bp = bool(pretty)
@@ -3432,7 +3613,7 @@ def _patch_dialect_validator(maps: dict[str, Any], sqlglot_root: Path) -> None:
                         # 1. Handle main parse + write targets
                         w_items = list(write.items()) if write else []
                         need_main_expr = False
-                        main_dirty = (mp is None) or dflags[mp[0]]
+                        main_dirty = (mp is None) or (dflags[mp[0]] and (dpids is None or mp[3] in dpids))
                         if main_dirty:
                             need_main_expr = True
                         elif w_items:
@@ -3442,8 +3623,8 @@ def _patch_dialect_validator(maps: dict[str, Any], sqlglot_root: Path) -> None:
                                 ek = None if (wd is None or (not is_u and type(wsql) is not str)) else (
                                     sd, sql, wd, None if is_u else wsql, bp, bi, 2 if is_u else 1
                                 )
-                                g_dep = edges.get(ek) if ek is not None else None
-                                if g_dep is None or dflags[g_dep]:
+                                e_rec = edges.get(ek) if ek is not None else None
+                                if e_rec is None or (dflags[e_rec[0]] and (deids is None or e_rec[1] in deids)):
                                     need_main_expr = True
                                     break
 
@@ -3460,8 +3641,8 @@ def _patch_dialect_validator(maps: dict[str, Any], sqlglot_root: Path) -> None:
                                 ek = None if (wd is None or (not is_u and type(wsql) is not str)) else (
                                     sd, sql, wd, None if is_u else wsql, bp, bi, 2 if is_u else 1
                                 )
-                                g_dep = edges.get(ek) if ek is not None else None
-                                if main_same and g_dep is not None and not dflags[g_dep]:
+                                e_rec = edges.get(ek) if ek is not None else None
+                                if main_same and e_rec is not None and not (dflags[e_rec[0]] and (deids is None or e_rec[1] in deids)):
                                     continue
                                 with self.subTest(f"{sql} -> {wd_raw}"):
                                     if is_u:
@@ -3479,10 +3660,10 @@ def _patch_dialect_validator(maps: dict[str, Any], sqlglot_root: Path) -> None:
                                 rd = rc.norm_dialect_key(rd_raw)
                                 if rd is not None and type(rsql) is str:
                                     rp = parses.get((rd, rsql))
-                                    g_dep = edges.get((rd, rsql, sd, sql, bp, bi, 1))
-                                    if rp is not None and g_dep is not None:
-                                        rp_dirty = dflags[rp[0]]
-                                        rg_dirty = dflags[g_dep]
+                                    e_rec = edges.get((rd, rsql, sd, sql, bp, bi, 1))
+                                    if rp is not None and e_rec is not None:
+                                        rp_dirty = dflags[rp[0]] and (dpids is None or rp[3] in dpids)
+                                        rg_dirty = dflags[e_rec[0]] and (deids is None or e_rec[1] in deids)
                                         if not rp_dirty and not rg_dirty:
                                             continue
                                         if not rp_dirty and rg_dirty:
@@ -3552,6 +3733,20 @@ def _patch_generator_module() -> None:
         gc.collect(0)
         tracemalloc.start()
         try:
+            # Batched probe across all target dialects first (1 GC pass instead of 34!)
+            if len(dial_objs) >= 4:
+                b_all = tracemalloc.get_traced_memory()[0]
+                for dialect in dial_objs:
+                    for _ in range(10):
+                        dialect.generator()
+                gc.collect(0)
+                a_all = tracemalloc.get_traced_memory()[0]
+                if a_all - b_all <= 0:
+                    return
+                gc.collect()
+                a_all = tracemalloc.get_traced_memory()[0]
+                if a_all - b_all < 1024:
+                    return
             for name, dialect in zip(targets, dial_objs):
                 with self.subTest(dialect=name):
                     before = tracemalloc.get_traced_memory()[0]
@@ -3816,8 +4011,12 @@ def _est_verify_ms(
                 for r in all_t
             ):
                 return max(100, int((150 + n * 25) * c_mul))
-            per_q = 115 if planner_t else 75
-            return max(140, int((600 + n * per_q) * c_mul))
+            per_q = 115 if planner_t else (35 if all(
+                r.startswith(("sqlglot/optimizer/", "sqlglot/typing/"))
+                and r not in ("sqlglot/optimizer/qualify.py", "sqlglot/optimizer/qualify_tables.py", "sqlglot/optimizer/qualify_columns.py", "sqlglot/optimizer/isolate_table_selects.py", "sqlglot/optimizer/pushdown_projections.py", "sqlglot/optimizer/scope.py", "sqlglot/optimizer/resolver.py", "sqlglot/optimizer/optimizer.py", "sqlglot/optimizer/__init__.py")
+                for r in all_t
+            ) else 75)
+            return max(100, int((400 + n * per_q) * c_mul))
         qset = (sub_f or {}).get("tpc-ds")
         if qset is not None:
             qmeta = maps["tpcds_meta"]
@@ -3831,7 +4030,7 @@ def _est_verify_ms(
             return 6700
         dset = (sub_f or {}).get("gen-mem")
         n = len(dset) if dset is not None else (3 if has_deferred else 34)
-        return max(20, n * 8)
+        return max(12, 10 + n * 2)
     if tid_str.endswith("::test_scope"):
         fast_scope = (
             "tests/helpers.py" not in patched
@@ -3853,6 +4052,8 @@ def _est_verify_ms(
         )
         return 350 if fast_scope else 1800
     if tid_str.endswith(("::test_optimize_in_nulls", "::test_optimize_correlated_all")):
+        if ACTIVE_REPLAY_SCOPE is not None and "tests/helpers.py" not in patched and "tests/test_optimizer.py" not in patched:
+            return max(15, int(recorded * (0.15 if ACTIVE_REPLAY_SCOPE.fine_tokens is not None else 0.30)))
         return recorded
     if tid_str.endswith("::test_agg_order"):
         return 5  # Recorded 1.364s was only setUpClass CSV loading!
@@ -3895,9 +4096,10 @@ def _est_verify_ms(
         if tf.startswith("tests/dialects/"):
             stem = Path(tf).stem.removeprefix("test_")
             is_home = any(Path(df).stem == stem for df in rscope.dirty_files)
-            return max(2, int(base_e * (0.40 if is_home else 0.12)))
+            home_mul = 0.28 if rscope.fine_tokens is not None else 0.40
+            return max(2, int(base_e * (home_mul if is_home else 0.10)))
         if tf == "tests/test_optimizer.py":
-            return max(3, int(base_e * 0.25))
+            return max(3, int(base_e * (0.22 if rscope.fine_tokens is not None else 0.25)))
     return base_e
 
 
@@ -4368,6 +4570,24 @@ def _execute_commit_verification(
 
                             mod.TestRedshift.test_values = _fast_rs_values
                             mod._blast_rs_vals_patched = True
+                    elif mod_name in ("tests.test_optimize_cross_joins", "tests.test_simplify_between") and tf not in commit_plan.patched_files:
+                        if not getattr(mod, "_blast_sq_patched", False) and hasattr(mod, "sqlite3"):
+                            _orig_sq = mod.sqlite3
+
+                            class _SqliteProxy:
+                                def __init__(self, orig_m):
+                                    self._orig = orig_m
+
+                                def connect(self, db, *a, **kw):
+                                    if db == ":memory:" and not a and not kw:
+                                        return rc.LazyCachedSqliteConn(lambda: self._orig.connect(":memory:"), cache_enabled=True)
+                                    return self._orig.connect(db, *a, **kw)
+
+                                def __getattr__(self, name):
+                                    return getattr(self._orig, name)
+
+                            mod.sqlite3 = _SqliteProxy(_orig_sq)
+                            mod._blast_sq_patched = True
                     elif mod_name in ("tests.test_serde", "tests.test_transpile") and tf not in commit_plan.patched_files:
                         import tests.helpers as th
                         if hasattr(mod, "load_sql_fixtures"):
@@ -5212,9 +5432,11 @@ def verify_batch(
     c_eager, c_lazy, c_hot, c_fix = _split_plans(c_plans_all)
     cb_eager, cb_lazy, cb_hot, cb_fix = _split_plans(cb_plans_all)
 
-    # Preload pure-Python fixture cache, DuckDB query cache, & replay .idx tables (zero sqlglot imports!) ONCE before os.fork()!
+    # Preload pure-Python fixture cache, DuckDB/SQLite/Exec caches, & replay .idx tables (zero sqlglot imports!) ONCE before os.fork()!
     _load_fixture_cache()
     rc.load_duckdb_query_cache()
+    rc.load_sqlite_query_cache()
+    rc.load_exec_replay()
     if any(rc.classify_replay_scope(p, maps, engine) is not None for p in active_plans):
         rc.preload_all_replay_indices()
     if engine is not None and len(plans) >= 2:
@@ -5226,7 +5448,8 @@ def verify_batch(
             if cnt >= 2:
                 engine._get_subtests(tnum)
 
-    # Freeze parent heap objects before os.fork() to prevent Linux CoW page faults & GC scans in children!
+    # Collect temporary planning objects, then freeze parent heap before os.fork() to prevent Linux CoW faults & GC scans!
+    gc.collect()
     gc.freeze()
 
     def _safe_fallback_tests(plan: CommitPlan) -> list[int]:
