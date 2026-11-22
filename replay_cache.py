@@ -620,6 +620,79 @@ def _is_strictly_tok_only_unit(u: Any, is_tokens_py: bool) -> bool:
     return False
 
 
+def _is_pure_additive_init_import(commit_plan: Any, maps: dict[str, Any], engine: Any) -> bool:
+    """True iff sqlglot/__init__.py ONLY inserts new private/unreferenced sqlglot.* imports
+    without modifying, removing, reordering, or shadowing any existing statement or export."""
+    if engine is None or "sqlglot/__init__.py" in commit_plan.deleted_files:
+        return False
+    new_src = commit_plan.patched_files.get("sqlglot/__init__.py")
+    if not new_src:
+        return False
+    old_src = engine._read_base_file("sqlglot/__init__.py")
+    if not old_src:
+        return False
+    import ast as _ast
+    try:
+        old_tree = _ast.parse(old_src)
+        new_tree = _ast.parse(new_src)
+    except SyntaxError:
+        return False
+    old_dumps = [_ast.dump(s, include_attributes=False) for s in old_tree.body]
+    new_dumps = [_ast.dump(s, include_attributes=False) for s in new_tree.body]
+    if len(new_dumps) <= len(old_dumps):
+        return False
+    oi = 0
+    inserted: list[Any] = []
+    for stmt, nd in zip(new_tree.body, new_dumps):
+        if oi < len(old_dumps) and nd == old_dumps[oi]:
+            oi += 1
+        else:
+            inserted.append(stmt)
+    if oi != len(old_dumps) or not inserted:
+        return False
+    old_bound: set[str] = set()
+    for st in old_tree.body:
+        if isinstance(st, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+            old_bound.add(st.name)
+        elif isinstance(st, _ast.Assign):
+            for tgt in st.targets:
+                for n in _ast.walk(tgt):
+                    if isinstance(n, _ast.Name):
+                        old_bound.add(n.id)
+        elif isinstance(st, _ast.AnnAssign) and isinstance(st.target, _ast.Name):
+            old_bound.add(st.target.id)
+        elif isinstance(st, (_ast.Import, _ast.ImportFrom)):
+            for a in st.names:
+                old_bound.add(a.asname or a.name.split(".", 1)[0])
+    name_readers = maps.get("name_readers", {})
+    attr_readers = maps.get("attr_readers", {})
+    for stmt in inserted:
+        if isinstance(stmt, _ast.Import):
+            for a in stmt.names:
+                if not (a.name == "sqlglot" or a.name.startswith("sqlglot.")):
+                    return False
+                if not a.asname:
+                    return False
+                bound = a.asname
+                if bound == "*" or bound.startswith("__") or bound in old_bound or bound in name_readers or bound in attr_readers:
+                    return False
+        elif isinstance(stmt, _ast.ImportFrom):
+            if stmt.level == 0:
+                if not (stmt.module and (stmt.module == "sqlglot" or stmt.module.startswith("sqlglot."))):
+                    return False
+            elif stmt.level != 1:
+                return False
+            for a in stmt.names:
+                if a.name == "*":
+                    return False
+                bound = a.asname or a.name
+                if bound.startswith("__") or bound in old_bound or bound in name_readers or bound in attr_readers:
+                    return False
+        else:
+            return False
+    return True
+
+
 def classify_replay_scope(
     commit_plan: Any,
     maps: dict[str, Any],
@@ -665,11 +738,16 @@ def classify_replay_scope(
     core_gen_file: bool = False
     core_par_file: bool = False
     core_tok_files: set[str] = set()
+    init_pure_import_only: bool = False
 
     for rel in commit_plan.patched_files:
         if rel.startswith("tests/") and rel not in ("tests/helpers.py", "tests/dialects/test_dialect.py"):
             # Patched test files & SQL fixtures run live on their own file/fixture while untouched
             # dialect/optimizer tests still get 100% sound stage-reuse replay!
+            continue
+
+        if rel == "sqlglot/__init__.py" and _is_pure_additive_init_import(commit_plan, maps, engine):
+            init_pure_import_only = True
             continue
 
         ana = commit_plan.py_analyses.get(rel)
@@ -734,6 +812,7 @@ def classify_replay_scope(
     if not (
         gen_files or par_files or dial_files or dial_tok_only_files
         or typing_files or opt_files or core_gen_file or core_par_file or core_tok_files
+        or init_pure_import_only
     ):
         return None
 
@@ -1151,7 +1230,7 @@ def classify_replay_scope(
                     break
             if not all_fine_ok:
                 break
-        if all_fine_ok and toks:
+        if all_fine_ok and (toks or init_pure_import_only):
             fine_tokens = toks
 
     is_gen_only = bool(
@@ -1163,6 +1242,7 @@ def classify_replay_scope(
         and not typing_files
         and not core_tok_files
         and not opt_files
+        and not init_pure_import_only
         and not dirty_dials
         and not dirty_pars
     )
@@ -1176,6 +1256,7 @@ def classify_replay_scope(
         and not dial_tok_only_files
         and not typing_files
         and not core_tok_files
+        and not init_pure_import_only
     )
     is_tok_only = bool(
         (core_tok_files or dial_tok_only_files)
@@ -1186,6 +1267,7 @@ def classify_replay_scope(
         and not dial_files
         and not typing_files
         and not opt_files
+        and not init_pure_import_only
     )
 
     return ReplayScope(

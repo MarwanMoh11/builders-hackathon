@@ -1148,6 +1148,33 @@ def _install_fast_test_patches(maps: dict[str, Any], commit_plan: CommitPlan, sq
                 cached_list = _load_fixture_cache().get("fixture_pairs", {}).get(filename)
             if cached_list is not None:
                 if allowed is None:
+                    _order = None
+                    if (
+                        cp is not None
+                        and cp.syntax_error_files
+                        and filename in ("optimizer/annotate_functions.sql", "optimizer/annotate_types.sql")
+                    ):
+                        _syn_stems = {
+                            Path(r).stem
+                            for r in cp.syntax_error_files
+                            if r.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/"))
+                        }
+                        if _syn_stems:
+                            _hi = [
+                                idx for idx, (a, _, _) in enumerate(cached_list, start=1)
+                                if (a.get("dialect") or "").lower() in _syn_stems
+                            ]
+                            if _hi and len(_hi) < len(cached_list):
+                                _hi_set = set(_hi)
+                                _order = _hi + [idx for idx in range(1, len(cached_list) + 1) if idx not in _hi_set]
+                    if _order is not None:
+                        for idx in _order:
+                            a, s, e = cached_list[idx - 1]
+                            ACTIVE_LAST_PAIR_IDX = idx
+                            if ECON_CPU_LIMIT is not None:
+                                _econ_check()
+                            yield (dict(a), s, e)
+                        return
                     for idx, (a, s, e) in enumerate(cached_list, start=1):
                         ACTIVE_LAST_PAIR_IDX = idx
                         if ECON_CPU_LIMIT is not None:
@@ -3874,8 +3901,32 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
         pass
 
 
-def _measure_speed_scale() -> float:
-    return 1.0
+_SPEED_SCALED: bool = False
+
+
+def _measure_speed_scale(is_c: bool = True) -> float:
+    """Measure real container CPU speed relative to Mac baseline (clamped [1.0, 2.2]) in ~4ms ONCE."""
+    global _SPEED_SCALE, _SPEED_SCALED
+    if _SPEED_SCALED:
+        return _SPEED_SCALE
+    _SPEED_SCALED = True
+    try:
+        import sqlglot as _sg_sp
+        _sql = (
+            "SELECT a, COALESCE(b, 1) AS c, SUM(d) OVER (PARTITION BY a ORDER BY b) "
+            "FROM t1 JOIN t2 ON t1.id = t2.id WHERE c > 10 GROUP BY a, b"
+        )
+        _sg_sp.parse_one(_sql)
+        _t0 = time.process_time()
+        for _ in range(40):
+            _sg_sp.parse_one(_sql)
+        _dt_ms = (time.process_time() - _t0) * 1000.0
+        _ref_ms = 3.8 if is_c else 6.6
+        _scale = _dt_ms / _ref_ms
+        _SPEED_SCALE = 1.0 if _scale < 1.0 else (2.2 if _scale > 2.2 else _scale)
+    except Exception:
+        _SPEED_SCALE = 1.0
+    return _SPEED_SCALE
 
 
 def _patch_executor_module(
@@ -6453,7 +6504,7 @@ def _execute_commit_verification(
 
                             def _fast_td_enum(self):
                                 sc = ACTIVE_REPLAY_SCOPE
-                                if sc is None:
+                                if sc is None or "sqlglot/__init__.py" in sc.dirty_files:
                                     return _orig_td_enum(self)
                                 targets_d = _dirty_dialect_enums(sc)
                                 for d_en in targets_d:
@@ -7107,12 +7158,14 @@ def _execute_commit_verification(
     # the buckets keep an early overshoot from condemning hundreds of cheap tests.
     cal_act = [0.0, 0.0, 0.0, 0.0]
     cal_est = [0.0, 0.0, 0.0, 0.0]
-    _CAL_PRIOR = (
+    _sc_hw = _measure_speed_scale(is_c_root or is_noopt_root)
+    _BASE_PRIOR = (
         (0.45, 0.40, 0.45, 0.40) if is_c_root else
         ((0.50, 0.45, 0.50, 0.45) if is_noopt_root else
          ((0.65, 0.55, 0.60, 0.55) if is_cb_root else (0.85, 0.75, 0.80, 0.75)))
     )
-    _CAL_W0 = (250.0, 250.0, 1e12, 120.0)
+    _CAL_PRIOR = tuple(min(1.15, p * _sc_hw) for p in _BASE_PRIOR)
+    _CAL_W0 = (150.0, 150.0, 600.0, 60.0)
 
     def _rho(c: int) -> float:
         r = (cal_act[c] + _CAL_PRIOR[c] * _CAL_W0[c]) / (cal_est[c] + _CAL_W0[c])
@@ -7368,7 +7421,7 @@ def _execute_commit_verification(
                 _imp_ms = (
                     20.0 if _vtf.startswith("tests/dialects/") else
                     (40.0 if _vtf in ("tests/test_optimizer.py", "tests/test_executor.py") else 8.0)
-                )
+                ) * _sc_hw
                 _sum_d_tf = sum(dur_by_num[_vt] for _vt in _tlist)
                 _max_d_tf = max(dur_by_num[_vt] for _vt in _tlist)
                 _sum_e_tf = sum(_e_cal(_vt) for _vt in _tlist)
@@ -7467,8 +7520,12 @@ def _execute_commit_verification(
         if not is_proj and _tf_next not in imported_tfiles and not any(
             x != t_next and num_to_test[x]["file"] == _tf_next for x in verify_set
         ):
-            eff_e += 8.0
-        if (s_t <= 0.0 and confirmed_fail) or (eff_e >= 8.0 and eff_e >= s_t):
+            _single_imp = (
+                16.0 if _tf_next.startswith("tests/dialects/") else
+                (32.0 if _tf_next in ("tests/test_optimizer.py", "tests/test_executor.py") else 8.0)
+            )
+            eff_e += _single_imp * _sc_hw if confirmed_fail else 8.0
+        if (s_t <= 0.0 and confirmed_fail) or (eff_e >= (3.0 if confirmed_fail else 8.0) and eff_e >= s_t):
             _plog("absorb_test", t_next, f"{eff_e:.0f}", f"{s_t:.0f}")
             _remove_remaining(t_next)
             _add_confirmed(t_next)
@@ -7749,17 +7806,23 @@ def verify_batch(
             and "sqlglot/__init__.py" not in plan.deleted_files
         )
         ov_dir: Path | None = None
+        _prev_pypath: str | None = None
+        _set_pypath = False
         if (
             not _can_inproc_lazy
             and lazy_tid is not None
             and lazy_tid in plan.candidates
-            and any(
-                rel.startswith("sqlglot/") for rel in list(plan.patched_files) + list(plan.deleted_files)
-            )
         ):
-            # Always point test_lazy_load's subprocess overlay at pure /sqlglot (never mix .so into overlay!)
-            ov_dir = _create_disk_overlay_for_subprocess(plan.patched_files, sqlglot_root, plan.deleted_files)
-            os.environ["PYTHONPATH"] = f"{ov_dir}:{sqlglot_root}"
+            _prev_pypath = os.environ.get("PYTHONPATH")
+            _set_pypath = True
+            if any(
+                rel.startswith("sqlglot/") for rel in list(plan.patched_files) + list(plan.deleted_files)
+            ):
+                # Always point test_lazy_load's subprocess overlay at pure /sqlglot (never mix .so into overlay!)
+                ov_dir = _create_disk_overlay_for_subprocess(plan.patched_files, sqlglot_root, plan.deleted_files)
+                os.environ["PYTHONPATH"] = f"{ov_dir}:{sqlglot_root}"
+            else:
+                os.environ["PYTHONPATH"] = str(sqlglot_root)
 
         finder = _InMemoryFinder(plan.patched_files, use_root, plan.deleted_files)
         sys.meta_path.insert(0, finder)
@@ -7777,6 +7840,11 @@ def verify_batch(
             )
         finally:
             restore_open()
+            if _set_pypath:
+                if _prev_pypath is None:
+                    os.environ.pop("PYTHONPATH", None)
+                else:
+                    os.environ["PYTHONPATH"] = _prev_pypath
             if ov_dir is not None:
                 import shutil
                 shutil.rmtree(ov_dir, ignore_errors=True)
@@ -7878,24 +7946,6 @@ def verify_batch(
                         return False
                     cq, an = u.symbol_name.rsplit(".", 1)
                     if an in _META_SKIP_ATTRS_INPROC or cq == "Tokenizer" or cq.endswith(".Tokenizer"):
-                        return False
-                elif u.kind in ("dict_key", "class_attr"):
-                    if (
-                        engine is None
-                        or "." not in u.symbol_name
-                        or not rel.startswith(("sqlglot/parsers/", "sqlglot/generators/", "sqlglot/dialects/"))
-                        or rel in ("sqlglot/dialects/dialect.py", "sqlglot/parsers/base.py")
-                    ):
-                        return False
-                    cq, an = u.symbol_name.rsplit(".", 1)
-                    if an.startswith("_") or an in _META_SKIP_ATTRS_INPROC or cq == "Tokenizer" or cq.endswith(".Tokenizer"):
-                        return False
-                    if u.kind == "dict_key" and an not in _SAFE_INPROC_DICTS:
-                        return False
-                    # Must be a strictly-leaf Parser/Generator class (zero subclasses, zero copiers!)
-                    if not (cq.endswith("Parser") or cq.endswith("Generator")):
-                        return False
-                    if len(engine._expand_class_and_copiers(cq, an)) > 1:
                         return False
                 else:
                     return False
@@ -8135,7 +8185,7 @@ def verify_batch(
         sys.path.insert(0, str(warm_root))
         import sqlglot  # noqa: F401
         import tests.helpers  # noqa: F401
-        _measure_speed_scale()
+        _measure_speed_scale(warm_root in (_SQLGLOT_C_ROOT, _SQLGLOT_C_NOOPT_ROOT))
 
         # Install ACTIVE_PATCHED_TRIE_MODS-guarded tok_trie_cache ONCE (zero restore/re-install CoW faults!)
         _tcache_z = rc.load_tok_trie_cache()
