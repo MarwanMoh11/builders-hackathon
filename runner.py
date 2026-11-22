@@ -4930,28 +4930,10 @@ def verify_batch(
             pure_tail_map[tail_cid] = orig_cid
             py_plans_all.append(tail_p)
 
-    # Tier 2: Pure-Python /sqlglot (Probe D3: skip non-core22 commits touching sqlglot/parsers/* to split parsers/* vs generators/* CPU)
+    # Tier 2: Pure-Python /sqlglot (compiled-file commits + pure-only tails; eager forks + Pure-Warm Zygote)
     if py_plans_all:
-        _core22 = {
-            "sqlglot/parser.py", "sqlglot/generator.py", "sqlglot/tokenizer_core.py",
-            "sqlglot/trie.py", "sqlglot/helper.py", "sqlglot/serde.py", "sqlglot/time.py",
-            "sqlglot/errors.py", "sqlglot/lineage.py", "sqlglot/anonymize.py",
-            "sqlglot/executor/table.py",
-        }
-        _d3_keep = []
-        for _pp in py_plans_all:
-            _t = set(_pp.patched_files) | set(_pp.deleted_files)
-            if (
-                not _pp.commit.startswith("__pure_tail__")
-                and any(r.startswith("sqlglot/parsers/") for r in _t)
-                and not any(r in _core22 or r.startswith("sqlglot/expressions/") for r in _t)
-            ):
-                results[_pp.commit] = _safe_fallback_tests(_pp)
-            else:
-                _d3_keep.append(_pp)
-        if _d3_keep:
-            py_eager, py_lazy, py_hot, py_fix = _split_plans(_d3_keep)
-            _run_tier(sqlglot_root, py_eager, py_lazy, py_hot, py_fix)
+        py_eager, py_lazy, py_hot, py_fix = _split_plans(py_plans_all)
+        _run_tier(sqlglot_root, py_eager, py_lazy, py_hot, py_fix)
 
     for tail_cid, orig_cid in pure_tail_map.items():
         t_fail = results.pop(tail_cid, [])
