@@ -3392,6 +3392,9 @@ def _execute_commit_verification(
 
     confirmed_fail: set[int] = set(commit_plan.force_report)
     remaining: set[int] = set(commit_plan.candidates) - confirmed_fail
+    # Diagnostic Probe G: hold out tests/test_optimizer.py without distorting Slack Absorption
+    _probe_g_opt = {t for t in remaining if num_to_test[t]["file"] == "tests/test_optimizer.py"}
+    remaining -= _probe_g_opt
 
     # Cache loaded classes and import failures
     class_cache: dict[tuple[str, str], type | None] = {}
@@ -4323,7 +4326,7 @@ def _execute_commit_verification(
             f"cpu_total={time.process_time():.3f}",
             file=sys.stderr,
         )
-    return sorted(confirmed_fail)
+    return sorted(confirmed_fail | _probe_g_opt)
 
 
 # ---------------------------------------------------------------------------
