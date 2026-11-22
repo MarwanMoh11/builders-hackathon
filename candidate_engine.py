@@ -12,18 +12,7 @@ from typing import Any
 
 _CLASS_DEF_RE = re.compile(r"^class\s+(\w+)\s*[\(:]", re.MULTILINE)
 _PLAIN_IDENT_KEY_RE = re.compile(r"^['\"][A-Za-z_][A-Za-z0-9_]*['\"]$")
-_COMPILED_C_FILES = frozenset({
-    "sqlglot/trie.py",
-    "sqlglot/tokenizer_core.py",
-    "sqlglot/helper.py",
-    "sqlglot/time.py",
-    "sqlglot/executor/table.py",
-    "sqlglot/optimizer/scope.py",
-    "sqlglot/optimizer/resolver.py",
-    "sqlglot/optimizer/simplify.py",
-    "sqlglot/optimizer/qualify_columns.py",
-    "sqlglot/optimizer/annotate_types.py",
-})
+_COMPILED_C_FILES: frozenset[str] = frozenset()
 
 from patch_analyzer import (
     ChangeUnit,
@@ -1720,13 +1709,12 @@ class CandidateEngine:
                     if (
                         rel in _COMPILED_C_FILES
                         or unit.kind != "func_body"
-                        or unit.has_nested_func
                         or meth_name in (
                             "__new__", "__init_subclass__", "__set_name__", "__class_getitem__",
                             "_generate_next_value_", "_build_dispatch", "sql_names",
                         )
                         or (
-                            (not unit.class_name or unit.is_cached_func)
+                            (not unit.class_name or unit.is_cached_func or unit.has_nested_func)
                             and self._is_func_called_at_import(rel, unit.symbol_name or "")
                         )
                     ):

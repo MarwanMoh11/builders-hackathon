@@ -1,7 +1,10 @@
 """Build-time cache generator (runs inside Dockerfile, adds 0 bytes to git repo).
 
-Precomputes bit-exact baseline optimized ASTs and execution Plans for all executable
-TPC-DS queries so planner/executor commits skip redundant parse_one()/optimize()/Plan().
+Precomputes:
+1. Bit-exact baseline optimized ASTs and execution Plans for all executable TPC-DS queries
+   so planner/executor/duckdb commits skip redundant parse_one()/optimize()/Plan().
+2. Pre-parsed baseline SQL fixtures (both pair and single-query formats) so forked children
+   skip repeated disk reads & comment/metadata parsing on unpatched fixtures.
 """
 
 from __future__ import annotations
@@ -49,11 +52,40 @@ def main() -> None:
             pl = Plan(opt.copy())
             tpcds_cache[i] = (pack_expr(opt), pl)
 
-    blob = zlib.compress(pickle.dumps({"tpcds": tpcds_cache}, protocol=pickle.HIGHEST_PROTOCOL), 6)
+    fixtures_root = Path("/sqlglot/tests/fixtures")
+    fixture_pairs: dict[str, list[tuple[dict, str, str]]] = {}
+    fixture_singles: dict[str, list[str]] = {}
+    for sql_file in sorted(fixtures_root.rglob("*.sql")):
+        rel_under = str(sql_file.relative_to(fixtures_root))
+        try:
+            singles = list(th.load_sql_fixtures(rel_under))
+            if singles:
+                fixture_singles[rel_under] = singles
+        except Exception:
+            pass
+        try:
+            pairs = list(th.load_sql_fixture_pairs(rel_under))
+            if pairs:
+                fixture_pairs[rel_under] = pairs
+        except Exception:
+            pass
+
+    blob = zlib.compress(
+        pickle.dumps(
+            {
+                "tpcds": tpcds_cache,
+                "fixture_pairs": fixture_pairs,
+                "fixture_singles": fixture_singles,
+            },
+            protocol=pickle.HIGHEST_PROTOCOL,
+        ),
+        6,
+    )
     out = Path("/app/tpc_cache.pkl.zlib")
     out.write_bytes(blob)
     print(
-        f"[build_caches] cached {len(tpcds_cache)} TPC-DS queries in {time.perf_counter() - t0:.2f}s "
+        f"[build_caches] cached {len(tpcds_cache)} TPC-DS + {len(fixture_pairs)} pair / "
+        f"{len(fixture_singles)} single fixtures in {time.perf_counter() - t0:.2f}s "
         f"({len(blob) / 1024:.1f} KB)",
         flush=True,
     )

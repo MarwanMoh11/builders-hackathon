@@ -621,6 +621,29 @@ def _install_fast_test_patches(maps: dict[str, Any], commit_plan: CommitPlan, sq
             global ACTIVE_LAST_PAIR_IDX
             rel = f"tests/fixtures/{filename}"
             allowed = ACTIVE_FIXTURE_FILTERS.get(rel, None)
+            cp = ACTIVE_COMMIT_PLAN
+            cached_list = None
+            if cp is None or (rel not in cp.patched_files and rel not in cp.deleted_files):
+                cached_list = _load_tpc_cache().get("fixture_pairs", {}).get(filename)
+            if cached_list is not None:
+                if allowed is None:
+                    for idx, (a, s, e) in enumerate(cached_list, start=1):
+                        ACTIVE_LAST_PAIR_IDX = idx
+                        if ECON_CPU_LIMIT is not None:
+                            _econ_check()
+                        yield (dict(a), s, e)
+                    return
+                if not allowed:
+                    return
+                n_c = len(cached_list)
+                for idx in sorted(allowed):
+                    if 1 <= idx <= n_c:
+                        a, s, e = cached_list[idx - 1]
+                        ACTIVE_LAST_PAIR_IDX = idx
+                        if ECON_CPU_LIMIT is not None:
+                            _econ_check()
+                        yield (dict(a), s, e)
+                return
             if allowed is None:
                 for idx, item in enumerate(orig_pairs(filename), start=1):
                     ACTIVE_LAST_PAIR_IDX = idx
@@ -640,6 +663,26 @@ def _install_fast_test_patches(maps: dict[str, Any], commit_plan: CommitPlan, sq
         def _filtered_fixtures(filename):
             rel = f"tests/fixtures/{filename}"
             allowed = ACTIVE_FIXTURE_FILTERS.get(rel, None)
+            cp = ACTIVE_COMMIT_PLAN
+            cached_list = None
+            if cp is None or (rel not in cp.patched_files and rel not in cp.deleted_files):
+                cached_list = _load_tpc_cache().get("fixture_singles", {}).get(filename)
+            if cached_list is not None:
+                if allowed is None:
+                    for item in cached_list:
+                        if ECON_CPU_LIMIT is not None:
+                            _econ_check()
+                        yield item
+                    return
+                if not allowed:
+                    return
+                n_c = len(cached_list)
+                for idx in sorted(allowed):
+                    if 1 <= idx <= n_c:
+                        if ECON_CPU_LIMIT is not None:
+                            _econ_check()
+                        yield cached_list[idx - 1]
+                return
             if allowed is None:
                 for item in orig_fixtures(filename):
                     if ECON_CPU_LIMIT is not None:
@@ -978,20 +1021,9 @@ def _fast_compare_rows(
     return "fallback" if need_fallback else "pass"
 
 
-_COMPILED_C_FILES = frozenset({
-    "sqlglot/trie.py",
-    "sqlglot/tokenizer_core.py",
-    "sqlglot/helper.py",
-    "sqlglot/time.py",
-    "sqlglot/executor/table.py",
-    "sqlglot/optimizer/scope.py",
-    "sqlglot/optimizer/resolver.py",
-    "sqlglot/optimizer/simplify.py",
-    "sqlglot/optimizer/qualify_columns.py",
-    "sqlglot/optimizer/annotate_types.py",
-})
+_COMPILED_C_FILES: frozenset[str] = frozenset()
 _SQLGLOT_C_ROOT = Path("/sqlglot-c")
-_TPC_CACHE: dict[str, dict[int, tuple[Any, Any]]] | None = None
+_TPC_CACHE: dict[str, Any] | None = None
 _SPEED_SCALE: float = 1.0
 
 
@@ -1029,23 +1061,22 @@ def _load_tpc_cache() -> dict[str, dict[int, tuple[Any, Any]]]:
 
 
 def _measure_speed_scale() -> float:
-    """Quick ~5ms CPU calibration probe measuring actual parse+optimize speed on this CPU & build."""
+    """Zero-extra-import ~8ms CPU calibration probe using ONLY sqlglot.parse_one().sql()
+    (NEVER imports sqlglot.optimizer or any dialect, so warm zygote loaded_files stays 100% clean!)."""
     global _SPEED_SCALE
     try:
         from sqlglot import parse_one
-        from sqlglot.optimizer import optimize
         sql = (
             "SELECT a.x, SUM(b.y) AS s FROM t1 AS a JOIN t2 AS b ON a.id = b.id "
             "WHERE a.z > 10 AND (a.w = 1 OR a.w = 2) GROUP BY a.x HAVING SUM(b.y) > 5"
         )
-        schema = {"t1": {"id": "INT", "x": "TEXT", "z": "INT", "w": "INT"}, "t2": {"id": "INT", "y": "DOUBLE"}}
-        # 1 warm-up call + 8 timed calls (~22ms on pure-Python Rosetta, ~4-7ms on native x86_64 + sqlglotc)
-        optimize(parse_one(sql), schema=schema)
+        # 1 warm-up + 20 timed parse+generate calls (~16ms on native x86_64 CI, ~36ms on Mac Rosetta)
+        parse_one(sql).sql()
         t0 = time.process_time()
-        for _ in range(8):
-            optimize(parse_one(sql), schema=schema)
+        for _ in range(20):
+            parse_one(sql).sql()
         dt_ms = (time.process_time() - t0) * 1000.0
-        _SPEED_SCALE = min(1.6, max(0.20, dt_ms / 22.0))
+        _SPEED_SCALE = min(1.5, max(0.35, dt_ms / 16.0))
     except Exception:
         _SPEED_SCALE = 1.0
     return _SPEED_SCALE
@@ -1279,16 +1310,35 @@ def _patch_executor_module(
                         )
                     _econ_abort_now()
 
-        tpc_opt_cache_ok = (
+        duckdb_only_tpc = (
             not tpch
             and (not helpers_patched or allow_duck_cache)
             and not fixture_touched
             and not check_pickle
             and bool(all_touched)
             and all(
-                r in ("sqlglot/planner.py", "sqlglot/generators/python.py")
-                or r.startswith("sqlglot/executor/")
+                r in (
+                    "sqlglot/dialects/duckdb.py",
+                    "sqlglot/parsers/duckdb.py",
+                    "sqlglot/generators/duckdb.py",
+                    "sqlglot/typing/duckdb.py",
+                )
                 for r in all_touched
+            )
+        )
+        tpc_opt_cache_ok = (
+            duckdb_only_tpc
+            or (
+                not tpch
+                and (not helpers_patched or allow_duck_cache)
+                and not fixture_touched
+                and not check_pickle
+                and bool(all_touched)
+                and all(
+                    r in ("sqlglot/planner.py", "sqlglot/generators/python.py")
+                    or r.startswith("sqlglot/executor/")
+                    for r in all_touched
+                )
             )
         )
         tpc_cache_ds = _load_tpc_cache().get("tpcds", {}) if tpc_opt_cache_ok else {}
@@ -1327,7 +1377,26 @@ def _patch_executor_module(
                         and not fixture_touched
                     )
                     cached_entry = tpc_cache_ds.get(qidx) if (tpc_opt_cache_ok and base_ok) else None
-                    if cached_entry is not None and not executor_init_touched:
+                    if duckdb_only_tpc and base_ok and cached_entry is not None:
+                        duck_sql = transpile(sql, write="duckdb")[0]
+                        duck_hash = hashlib.blake2b(duck_sql.encode(), digest_size=12).hexdigest()
+                        duck_unchanged = duck_hash == qm.get("duck_sql_hash")
+                        if duck_unchanged:
+                            done_w += q_weights[q_pos]
+                            q_done += 1
+                            continue
+                        ran_heavy = True
+                        plan = cached_entry[1]
+                        expr = parse_one(sql)
+                        q_tables = {}
+                        t_names = []
+                        for tbl in find_tables(expr):
+                            name = tbl.name
+                            q_tables[name] = tables[name]
+                            t_names.append(name)
+                        tables_ = ensure_tables(q_tables)
+                        table = PythonExecutor(tables=tables_).execute(plan)
+                    elif cached_entry is not None and not executor_init_touched:
                         expr = None
                         duck_sql = None
                         duck_unchanged = True
@@ -1807,12 +1876,6 @@ def _apply_hot_func_patches(commit_plan: CommitPlan, sqlglot_root: Path) -> bool
             if fn_node is None:
                 return False
             if fn_node.name in _META_HOOKS:
-                return False
-            # Reject any function containing nested defs or lambdas (may return import-time closures!)
-            if any(
-                isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and n is not fn_node
-                for n in ast.walk(fn_node)
-            ):
                 return False
 
             # Allow plain methods, property/classmethod/staticmethod, and @lru_cache / @cache!
@@ -2403,12 +2466,12 @@ def _execute_commit_verification(
     cal_act = [0.0, 0.0, 0.0, 0.0]
     cal_est = [0.0, 0.0, 0.0, 0.0]
     _ss = _SPEED_SCALE
-    _CAL_PRIOR = (1.6 * _ss, 1.3 * _ss, max(0.35, 1.0 * _ss), 1.1 * _ss)
-    _CAL_W0 = (250.0, 250.0, 1e12, 120.0)
+    _CAL_PRIOR = (1.15 * _ss, 1.00 * _ss, max(0.35, 0.95 * _ss), 0.90 * _ss)
+    _CAL_W0 = (120.0, 120.0, 1e12, 60.0)
 
     def _rho(c: int) -> float:
         r = (cal_act[c] + _CAL_PRIOR[c] * _CAL_W0[c]) / (cal_est[c] + _CAL_W0[c])
-        return 0.15 if r < 0.15 else (4.0 if r > 4.0 else r)
+        return 0.25 if r < 0.25 else (3.5 if r > 3.5 else r)
 
     def _cal_idx(t: int) -> int:
         c = est_cls[t]
@@ -2901,6 +2964,7 @@ def verify_batch(
         try:
             if root_override is None and len(plan.candidates) >= 15 and not plan.syntax_error_files:
                 _measure_speed_scale()
+                gc.freeze()
             return _execute_commit_verification(
                 plan, maps, num_to_test, dur_by_num, use_root, {}, set(plan.syntax_error_files), engine=engine, ov_dir=ov_dir
             )
@@ -2964,6 +3028,17 @@ def verify_batch(
         else:
             eager_hot_plans.append(p)
     hot_func_plans = eager_hot_plans
+
+    # Preload build-time fixture + TPC-DS cache and shared subtest maps ONCE in parent before ANY os.fork()!
+    _load_tpc_cache()
+    if engine is not None and len(plans) >= 3:
+        st_freq_all: dict[int, int] = {}
+        for p in plans:
+            for tnum in p.deferred_subtests:
+                st_freq_all[tnum] = st_freq_all.get(tnum, 0) + 1
+        for tnum, cnt in st_freq_all.items():
+            if cnt >= 2:
+                engine._get_subtests(tnum)
 
     # Freeze parent heap objects before os.fork() to prevent Linux CoW page faults & GC scans in children!
     gc.freeze()
@@ -3120,18 +3195,38 @@ def verify_batch(
             except Exception:
                 fallback_commits.append(plan.commit)
 
-        # Pre-import tests.dialects.test_dialect ONLY when >=3 dialect_safe_plans use dialect tests!
+        # Pre-import tests.dialects.test_dialect + safe dialect test files BEFORE dialect_safe_plans!
+        rem_after_dc = dialect_safe_plans + fixture_plans + hot_func_plans
         if dialect_safe_plans:
-            ds_dial_users = sum(
-                1 for p in dialect_safe_plans
-                if any(num_to_test[t]["file"].startswith("tests/dialects/") for t in p.candidates)
-            )
-            if ds_dial_users >= 3 and "tests/dialects/test_dialect.py" not in all_patched_py:
+            ds_file_freq: dict[str, int] = {}
+            ds_dial_users = 0
+            for p in rem_after_dc:
+                seen_tf = {num_to_test[t]["file"] for t in p.candidates}
+                if any(tf.startswith("tests/dialects/") for tf in seen_tf):
+                    ds_dial_users += 1
+                for tf in seen_tf:
+                    if tf == "tests/dialects/test_duckdb.py" and hot_func_plans:
+                        continue
+                    ds_file_freq[tf] = ds_file_freq.get(tf, 0) + 1
+            if ds_dial_users >= 2 and "tests/dialects/test_dialect.py" not in all_patched_py:
                 try:
                     importlib.import_module("tests.dialects.test_dialect")
-                    loaded_files = _snapshot_loaded()
                 except Exception:
                     pass
+            ds_patched_dialects = {
+                Path(r).stem for p in dialect_safe_plans for r in p.patched_files
+                if r.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/"))
+            }
+            for tf, cnt in ds_file_freq.items():
+                if cnt >= 2 and tf not in all_patched_py and tf.startswith("tests/dialects/"):
+                    d_stem = Path(tf).stem.removeprefix("test_")
+                    if d_stem in ds_patched_dialects:
+                        continue
+                    try:
+                        _import_test_module_lazy(tf.removesuffix(".py").replace("/", "."), False)
+                    except Exception:
+                        pass
+            loaded_files = _snapshot_loaded()
             gc.freeze()
         for plan in dialect_safe_plans:
             if any(rel in loaded_files for rel in plan.patched_files if rel.endswith(".py")):
