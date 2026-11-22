@@ -267,3 +267,21 @@ def fast_cost_ms(test_nums: Sequence[int] | set[int], dur_by_num: dict[int, int]
         if cost < best_cost:
             best_cost = cost
     return best_cost
+
+
+def lb_cost_ms(total_ms: float, max_d: float) -> float:
+    """O(8) lower-bound cost of a NON-EMPTY selection with the given total and longest duration:
+    min over w of max(max_d, total / w) + 2000 * w."""
+    best = total_ms + WORKER_COST_MS
+    if max_d > total_ms:
+        best = max_d + WORKER_COST_MS
+    for w in range(2, MAX_WORKERS + 1):
+        m = total_ms / w
+        if m < max_d:
+            m = max_d
+        c = m + WORKER_COST_MS * w
+        if c < best:
+            best = c
+        elif m <= max_d:
+            break
+    return best

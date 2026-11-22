@@ -42,6 +42,7 @@ class CommitPlan:
     tpcds_fixture_touched: bool = False
     tpch_fixture_touched: bool = False
     has_max_nodes_edit: bool = False
+    force_report: set[int] = field(default_factory=set)
 
 
 class CandidateEngine:
@@ -523,7 +524,8 @@ class CandidateEngine:
         class_aliases = dep["class_aliases"]
         class_copiers = dep["class_copiers"]
 
-        visited: set[str] = set()
+        visited_pairs: set[tuple[str, str]] = set()
+        visited_classes: set[str] = set()
         queue: list[tuple[str, str]] = [(class_name, attr)]
         if class_name == "JSONPathTokenizer":
             for o in self.dict_keys_by_oa:
@@ -532,37 +534,40 @@ class CandidateEngine:
 
         while queue:
             cur, cur_attr = queue.pop()
-            if cur in visited:
+            pair = (cur, cur_attr)
+            if pair in visited_pairs:
                 continue
-            visited.add(cur)
+            visited_pairs.add(pair)
+            visited_classes.add(cur)
 
             for sc in self._subclasses_of(cur):
-                if sc not in visited:
+                if (sc, cur_attr) not in visited_pairs:
                     queue.append((sc, cur_attr))
             for ch in class_children.get(cur, ()):
-                if ch not in visited:
+                if (ch, cur_attr) not in visited_pairs:
                     queue.append((ch, cur_attr))
             for al in class_aliases.get(cur, ()):
-                if al not in visited:
+                if (al, cur_attr) not in visited_pairs:
                     queue.append((al, cur_attr))
             if "." in cur:
                 parent_d, leaf = cur.split(".", 1)
                 for psub in set(self._subclasses_of(parent_d)) | set(class_children.get(parent_d, ())):
                     cand = f"{psub}.{leaf}"
-                    if cand not in visited:
+                    if (cand, cur_attr) not in visited_pairs:
                         queue.append((cand, cur_attr))
-                    if psub not in visited:
+                    if (psub, cur_attr) not in visited_pairs:
                         queue.append((psub, cur_attr))
             if cur_attr != "*":
                 for dst_cls, dst_attr in attr_copiers.get((cur, cur_attr), ()):
-                    if dst_cls not in visited:
-                        queue.append((dst_cls, dst_attr if dst_attr != "*" else cur_attr))
+                    nxt_attr = dst_attr if dst_attr != "*" else cur_attr
+                    if (dst_cls, nxt_attr) not in visited_pairs:
+                        queue.append((dst_cls, nxt_attr))
             else:
                 for dst_cls in class_copiers.get(cur, ()):
-                    if dst_cls not in visited:
+                    if (dst_cls, "*") not in visited_pairs:
                         queue.append((dst_cls, "*"))
 
-        return sorted(visited)
+        return sorted(visited_classes)
 
     def _get_rev_import_graph(self) -> dict[str, set[str]]:
         """Lazily build EXACT top-level static reverse-import graph across sqlglot/**/*.py
@@ -1026,9 +1031,14 @@ class CandidateEngine:
                 tf["val-calls"] = None
             if "gen-mem" in tf and tf["gen-mem"] is not None and len(tf["gen-mem"]) == 0 and "gen-mem" not in proven_only:
                 tf["gen-mem"] = None
+            for k in list(tf.keys()):
+                if tf[k] is not None and len(tf[k]) == 0 and k in untracked_empty_tags and k not in proven_only:
+                    # Only widen to None if NO non-empty sibling tag exists or this tag itself was marked untracked
+                    if not any(v is not None and len(v) > 0 for v in tf.values()):
+                        tf[k] = None
             if all(v is not None and len(v) == 0 for v in tf.values()):
-                if not any(k in proven_only for k in tf):
-                    for k in list(tf.keys()):
+                for k in list(tf.keys()):
+                    if k not in proven_only:
                         tf[k] = None
         return tf
 
@@ -1531,6 +1541,7 @@ class CandidateEngine:
         deleted_files: set[str] = set()
         py_analyses: dict[str, PyFileAnalysis] = {}
         candidates: set[int] = set()
+        force_report: set[int] = set()
         subtest_filters: dict[int, dict[str, set[Any] | None]] = {}
         deferred_subtests: dict[int, list[tuple[str, Any]]] = {}
 
@@ -1576,7 +1587,9 @@ class CandidateEngine:
                 for rnum in old_affected:
                     for tag in self._subtest_tags_by_num.get(rnum, ()):
                         self._add_subtest_filter(subtest_filters, rnum, tag, None)
-                if not fp.is_binary:
+                if fp.is_binary:
+                    force_report.update(old_affected)
+                else:
                     base_src = self._read_base_file(old_p)
                     new_src = apply_file_patch(base_src, fp)
                     patched_files[new_p] = new_src
@@ -1592,13 +1605,27 @@ class CandidateEngine:
                 has_non_noop = True
                 only_fixtures = False
                 all_hot_func = False
+                bin_hits = set(self._to_rnums(self.maps["fixture_to_tests"].get(rel, [])))
                 if "tpc-ds/" in rel:
                     tpcds_fixture_touched = True
                     exec_engine_touched = True
+                    t_ds = self.id_to_num.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+                    if t_ds is not None:
+                        bin_hits.add(t_ds)
                 if "tpc-h/" in rel:
                     tpch_fixture_touched = True
                     exec_engine_touched = True
-                candidates.update(self._to_rnums(self.maps["fixture_to_tests"].get(rel, [])))
+                    for tid_k in (
+                        "tests/test_executor.py::TestExecutor::test_execute_tpch",
+                        "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+                    ):
+                        t_h = self.id_to_num.get(tid_k)
+                        if t_h is not None:
+                            bin_hits.add(t_h)
+                candidates.update(bin_hits)
+                # Binary diffs carry no patch bytes to apply in-memory, so verifying against baseline
+                # would falsely pass -> report affected tests directly (0% miss risk, 0 ms CPU)!
+                force_report.update(bin_hits)
                 continue
 
             old_text = self._read_base_file(rel)
@@ -1825,4 +1852,5 @@ class CandidateEngine:
             tpcds_fixture_touched=tpcds_fixture_touched,
             tpch_fixture_touched=tpch_fixture_touched,
             has_max_nodes_edit=has_max_nodes_edit,
+            force_report=force_report,
         )

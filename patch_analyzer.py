@@ -170,7 +170,10 @@ def apply_file_patch(old_text: str, fp: FilePatch) -> str:
     cursor = 0  # 0-based index into old_lines
 
     for hunk in fp.hunks:
-        target = max(0, hunk.old_start - 1) if hunk.old_start > 0 else 0
+        if hunk.old_count == 0:
+            target = max(0, hunk.old_start)
+        else:
+            target = max(0, hunk.old_start - 1) if hunk.old_start > 0 else 0
         if target > cursor:
             out.extend(old_lines[cursor:target])
             cursor = target
@@ -445,6 +448,85 @@ def _ast_nodes_equiv(
     return a == b
 
 
+def _stmt_start_line(node: ast.stmt) -> int:
+    start = node.lineno
+    for d in getattr(node, "decorator_list", None) or ():
+        if d.lineno < start:
+            start = d.lineno
+    return start
+
+
+def _same_stmt_text(x: ast.stmt, y: ast.stmt, old_lines: list[str], new_lines: list[str]) -> bool:
+    """True when two statements span byte-identical source text, hence parse to identical ASTs."""
+    if type(x) is not type(y) or x.col_offset != y.col_offset or x.end_col_offset != y.end_col_offset:
+        return False
+    xs = _stmt_start_line(x)
+    ys = _stmt_start_line(y)
+    xe = x.end_lineno
+    ye = y.end_lineno
+    if xe is None or ye is None or xe - xs != ye - ys:
+        return False
+    return old_lines[xs - 1 : xe] == new_lines[ys - 1 : ye]
+
+
+def _fast_tree_equiv(
+    a: Any,
+    b: Any,
+    old_lines: list[str] | None,
+    new_lines: list[str] | None,
+    ignore_docstrings: bool = False,
+    ignore_type_checking: bool = False,
+    allow_sound_cmp: bool = False,
+    allow_none: bool = False,
+    pure_enums: set[str] | None = None,
+    strict_enum_attrs: set[tuple[str, str]] | None = None,
+    cmp_site_ok: Any = None,
+) -> bool:
+    """Exactly _ast_nodes_equiv(a, b, ...) for old/new Module trees, but statements (at module and
+    class level) whose source text is identical are skipped instead of walked node by node."""
+    rest = (
+        ignore_docstrings,
+        ignore_type_checking,
+        allow_sound_cmp,
+        allow_none,
+        pure_enums,
+        strict_enum_attrs,
+        cmp_site_ok,
+    )
+    if old_lines is None or new_lines is None or not isinstance(a, (ast.Module, ast.ClassDef)):
+        return _ast_nodes_equiv(a, b, *rest)
+    if type(a) is not type(b):
+        return False
+    for field_name in a._fields:
+        if field_name != "body" and not _ast_nodes_equiv(getattr(a, field_name), getattr(b, field_name), *rest):
+            return False
+    va = a.body
+    vb = b.body
+    if ignore_docstrings:
+        va = _strip_leading_docstring(va)
+        vb = _strip_leading_docstring(vb)
+    if ignore_type_checking:
+        va = [st for st in va if not _is_type_checking_if(st)]
+        vb = [st for st in vb if not _is_type_checking_if(st)]
+    if len(va) != len(vb):
+        return False
+    for x, y in zip(va, vb):
+        if _same_stmt_text(x, y, old_lines, new_lines):
+            continue
+        if isinstance(x, ast.ClassDef) and isinstance(y, ast.ClassDef):
+            if not _fast_tree_equiv(x, y, old_lines, new_lines, *rest):
+                return False
+        elif not _ast_nodes_equiv(x, y, *rest):
+            return False
+    return True
+
+
+def _source_lines(src: str) -> list[str] | None:
+    if "\r" in src:
+        return None
+    return src.split("\n")
+
+
 def _diff_has_identity_or_eq_change(fp: FilePatch) -> bool:
     for h in fp.hunks:
         for line in h.lines:
@@ -468,12 +550,14 @@ def _is_sound_cmp_equiv(
     pure_enums: set[str],
     strict_enum_attrs: set[tuple[str, str]],
     ignore_docstrings: bool = False,
+    old_lines: list[str] | None = None,
+    new_lines: list[str] | None = None,
 ) -> bool:
     if not file.startswith("sqlglot/") or not _diff_has_identity_or_eq_change(fp):
         return False
     allow_none = file not in _UNSAFE_NONE_EQ_FILES
-    return _ast_nodes_equiv(
-        old_ast, new_ast,
+    return _fast_tree_equiv(
+        old_ast, new_ast, old_lines, new_lines,
         ignore_docstrings=ignore_docstrings,
         ignore_type_checking=False,
         allow_sound_cmp=True,
@@ -1107,8 +1191,10 @@ def analyze_python_change(
 
     # Treat as static no-op when exact AST is identical (or provably sound None/strict-Enum is<->== swap)
     # and no coding cookie changed.
+    old_lines = _source_lines(old_src)
+    new_lines = _source_lines(new_src)
     if _coding_cookie(old_src) == _coding_cookie(new_src):
-        if _ast_nodes_equiv(old_ast, new_ast, ignore_docstrings):
+        if _fast_tree_equiv(old_ast, new_ast, old_lines, new_lines, ignore_docstrings):
             return PyFileAnalysis(file=file, is_noop=True)
         if _is_sound_cmp_equiv(
             file,
@@ -1118,11 +1204,15 @@ def analyze_python_change(
             pure_enums or _EMPTY_SET,
             strict_enum_attrs or _EMPTY_SET,
             ignore_docstrings=ignore_docstrings,
+            old_lines=old_lines,
+            new_lines=new_lines,
         ):
             return PyFileAnalysis(file=file, is_noop=True)
-        if cmp_agree and _diff_has_identity_or_eq_change(fp) and _ast_nodes_equiv(
+        if cmp_agree and _diff_has_identity_or_eq_change(fp) and _fast_tree_equiv(
             old_ast,
             new_ast,
+            old_lines,
+            new_lines,
             ignore_docstrings,
             cmp_site_ok=lambda line, col: f"{file}:{line}:{col}" in cmp_agree,
         ):
@@ -1151,7 +1241,7 @@ def analyze_python_change(
         if (
             not file.startswith("sqlglot/typing/")
             and _coding_cookie(old_src) == _coding_cookie(new_src)
-            and _ast_nodes_equiv(old_ast, new_ast, ignore_docstrings, ignore_type_checking=True)
+            and _fast_tree_equiv(old_ast, new_ast, old_lines, new_lines, ignore_docstrings, ignore_type_checking=True)
         ):
             return PyFileAnalysis(file=file, is_noop=True)
         units.append(ChangeUnit(kind="module_other", file=file, symbol_name="*", old_lines=changed_old))
