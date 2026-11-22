@@ -4907,11 +4907,6 @@ def verify_batch(
                 except Exception:
                     results[cid] = _safe_fallback_tests(plan)
 
-    # Diagnostic Probe E: skip ALL test verification to measure exact fixed CPU (startup + maps + 40 plans + pack)
-    for _p in active_plans:
-        results[_p.commit] = _safe_fallback_tests(_p)
-    return results
-
     # Tier 1: C-accelerated /sqlglot-c (94 mods, pure-Python optimizer/*; eager forks + C-Warm Zygote)
     if has_sqlglot_c and c_plans_all:
         _run_tier(_SQLGLOT_C_ROOT, c_eager, c_lazy, c_hot, c_fix)
