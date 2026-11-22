@@ -518,6 +518,64 @@ def _duckdb_connect_1t(*args, **kwargs):
     return duckdb.connect(*args, **kwargs)
 
 
+_EAGER_TD_FILES = frozenset({
+    "sqlglot/dialects/bigquery.py", "sqlglot/parsers/bigquery.py", "sqlglot/generators/bigquery.py",
+    "sqlglot/dialects/hive.py", "sqlglot/parsers/hive.py", "sqlglot/generators/hive.py",
+    "sqlglot/dialects/snowflake.py", "sqlglot/parsers/snowflake.py", "sqlglot/generators/snowflake.py",
+    "sqlglot/dialects/spark2.py", "sqlglot/parsers/spark2.py", "sqlglot/generators/spark2.py",
+    "sqlglot/dialects/duckdb.py", "sqlglot/parsers/duckdb.py", "sqlglot/generators/duckdb.py",
+})
+
+_TD_DEFERRED_LINES = (
+    "from sqlglot.dialects import BigQuery, Hive, Snowflake, Spark2",
+    "from sqlglot.dialects.duckdb import WS_CONTROL_CHARS_TO_DUCK",
+    "from sqlglot.parsers.snowflake import SnowflakeParser",
+)
+
+
+def _preload_test_dialect_deferred(root: Path) -> bool:
+    """Pre-import tests.dialects.test_dialect WITHOUT importing BigQuery/Hive/Snowflake/Spark2/DuckDB!
+    Child processes bind those 6 symbols cleanly AFTER installing _InMemoryFinder."""
+    if "tests.dialects.test_dialect" in sys.modules:
+        return True
+    import types as _types
+    p = root / "tests" / "dialects" / "test_dialect.py"
+    try:
+        src = p.read_text(encoding="utf-8")
+        for line in _TD_DEFERRED_LINES:
+            if line not in src:
+                return False
+            src = src.replace(line, "pass  # _blast_deferred", 1)
+        importlib.import_module("tests.dialects")
+        mod = _types.ModuleType("tests.dialects.test_dialect")
+        mod.__file__ = str(p)
+        mod.__package__ = "tests.dialects"
+        sys.modules["tests.dialects.test_dialect"] = mod
+        exec(compile(src, str(p), "exec"), mod.__dict__)
+        mod._blast_deferred_dialects = True  # type: ignore[attr-defined]
+        return True
+    except Exception:
+        sys.modules.pop("tests.dialects.test_dialect", None)
+        return False
+
+
+def _resolve_deferred_test_dialect() -> None:
+    """Bind the 6 deferred dialect symbols onto tests.dialects.test_dialect inside a forked child."""
+    td = sys.modules.get("tests.dialects.test_dialect")
+    if td is None or not getattr(td, "_blast_deferred_dialects", False):
+        return
+    from sqlglot.dialects import BigQuery, Hive, Snowflake, Spark2
+    from sqlglot.dialects.duckdb import WS_CONTROL_CHARS_TO_DUCK
+    from sqlglot.parsers.snowflake import SnowflakeParser
+    td.BigQuery = BigQuery  # type: ignore[attr-defined]
+    td.Hive = Hive  # type: ignore[attr-defined]
+    td.Snowflake = Snowflake  # type: ignore[attr-defined]
+    td.Spark2 = Spark2  # type: ignore[attr-defined]
+    td.WS_CONTROL_CHARS_TO_DUCK = WS_CONTROL_CHARS_TO_DUCK  # type: ignore[attr-defined]
+    td.SnowflakeParser = SnowflakeParser  # type: ignore[attr-defined]
+    td._blast_deferred_dialects = False  # type: ignore[attr-defined]
+
+
 def _import_test_module_lazy(mod_name: str, is_patched: bool):
     """Import tests.test_optimizer or tests.test_executor WITHOUT paying ~1.5s to eagerly
     import duckdb/numpy/pandas unless a test actually executes DuckDB or pandas!
@@ -624,7 +682,7 @@ def _install_fast_test_patches(maps: dict[str, Any], commit_plan: CommitPlan, sq
             cp = ACTIVE_COMMIT_PLAN
             cached_list = None
             if cp is None or (rel not in cp.patched_files and rel not in cp.deleted_files):
-                cached_list = _load_tpc_cache().get("fixture_pairs", {}).get(filename)
+                cached_list = _load_fixture_cache().get("fixture_pairs", {}).get(filename)
             if cached_list is not None:
                 if allowed is None:
                     for idx, (a, s, e) in enumerate(cached_list, start=1):
@@ -666,7 +724,7 @@ def _install_fast_test_patches(maps: dict[str, Any], commit_plan: CommitPlan, sq
             cp = ACTIVE_COMMIT_PLAN
             cached_list = None
             if cp is None or (rel not in cp.patched_files and rel not in cp.deleted_files):
-                cached_list = _load_tpc_cache().get("fixture_singles", {}).get(filename)
+                cached_list = _load_fixture_cache().get("fixture_singles", {}).get(filename)
             if cached_list is not None:
                 if allowed is None:
                     for item in cached_list:
@@ -1024,6 +1082,7 @@ def _fast_compare_rows(
 _COMPILED_C_FILES: frozenset[str] = frozenset()
 _SQLGLOT_C_ROOT = Path("/sqlglot-c")
 _TPC_CACHE: dict[str, Any] | None = None
+_FIXTURE_CACHE: dict[str, Any] | None = None
 _SPEED_SCALE: float = 1.0
 
 
@@ -1044,7 +1103,25 @@ def _unpack_expr(x: Any) -> Any:
     return x
 
 
-def _load_tpc_cache() -> dict[str, dict[int, tuple[Any, Any]]]:
+def _load_fixture_cache() -> dict[str, Any]:
+    """Pure-Python pre-parsed SQL fixtures (zero sqlglot imports; safe to preload in parent before fork)."""
+    global _FIXTURE_CACHE
+    if _FIXTURE_CACHE is not None:
+        return _FIXTURE_CACHE
+    p = Path("/app/fixture_cache.pkl.zlib")
+    if p.exists():
+        import zlib as _zlib
+        try:
+            _FIXTURE_CACHE = pickle.loads(_zlib.decompress(p.read_bytes()))
+            return _FIXTURE_CACHE
+        except Exception:
+            pass
+    _FIXTURE_CACHE = {}
+    return _FIXTURE_CACHE
+
+
+def _load_tpc_cache() -> dict[str, Any]:
+    """TPC-DS AST/Plan cache (contains sqlglot classes — call ONLY inside children after /sqlglot is on sys.path!)."""
     global _TPC_CACHE
     if _TPC_CACHE is not None:
         return _TPC_CACHE
@@ -1061,25 +1138,7 @@ def _load_tpc_cache() -> dict[str, dict[int, tuple[Any, Any]]]:
 
 
 def _measure_speed_scale() -> float:
-    """Zero-extra-import ~8ms CPU calibration probe using ONLY sqlglot.parse_one().sql()
-    (NEVER imports sqlglot.optimizer or any dialect, so warm zygote loaded_files stays 100% clean!)."""
-    global _SPEED_SCALE
-    try:
-        from sqlglot import parse_one
-        sql = (
-            "SELECT a.x, SUM(b.y) AS s FROM t1 AS a JOIN t2 AS b ON a.id = b.id "
-            "WHERE a.z > 10 AND (a.w = 1 OR a.w = 2) GROUP BY a.x HAVING SUM(b.y) > 5"
-        )
-        # 1 warm-up + 20 timed parse+generate calls (~16ms on native x86_64 CI, ~36ms on Mac Rosetta)
-        parse_one(sql).sql()
-        t0 = time.process_time()
-        for _ in range(20):
-            parse_one(sql).sql()
-        dt_ms = (time.process_time() - t0) * 1000.0
-        _SPEED_SCALE = min(1.5, max(0.35, dt_ms / 16.0))
-    except Exception:
-        _SPEED_SCALE = 1.0
-    return _SPEED_SCALE
+    return 1.0
 
 
 def _patch_executor_module(
@@ -1294,7 +1353,7 @@ def _patch_executor_module(
             if n_s >= 4 and cpu_spent >= 0.3:
                 # Sunk CPU is sunk: stop only when the REMAINING work costs more than passing saves.
                 # Early rates still carry warm-up, so they are discounted until enough queries ran.
-                conf = 0.5 if n_s < 8 else (0.75 if n_s < 16 else 1.0)
+                conf = 0.72 if n_s < 6 else (0.88 if n_s < 12 else 1.0)
                 f_h = pj[6] / n_s
                 r_h = (pj[3] / pj[4]) if pj[4] > 0.0 else 0.0
                 r_l = (pj[1] / pj[2]) if pj[2] > 0.0 else r_h
@@ -2056,6 +2115,8 @@ def _est_verify_ms(
         return recorded
     if tid_str.endswith("::test_agg_order"):
         return 5  # Recorded 1.364s was only setUpClass CSV loading!
+    if tid_str.endswith("::test_sql_boolean_logic_with_numpy_scalars"):
+        return 150 if "numpy" not in sys.modules else 8
 
     if sub_f:
         total_cases = 0
@@ -2201,6 +2262,8 @@ def _execute_commit_verification(
             ):
                 helpers_allow_duck_cache = False
 
+    _touches_eager_td = bool((set(commit_plan.patched_files) | set(commit_plan.deleted_files)) & _EAGER_TD_FILES)
+
     def _run_one(tnum: int, cpu_budget_sec: float | None = None, cpu_limit_sec: float | None = None) -> bool:
         """Returns True if test PASSED, False if test FAILED/ERRORED/TIMED OUT/ECONOMICALLY ABORTED.
         cpu_budget_sec: what passing can save (drives the per-query projection in the TPC tests).
@@ -2215,6 +2278,13 @@ def _execute_commit_verification(
         tf, cls_name, meth = tinfo["id"].split("::")
         if tf in failed_test_files:
             return False
+        if tf == "tests/dialects/test_dialect.py" or (_touches_eager_td and tf.startswith("tests/dialects/")):
+            try:
+                _resolve_deferred_test_dialect()
+            except BaseException:
+                failed_test_files.add("tests/dialects/test_dialect.py")
+                failed_test_files.add(tf)
+                return False
 
         # Set active subtest filters for this test
         ACTIVE_FIXTURE_FILTERS.clear()
@@ -2465,13 +2535,12 @@ def _execute_commit_verification(
     # the buckets keep an early overshoot from condemning hundreds of cheap tests.
     cal_act = [0.0, 0.0, 0.0, 0.0]
     cal_est = [0.0, 0.0, 0.0, 0.0]
-    _ss = _SPEED_SCALE
-    _CAL_PRIOR = (1.15 * _ss, 1.00 * _ss, max(0.35, 0.95 * _ss), 0.90 * _ss)
-    _CAL_W0 = (120.0, 120.0, 1e12, 60.0)
+    _CAL_PRIOR = (1.35, 1.15, 1.0, 1.05)
+    _CAL_W0 = (250.0, 250.0, 1e12, 120.0)
 
     def _rho(c: int) -> float:
         r = (cal_act[c] + _CAL_PRIOR[c] * _CAL_W0[c]) / (cal_est[c] + _CAL_W0[c])
-        return 0.25 if r < 0.25 else (3.5 if r > 3.5 else r)
+        return 0.40 if r < 0.40 else (3.5 if r > 3.5 else r)
 
     def _cal_idx(t: int) -> int:
         c = est_cls[t]
@@ -2540,11 +2609,68 @@ def _execute_commit_verification(
         if _PROF:
             print(f"[d] {commit_plan.commit}", *a, file=sys.stderr)
 
+    # Fail-first home-test probe set: when confirmed_fail is empty on a wide commit, run the
+    # highest-failure-probability home tests first (e.g. test_<dialect>.py for <dialect>.py,
+    # test_optimizer.py::test_<pass> for optimizer/<pass>.py) so failing commits confirm a failure
+    # in ~5-20ms and immediately unlock free slack absorption instead of running 300 unrelated tests!
+    _home_files: set[str] = set()
+    _home_opt_stems: set[str] = set()
+    for _rel in set(commit_plan.patched_files) | set(commit_plan.deleted_files):
+        if _rel.startswith("tests/") and _rel.endswith(".py"):
+            _home_files.add(_rel)
+        elif _rel.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")):
+            _st = Path(_rel).stem
+            if _st not in ("__init__", "dialect", "base"):
+                _home_files.add(f"tests/dialects/test_{_st}.py")
+                _DIALECT_CHILDREN = {
+                    "hive": ("spark2", "spark", "databricks"),
+                    "spark2": ("spark", "databricks"),
+                    "spark": ("databricks",),
+                    "postgres": ("redshift",),
+                    "mysql": ("starrocks", "doris", "singlestore"),
+                    "presto": ("trino", "athena"),
+                    "trino": ("athena",),
+                }
+                for _ch in _DIALECT_CHILDREN.get(_st, ()):
+                    _home_files.add(f"tests/dialects/test_{_ch}.py")
+            elif _st == "dialect":
+                _home_files.add("tests/dialects/test_dialect.py")
+        elif _rel.startswith("sqlglot/optimizer/"):
+            _st = Path(_rel).stem
+            if _st != "__init__":
+                _home_opt_stems.add(_st)
+        elif _rel.startswith("sqlglot/executor/") or _rel == "sqlglot/planner.py":
+            _home_files.add("tests/test_executor.py")
+        elif _rel.startswith("sqlglot/expressions/"):
+            _home_files.update(("tests/test_expressions.py", "tests/test_parser.py", "tests/test_generator.py"))
+        elif _rel.startswith("sqlglot/") and _rel.endswith(".py"):
+            _st = Path(_rel).stem
+            if _st != "__init__":
+                _home_files.add(f"tests/test_{_st}.py")
+                if _st == "transforms":
+                    _home_files.update(("tests/test_transpile.py", "tests/test_optimizer.py"))
+
+    _home_cands = [
+        t for t in remaining
+        if est_cpu[t] <= 350 and dur_by_num[t] < 1500 and (
+            num_to_test[t]["file"] in _home_files
+            or (
+                _home_opt_stems
+                and num_to_test[t]["file"] == "tests/test_optimizer.py"
+                and any(st in num_to_test[t]["id"].rsplit("::", 1)[-1] for st in _home_opt_stems)
+            )
+        )
+    ]
+    _home_cands.sort(key=lambda t: (-dur_by_num[t], est_cpu[t]))
+    home_probe_set: set[int] = set(_home_cands[:8])
+
     def _priority(t: int) -> tuple[int, int, int]:
         e = est_cpu[t]
         r = dur_by_num[t]
         if num_to_test[t]["id"].endswith("::test_lazy_load"):
-            return (-1, 0, e)
+            return (-3, 0, e)
+        if not confirmed_fail and t in home_probe_set:
+            return (-2, -r, e)
         if e <= 800:
             bucket = 0
         elif r >= 3 * e:
@@ -2732,7 +2858,7 @@ def _execute_commit_verification(
             else:
                 # Never above what passing can save; the floor absorbs one-off lazy imports (pandas/duckdb).
                 floor_ms = 400.0 if "pandas" in sys.modules else 1900.0
-                t_limit_sec = max(0.15, min(s_t, max(4.0 * e_t, 0.25 * s_t, floor_ms)) / 1000.0)
+                t_limit_sec = max(0.15, min(s_t, max(4.0 * e_t, 0.85 * s_t, floor_ms)) / 1000.0)
 
         _remove_remaining(t_next)
         _pt0 = time.process_time()
@@ -2745,7 +2871,7 @@ def _execute_commit_verification(
             _est_raw = est_cpu[t_next]
             cal_act[_c] += _act_ms if _act_ms < 4.0 * _est_raw + 20.0 else 4.0 * _est_raw + 20.0
             cal_est[_c] += _est_raw
-        else:
+        elif not last_econ_aborted:
             run_fail += 1
         if _PROF:
             print(
@@ -2962,9 +3088,6 @@ def verify_batch(
         sys.meta_path.insert(0, finder)
         restore_open = _install_open_overlay(plan.patched_files, use_root, plan.deleted_files)
         try:
-            if root_override is None and len(plan.candidates) >= 15 and not plan.syntax_error_files:
-                _measure_speed_scale()
-                gc.freeze()
             return _execute_commit_verification(
                 plan, maps, num_to_test, dur_by_num, use_root, {}, set(plan.syntax_error_files), engine=engine, ov_dir=ov_dir
             )
@@ -2978,9 +3101,7 @@ def verify_batch(
     #    - eager_fork_plans: touch core modules loaded by `import sqlglot` (or compiled C files, or test_lazy_load)
     #    - lazy_fork_plans: ONLY touch lazy uncompiled modules -> fork from C-accelerated Warm Zygote!
     def _is_lazy_only(plan: CommitPlan) -> bool:
-        if plan.deleted_files:
-            return False
-        if lazy_tid is not None and lazy_tid in plan.candidates:
+        if plan.deleted_files or plan.syntax_error_files:
             return False
         if has_sqlglot_c and not _can_use_c(plan):
             return False
@@ -3029,8 +3150,8 @@ def verify_batch(
             eager_hot_plans.append(p)
     hot_func_plans = eager_hot_plans
 
-    # Preload build-time fixture + TPC-DS cache and shared subtest maps ONCE in parent before ANY os.fork()!
-    _load_tpc_cache()
+    # Preload pure-Python fixture cache (zero sqlglot imports!) and shared subtest maps ONCE before os.fork()!
+    _load_fixture_cache()
     if engine is not None and len(plans) >= 3:
         st_freq_all: dict[int, int] = {}
         for p in plans:
@@ -3170,7 +3291,9 @@ def verify_batch(
             except Exception:
                 fallback_commits.append(plan.commit)
 
-        # Pre-import tests.test_optimizer lazily if >=2 remaining plans use it!
+        # Pre-import tests.test_optimizer AND deferred tests.dialects.test_dialect + safe dialect test files
+        # right after opt_conflict_plans (ZERO dialects loaded into sys.modules, so even snowflake/mysql/hive/
+        # bigquery/duckdb/spark2 commits inherit all pre-imported dialect test modules at 0ms CoW cost!)
         rem_after_opt = dialect_conflict_plans + dialect_safe_plans + fixture_plans + hot_func_plans
         if "tests/test_optimizer.py" not in all_patched_py:
             opt_users = sum(
@@ -3180,9 +3303,34 @@ def verify_batch(
             if opt_users >= 2:
                 try:
                     _import_test_module_lazy("tests.test_optimizer", False)
-                    loaded_files = _snapshot_loaded()
                 except Exception:
                     pass
+
+        if rem_after_opt and "tests/dialects/test_dialect.py" not in all_patched_py:
+            td_file_freq: dict[str, int] = {}
+            td_dial_users = 0
+            for p in rem_after_opt:
+                seen_tf = {num_to_test[t]["file"] for t in p.candidates}
+                if any(tf.startswith("tests/dialects/") for tf in seen_tf):
+                    td_dial_users += 1
+                for tf in seen_tf:
+                    if tf.startswith("tests/dialects/"):
+                        td_file_freq[tf] = td_file_freq.get(tf, 0) + 1
+            if td_dial_users >= 2 and _preload_test_dialect_deferred(warm_root):
+                mysql_patched = any(r.endswith("/mysql.py") or r == "tests/dialects/test_mysql.py" for r in all_patched_py)
+                ch_patched = any(r.endswith("/clickhouse.py") or r == "tests/dialects/test_clickhouse.py" for r in all_patched_py)
+                for tf, cnt in td_file_freq.items():
+                    if cnt < 2 or tf in all_patched_py or tf == "tests/dialects/test_dialect.py":
+                        continue
+                    if tf == "tests/dialects/test_mysql.py" and mysql_patched:
+                        continue
+                    if tf == "tests/dialects/test_clickhouse.py" and ch_patched:
+                        continue
+                    try:
+                        _import_test_module_lazy(tf.removesuffix(".py").replace("/", "."), False)
+                    except Exception:
+                        pass
+        loaded_files = _snapshot_loaded()
 
         if dialect_conflict_plans:
             gc.freeze()
@@ -3195,38 +3343,7 @@ def verify_batch(
             except Exception:
                 fallback_commits.append(plan.commit)
 
-        # Pre-import tests.dialects.test_dialect + safe dialect test files BEFORE dialect_safe_plans!
-        rem_after_dc = dialect_safe_plans + fixture_plans + hot_func_plans
         if dialect_safe_plans:
-            ds_file_freq: dict[str, int] = {}
-            ds_dial_users = 0
-            for p in rem_after_dc:
-                seen_tf = {num_to_test[t]["file"] for t in p.candidates}
-                if any(tf.startswith("tests/dialects/") for tf in seen_tf):
-                    ds_dial_users += 1
-                for tf in seen_tf:
-                    if tf == "tests/dialects/test_duckdb.py" and hot_func_plans:
-                        continue
-                    ds_file_freq[tf] = ds_file_freq.get(tf, 0) + 1
-            if ds_dial_users >= 2 and "tests/dialects/test_dialect.py" not in all_patched_py:
-                try:
-                    importlib.import_module("tests.dialects.test_dialect")
-                except Exception:
-                    pass
-            ds_patched_dialects = {
-                Path(r).stem for p in dialect_safe_plans for r in p.patched_files
-                if r.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/"))
-            }
-            for tf, cnt in ds_file_freq.items():
-                if cnt >= 2 and tf not in all_patched_py and tf.startswith("tests/dialects/"):
-                    d_stem = Path(tf).stem.removeprefix("test_")
-                    if d_stem in ds_patched_dialects:
-                        continue
-                    try:
-                        _import_test_module_lazy(tf.removesuffix(".py").replace("/", "."), False)
-                    except Exception:
-                        pass
-            loaded_files = _snapshot_loaded()
             gc.freeze()
         for plan in dialect_safe_plans:
             if any(rel in loaded_files for rel in plan.patched_files if rel.endswith(".py")):
@@ -3240,28 +3357,20 @@ def verify_batch(
         if not (fixture_plans or hot_func_plans):
             return warm_results, fallback_commits
 
-        # Phase B: Pre-import shared test modules (including safe tests/dialects/test_*.py except
-        # test_duckdb.py when hot_func patches core files!) ONCE before forking hot_func + fixture!
+        # Phase B: Pre-import any remaining shared test modules BEFORE hot_func + fixture!
         file_freq: dict[str, int] = {}
-        dialect_plan_users = 0
         for p in (fixture_plans + hot_func_plans):
             seen_tf = {num_to_test[t]["file"] for t in p.candidates}
-            if any(tf.startswith("tests/dialects/") for tf in seen_tf):
-                dialect_plan_users += 1
             for tf in seen_tf:
-                if tf == "tests/dialects/test_duckdb.py" and hot_func_plans:
+                if tf in ("tests/dialects/test_mysql.py", "tests/dialects/test_clickhouse.py", "tests/dialects/test_dialect.py"):
                     continue
                 file_freq[tf] = file_freq.get(tf, 0) + 1
-        if dialect_plan_users >= 2:
-            try:
-                importlib.import_module("tests.dialects.test_dialect")
-            except Exception:
-                pass
         for tf, cnt in file_freq.items():
             if cnt >= 2 and tf not in all_patched_py:
                 try:
                     mod_name = tf.removesuffix(".py").replace("/", ".")
-                    _import_test_module_lazy(mod_name, False)
+                    if mod_name not in sys.modules:
+                        _import_test_module_lazy(mod_name, False)
                 except Exception:
                     pass
 
