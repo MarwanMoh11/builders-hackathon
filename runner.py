@@ -18,7 +18,6 @@ import pickle
 import signal
 import sys
 import time
-import types
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,7 +25,16 @@ from typing import Any
 
 from candidate_engine import CommitPlan
 from packer import fast_cost_ms, lb_cost_ms, max_total_for_cost_ms, optimal_cost_ms
+import dep_index as _di
 import replay_cache as rc
+
+try:
+    import _fast_join_c as _FJC
+    _FJC_OPEN_LOOKUP = getattr(_FJC, "fast_open_lookup", None)
+    _FJC_COMPARE_ROWS = getattr(_FJC, "fast_compare_rows", None)
+except Exception:
+    _FJC_OPEN_LOOKUP = None
+    _FJC_COMPARE_ROWS = None
 
 
 class _FailFast(BaseException):
@@ -42,6 +50,7 @@ class _EconomicAbort(BaseException):
 
 
 TIMEOUT_FIRED: bool = False  # set by the SIGALRM handler (unittest swallows the exception itself)
+LAST_COMMIT_HAD_TIMEOUT: bool = False
 
 
 def _alarm_handler(signum: int, frame: Any) -> None:
@@ -128,18 +137,17 @@ def _install_open_overlay(patched_files: dict[str, str], sqlglot_root: Path, del
     orig_path_open = Path.open
     orig_listdir = os.listdir
     abs_map: dict[str, str] = {
-        str((sqlglot_root / rel).resolve()): content
+        os.path.realpath(str(sqlglot_root / rel)): content
         for rel, content in patched_files.items()
     }
     del_set: set[str] = {
-        str((sqlglot_root / rel).resolve())
+        os.path.realpath(str(sqlglot_root / rel))
         for rel in (deleted_files or ())
     }
-    patched_basenames: frozenset[str] = frozenset(
-        os.path.basename(k) for k in abs_map
-    ) | frozenset(
-        os.path.basename(k) for k in del_set
+    basenames_tuple: tuple[str, ...] = tuple(
+        {os.path.basename(k) for k in abs_map} | {os.path.basename(k) for k in del_set}
     )
+    basenames_set: frozenset[str] = frozenset(basenames_tuple)
     # Overlay os.listdir for newly added/deleted files (so pkgutil.iter_modules sees added sqlglot/typing/*.py!)
     added_by_dir: dict[str, set[str]] = {}
     deleted_by_dir: dict[str, set[str]] = {}
@@ -157,7 +165,9 @@ def _install_open_overlay(patched_files: dict[str, str], sqlglot_root: Path, del
         if not overlay_dirs or isinstance(path, int):
             return res
         try:
-            rp = str(Path(os.fspath(path)).resolve())
+            rp = os.path.realpath(os.fspath(path))
+            if isinstance(rp, bytes):
+                rp = os.fsdecode(rp)
         except Exception:
             return res
         if rp not in overlay_dirs:
@@ -182,59 +192,132 @@ def _install_open_overlay(patched_files: dict[str, str], sqlglot_root: Path, del
                     out_s.append(n)
         return out_s
 
-    def _lookup(file: Any) -> tuple[bool, str | None]:
+    _c_lookup = _FJC_OPEN_LOOKUP
+    _realpath = os.path.realpath
+    _fspath = os.fspath
+
+    def _lookup_fallback(file: Any) -> tuple[bool, str | None]:
         if not isinstance(file, (str, os.PathLike)):
             return False, None
-        s = os.fspath(file)
+        s = _fspath(file)
         if not isinstance(s, str):
             return False, None
-        if s in del_set:
+        if del_set and s in del_set:
             return True, s
         data = abs_map.get(s)
         if data is not None:
             return False, data
-        if (
-            s.startswith(("/app/", "/usr/", "/lib/", "/etc/", "/proc/"))
-            or os.path.basename(s) not in patched_basenames
-        ):
+        if not basenames_set:
             return False, None
+        if not s or s.endswith("/") or s.startswith("/tmp/"):
+            pass
+        else:
+            bname = s.rsplit("/", 1)[-1]
+            if bname not in (".", "..") and bname not in basenames_set:
+                return False, None
         try:
-            r = str(Path(s).resolve())
-            if r in del_set:
+            r = _realpath(s)
+            if del_set and r in del_set:
                 return True, s
             return False, abs_map.get(r)
         except Exception:
             return False, None
 
-    def _overlay_open(file, mode="r", *args, **kwargs):
-        if "w" not in mode and "a" not in mode and "x" not in mode:
-            is_del, data = _lookup(file)
+    if _c_lookup is not None:
+        def _overlay_open(file, mode="r", *args, **kwargs):
+            if "w" not in mode and "a" not in mode and "x" not in mode:
+                res = _c_lookup(file, abs_map, del_set, basenames_tuple)
+                if res is None:
+                    return orig_open(file, mode, *args, **kwargs)
+                if res is True:
+                    raise FileNotFoundError(_errno.ENOENT, os.strerror(_errno.ENOENT), _fspath(file))
+                if res is False:
+                    s = _fspath(file)
+                    try:
+                        r = _realpath(s)
+                    except Exception:
+                        r = ""
+                    if r in del_set:
+                        raise FileNotFoundError(_errno.ENOENT, os.strerror(_errno.ENOENT), s)
+                    res = abs_map.get(r)
+                    if res is None:
+                        return orig_open(file, mode, *args, **kwargs)
+                if "b" in mode:
+                    return io.BytesIO(res.encode("utf-8"))
+                return io.StringIO(res)
+            return orig_open(file, mode, *args, **kwargs)
+
+        def _overlay_open_code(path):
+            res = _c_lookup(path, abs_map, del_set, basenames_tuple)
+            if res is None:
+                return orig_open_code(path)
+            if res is True:
+                raise FileNotFoundError(_errno.ENOENT, os.strerror(_errno.ENOENT), _fspath(path))
+            if res is False:
+                s = _fspath(path)
+                try:
+                    r = _realpath(s)
+                except Exception:
+                    r = ""
+                if r in del_set:
+                    raise FileNotFoundError(_errno.ENOENT, os.strerror(_errno.ENOENT), s)
+                res = abs_map.get(r)
+                if res is None:
+                    return orig_open_code(path)
+            return io.BytesIO(res.encode("utf-8"))
+
+        def _overlay_path_open(self, mode="r", *args, **kwargs):
+            if "w" not in mode and "a" not in mode and "x" not in mode:
+                res = _c_lookup(self, abs_map, del_set, basenames_tuple)
+                if res is None:
+                    return orig_path_open(self, mode, *args, **kwargs)
+                if res is True:
+                    raise FileNotFoundError(_errno.ENOENT, os.strerror(_errno.ENOENT), _fspath(self))
+                if res is False:
+                    s = _fspath(self)
+                    try:
+                        r = _realpath(s)
+                    except Exception:
+                        r = ""
+                    if r in del_set:
+                        raise FileNotFoundError(_errno.ENOENT, os.strerror(_errno.ENOENT), s)
+                    res = abs_map.get(r)
+                    if res is None:
+                        return orig_path_open(self, mode, *args, **kwargs)
+                if "b" in mode:
+                    return io.BytesIO(res.encode("utf-8"))
+                return io.StringIO(res)
+            return orig_path_open(self, mode, *args, **kwargs)
+    else:
+        def _overlay_open(file, mode="r", *args, **kwargs):
+            if "w" not in mode and "a" not in mode and "x" not in mode:
+                is_del, data = _lookup_fallback(file)
+                if is_del:
+                    raise FileNotFoundError(_errno.ENOENT, os.strerror(_errno.ENOENT), data)
+                if data is not None:
+                    if "b" in mode:
+                        return io.BytesIO(data.encode("utf-8"))
+                    return io.StringIO(data)
+            return orig_open(file, mode, *args, **kwargs)
+
+        def _overlay_open_code(path):
+            is_del, data = _lookup_fallback(path)
             if is_del:
                 raise FileNotFoundError(_errno.ENOENT, os.strerror(_errno.ENOENT), data)
             if data is not None:
-                if "b" in mode:
-                    return io.BytesIO(data.encode("utf-8"))
-                return io.StringIO(data)
-        return orig_open(file, mode, *args, **kwargs)
+                return io.BytesIO(data.encode("utf-8"))
+            return orig_open_code(path)
 
-    def _overlay_open_code(path):
-        is_del, data = _lookup(path)
-        if is_del:
-            raise FileNotFoundError(_errno.ENOENT, os.strerror(_errno.ENOENT), data)
-        if data is not None:
-            return io.BytesIO(data.encode("utf-8"))
-        return orig_open_code(path)
-
-    def _overlay_path_open(self, mode="r", *args, **kwargs):
-        if "w" not in mode and "a" not in mode and "x" not in mode:
-            is_del, data = _lookup(self)
-            if is_del:
-                raise FileNotFoundError(_errno.ENOENT, os.strerror(_errno.ENOENT), data)
-            if data is not None:
-                if "b" in mode:
-                    return io.BytesIO(data.encode("utf-8"))
-                return io.StringIO(data)
-        return orig_path_open(self, mode, *args, **kwargs)
+        def _overlay_path_open(self, mode="r", *args, **kwargs):
+            if "w" not in mode and "a" not in mode and "x" not in mode:
+                is_del, data = _lookup_fallback(self)
+                if is_del:
+                    raise FileNotFoundError(_errno.ENOENT, os.strerror(_errno.ENOENT), data)
+                if data is not None:
+                    if "b" in mode:
+                        return io.BytesIO(data.encode("utf-8"))
+                    return io.StringIO(data)
+            return orig_path_open(self, mode, *args, **kwargs)
 
     builtins.open = _overlay_open
     io.open = _overlay_open
@@ -341,39 +424,6 @@ def _econ_check() -> None:
     lim = ECON_CPU_LIMIT
     if lim is not None and time.process_time() > lim:
         _econ_abort_now()
-
-
-def _reset_inproc_globals() -> None:
-    """Reset all runner module-level per-commit/per-test globals for clean zero-fork in-process isolation."""
-    global TIMEOUT_FIRED, ACTIVE_LAST_PAIR_IDX, LAST_FAILED_TPCDS_QIDX, ACTIVE_GEN_MEM_DIALECTS
-    global ACTIVE_VAL_CALLS, ACTIVE_VAL_COUNTER, ACTIVE_VAL_DEPTH, ACTIVE_VAL_FILE
-    global ACTIVE_VAL_RET_USED_LINES, ACTIVE_TEST_ID, ACTIVE_REPLAY_SCOPE, ACTIVE_INLINE_OPT_DEPTH
-    global VAL_FAILED_INSIDE, IN_ASSERT_CTX, ACTIVE_COMMIT_PLAN, ACTIVE_ENGINE, ACTIVE_TNUM
-    global ACTIVE_CPU_BUDGET_SEC, ACTIVE_PATCHED_TRIE_MODS, ACTIVE_RS_SLIM_OK
-    global ECON_CPU_LIMIT, ECON_ABORTED
-    TIMEOUT_FIRED = False
-    ACTIVE_FIXTURE_FILTERS.clear()
-    ACTIVE_LAST_PAIR_IDX = 0
-    LAST_FAILED_TPCDS_QIDX = 0
-    ACTIVE_GEN_MEM_DIALECTS = None
-    ACTIVE_VAL_CALLS = None
-    ACTIVE_VAL_COUNTER = 0
-    ACTIVE_VAL_DEPTH = 0
-    ACTIVE_VAL_FILE = ""
-    ACTIVE_VAL_RET_USED_LINES = None
-    ACTIVE_TEST_ID = ""
-    ACTIVE_REPLAY_SCOPE = None
-    ACTIVE_INLINE_OPT_DEPTH = 0
-    VAL_FAILED_INSIDE = False
-    IN_ASSERT_CTX = 0
-    ACTIVE_COMMIT_PLAN = None
-    ACTIVE_ENGINE = None
-    ACTIVE_TNUM = -1
-    ACTIVE_CPU_BUDGET_SEC = None
-    ACTIVE_PATCHED_TRIE_MODS = frozenset({"*"})
-    ACTIVE_RS_SLIM_OK = False
-    ECON_CPU_LIMIT = None
-    ECON_ABORTED = False
 
 
 def _hash_df(df) -> str:
@@ -502,7 +552,7 @@ def _hash_plan_py_code(plan: Any) -> str:
 
     def _gen_expr(expr: Any) -> str:
         rep = pe._replace_subqueries(expr)
-        return pe.generator.generate(rep, copy=False)
+        return pe.generator.generate(rep)
 
     def _hash_obj(obj: Any, h: Any) -> None:
         if isinstance(obj, Step):
@@ -772,33 +822,6 @@ def _resolve_deferred_test_dialect(patched_files: set[str] | None = None, meth: 
             td.SnowflakeParser = importlib.import_module("sqlglot.parsers.snowflake").SnowflakeParser  # type: ignore[attr-defined]
 
 
-def _verify_eager_td_imports(touched_files: set[str]) -> None:
-    """Verify eager top-level imports of tests/dialects/test_dialect.py for any touched eager dialect file,
-    even when tests.dialects.test_dialect has not yet been preloaded into sys.modules."""
-    td = sys.modules.get("tests.dialects.test_dialect")
-    if td is not None and getattr(td, "_blast_deferred_dialects", False):
-        _resolve_deferred_test_dialect(touched_files)
-        return
-    _STEM_NEEDS = {
-        "bigquery": ("BigQuery",),
-        "hive": ("Hive",),
-        "snowflake": ("Snowflake", "SnowflakeParser"),
-        "spark2": ("Spark2",),
-        "duckdb": ("WS_CONTROL_CHARS_TO_DUCK",),
-    }
-    needed: set[str] = set()
-    for rel in touched_files:
-        if rel in _EAGER_TD_FILES:
-            needed.update(_STEM_NEEDS.get(Path(rel).stem, ()))
-    for sym in needed:
-        if sym in ("BigQuery", "Hive", "Snowflake", "Spark2"):
-            getattr(importlib.import_module("sqlglot.dialects"), sym)
-        elif sym == "WS_CONTROL_CHARS_TO_DUCK":
-            getattr(importlib.import_module("sqlglot.dialects.duckdb"), "WS_CONTROL_CHARS_TO_DUCK")
-        elif sym == "SnowflakeParser":
-            getattr(importlib.import_module("sqlglot.parsers.snowflake"), "SnowflakeParser")
-
-
 def _import_test_module_lazy(mod_name: str, is_patched: bool):
     """Import tests.test_optimizer or tests.test_executor WITHOUT paying ~1.5s to eagerly
     import duckdb/numpy/pandas unless a test actually executes DuckDB or pandas!
@@ -987,15 +1010,7 @@ def _install_fast_optimizer_argspec(commit_plan: CommitPlan | None) -> None:
                 self._orig = orig_mod
 
             def getfullargspec(self, func: Any) -> Any:
-                cp = ACTIVE_COMMIT_PLAN
-                if cp is not None and (
-                    "sqlglot/optimizer/optimizer.py" in cp.patched_files
-                    or "sqlglot/optimizer/__init__.py" in cp.patched_files
-                    or "sqlglot/optimizer/optimizer.py" in cp.deleted_files
-                    or "sqlglot/optimizer/__init__.py" in cp.deleted_files
-                ):
-                    return _orig_gfa(func)
-                key = (func, id(getattr(func, "__code__", None)))
+                key = (func, getattr(func, "__code__", None))
                 try:
                     res = _cache.get(key)
                     if res is not None:
@@ -1010,283 +1025,210 @@ def _install_fast_optimizer_argspec(commit_plan: CommitPlan | None) -> None:
                 return getattr(self._orig, name)
 
         _opt_mod.inspect = _CachedInspectProxy(_opt_mod.inspect)
-        _opt_mod._blast_argspec_cache = _cache  # type: ignore[attr-defined]
         _opt_mod._blast_argspec_cached = True  # type: ignore[attr-defined]
     except Exception:
         pass
 
 
-_TRIE_CORE_FILES = frozenset({
-    "sqlglot/tokens.py",
-    "sqlglot/tokenizer_core.py",
-    "sqlglot/dialects/dialect.py",
-    "sqlglot/trie.py",
-    "sqlglot/helper.py",
-    "sqlglot/__init__.py",
-})
+def _install_fast_test_patches(maps: dict[str, Any], commit_plan: CommitPlan, sqlglot_root: Path) -> None:
+    """Install fail-fast subTest and fast in-process overrides on already-imported test modules."""
+    _install_unittest_ctx_patches()
 
-
-def _compute_patched_trie_mods(commit_plan: CommitPlan, maps: dict[str, Any]) -> frozenset[str]:
-    """Compute transitive dirty module set for Tokenizer._KEYWORD_TRIE cache invalidation."""
-    all_t = set(commit_plan.patched_files) | set(commit_plan.deleted_files)
-    if all_t & _TRIE_CORE_FILES:
-        return frozenset({"*"})
-    rev_g = maps.get("static_ast_meta", {}).get("rev_import_graph", {})
-    dirty_trie_files = set(all_t)
-    tq = [r for r in all_t if r.endswith(".py")]
-    while tq:
-        tf = tq.pop()
-        for imp in rev_g.get(tf, ()):
-            if imp not in dirty_trie_files:
-                dirty_trie_files.add(imp)
-                tq.append(imp)
-    return frozenset(
-        r.removesuffix("/__init__.py").removesuffix(".py").replace("/", ".")
-        for r in dirty_trie_files
-        if r.endswith(".py")
+    # 1b. Cached Tokenizer._KEYWORD_TRIE for untouched dialects (skips ~600k Python genexpr calls / ~42ms!)
+    global ACTIVE_PATCHED_TRIE_MODS
+    _all_t = set(commit_plan.patched_files) | set(commit_plan.deleted_files)
+    _trie_core_dirty = bool(
+        _all_t
+        & {
+            "sqlglot/tokens.py",
+            "sqlglot/tokenizer_core.py",
+            "sqlglot/dialects/dialect.py",
+            "sqlglot/trie.py",
+            "sqlglot/helper.py",
+            "sqlglot/__init__.py",
+        }
     )
+    if _trie_core_dirty:
+        ACTIVE_PATCHED_TRIE_MODS = frozenset({"*"})
+    else:
+        _rev_g = maps.get("static_ast_meta", {}).get("rev_import_graph", {})
+        _dirty_trie_files = set(_all_t)
+        _tq = [r for r in _all_t if r.endswith(".py")]
+        while _tq:
+            _tf = _tq.pop()
+            for _imp in _rev_g.get(_tf, ()):
+                if _imp not in _dirty_trie_files:
+                    _dirty_trie_files.add(_imp)
+                    _tq.append(_imp)
+        ACTIVE_PATCHED_TRIE_MODS = frozenset(
+            r.removesuffix("/__init__.py").removesuffix(".py").replace("/", ".")
+            for r in _dirty_trie_files
+            if r.endswith(".py")
+        )
+    if not _trie_core_dirty:
+        _tcache = rc.load_tok_trie_cache()
+        if _tcache:
+            try:
+                import sqlglot.tokens as _sgtok
+                if not getattr(_sgtok._TokenizerBase, "_blast_trie_patched", False):
+                    _orig_tok_sub = _sgtok._TokenizerBase.__init_subclass__.__func__
 
+                    @classmethod  # type: ignore[misc]
+                    def _fast_tok_init_subclass(cls, **kwargs):
+                        key = f"{cls.__module__}.{cls.__qualname__}"
+                        cached_trie = _tcache.get(key)
+                        pmods = ACTIVE_PATCHED_TRIE_MODS
+                        if cached_trie is not None and "*" not in pmods and not any(
+                            b.__module__ in pmods for b in cls.__mro__ if b.__module__.startswith("sqlglot.")
+                        ):
+                            super(_sgtok._TokenizerBase, cls).__init_subclass__(**kwargs)
+                            cls._QUOTES = _sgtok._convert_quotes(cls.QUOTES)
+                            cls._IDENTIFIERS = _sgtok._convert_quotes(cls.IDENTIFIERS)
+                            cls._FORMAT_STRINGS = {
+                                **{
+                                    p + s: (e, _sgtok.TokenType.NATIONAL_STRING)
+                                    for s, e in cls._QUOTES.items()
+                                    for p in ("n", "N")
+                                },
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.BIT_STRING, cls.BIT_STRINGS),
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.BYTE_STRING, cls.BYTE_STRINGS),
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.HEX_STRING, cls.HEX_STRINGS),
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.NATIONAL_RAW_STRING, cls.NATIONAL_RAW_STRINGS),
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.RAW_STRING, cls.RAW_STRINGS),
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.HEREDOC_STRING, cls.HEREDOC_STRINGS),
+                                **_sgtok._quotes_to_format(_sgtok.TokenType.UNICODE_STRING, cls.UNICODE_STRINGS),
+                            }
+                            if not any(
+                                "BYTE_STRING_ESCAPES" in k.__dict__ for k in cls.__mro__ if k.__module__ != _sgtok.__name__
+                            ):
+                                cls.BYTE_STRING_ESCAPES = cls.STRING_ESCAPES.copy()
+                            cls._STRING_ESCAPES = set(cls.STRING_ESCAPES)
+                            cls._BYTE_STRING_ESCAPES = set(cls.BYTE_STRING_ESCAPES)
+                            cls._IDENTIFIER_ESCAPES = set(cls.IDENTIFIER_ESCAPES)
+                            cls._COMMENTS = {
+                                **{c: None for c in cls.COMMENTS if isinstance(c, str)},
+                                **{c[0]: c[1] for c in cls.COMMENTS if not isinstance(c, str)},
+                                "{#": "#}",
+                            }
+                            if cls.HINT_START in cls.KEYWORDS:
+                                cls._COMMENTS[cls.HINT_START] = "*/"
+                            cls._KEYWORD_TRIE = cached_trie
+                            return
+                        _orig_tok_sub(cls, **kwargs)
 
-def _install_tok_trie_patch() -> None:
-    """Install cached Tokenizer._KEYWORD_TRIE hook ONCE (reads ACTIVE_PATCHED_TRIE_MODS dynamically!)."""
-    _tcache = rc.load_tok_trie_cache()
-    if not _tcache:
-        return
-    try:
-        import sqlglot.tokens as _sgtok
-        if getattr(_sgtok._TokenizerBase, "_blast_trie_patched", False):
-            return
-        _orig_tok_sub = _sgtok._TokenizerBase.__init_subclass__.__func__
+                    _sgtok._TokenizerBase.__init_subclass__ = _fast_tok_init_subclass
+                    _sgtok._TokenizerBase._blast_trie_patched = True
+            except Exception:
+                pass
 
-        @classmethod  # type: ignore[misc]
-        def _fast_tok_init_subclass(cls, **kwargs):
-            key = f"{cls.__module__}.{cls.__qualname__}"
-            cached_trie = _tcache.get(key)
-            pmods = ACTIVE_PATCHED_TRIE_MODS
-            if cached_trie is not None and "*" not in pmods and not any(
-                b.__module__ in pmods for b in cls.__mro__ if b.__module__.startswith("sqlglot.")
-            ):
-                super(_sgtok._TokenizerBase, cls).__init_subclass__(**kwargs)
-                cls._QUOTES = _sgtok._convert_quotes(cls.QUOTES)
-                cls._IDENTIFIERS = _sgtok._convert_quotes(cls.IDENTIFIERS)
-                cls._FORMAT_STRINGS = {
-                    **{
-                        p + s: (e, _sgtok.TokenType.NATIONAL_STRING)
-                        for s, e in cls._QUOTES.items()
-                        for p in ("n", "N")
-                    },
-                    **_sgtok._quotes_to_format(_sgtok.TokenType.BIT_STRING, cls.BIT_STRINGS),
-                    **_sgtok._quotes_to_format(_sgtok.TokenType.BYTE_STRING, cls.BYTE_STRINGS),
-                    **_sgtok._quotes_to_format(_sgtok.TokenType.HEX_STRING, cls.HEX_STRINGS),
-                    **_sgtok._quotes_to_format(_sgtok.TokenType.NATIONAL_RAW_STRING, cls.NATIONAL_RAW_STRINGS),
-                    **_sgtok._quotes_to_format(_sgtok.TokenType.RAW_STRING, cls.RAW_STRINGS),
-                    **_sgtok._quotes_to_format(_sgtok.TokenType.HEREDOC_STRING, cls.HEREDOC_STRINGS),
-                    **_sgtok._quotes_to_format(_sgtok.TokenType.UNICODE_STRING, cls.UNICODE_STRINGS),
-                }
-                if not any(
-                    "BYTE_STRING_ESCAPES" in k.__dict__ for k in cls.__mro__ if k.__module__ != _sgtok.__name__
-                ):
-                    cls.BYTE_STRING_ESCAPES = cls.STRING_ESCAPES.copy()
-                cls._STRING_ESCAPES = set(cls.STRING_ESCAPES)
-                cls._BYTE_STRING_ESCAPES = set(cls.BYTE_STRING_ESCAPES)
-                cls._IDENTIFIER_ESCAPES = set(cls.IDENTIFIER_ESCAPES)
-                cls._COMMENTS = {
-                    **{c: None for c in cls.COMMENTS if isinstance(c, str)},
-                    **{c[0]: c[1] for c in cls.COMMENTS if not isinstance(c, str)},
-                    "{#": "#}",
-                }
-                if cls.HINT_START in cls.KEYWORDS:
-                    cls._COMMENTS[cls.HINT_START] = "*/"
-                cls._KEYWORD_TRIE = cached_trie
-                return
-            _orig_tok_sub(cls, **kwargs)
+    if "sqlglot.optimizer.optimizer" in sys.modules:
+        _install_fast_optimizer_argspec(commit_plan)
 
-        _sgtok._TokenizerBase.__init_subclass__ = _fast_tok_init_subclass
-        _sgtok._TokenizerBase._blast_trie_patched = True
-    except Exception:
-        pass
-
-
-def _helpers_cache_flags(commit_plan: CommitPlan | None) -> tuple[bool, bool]:
-    """Return (allow_duck_and_pairs_cache, allow_singles_cache) for tests/helpers.py edits.
-    `load_sql_fixtures` is NOT used by TPC-DS / TPC-H or check_file (_load_sqls only uses
-    `load_sql_fixture_pairs`, `_filter_comments`, `_extract_meta`, `string_to_bool`, `FIXTURES_DIR`,
-    `FILE_DIR`, `TPCH_SCHEMA`, `TPCDS_SCHEMA`)."""
-    if commit_plan is None:
-        return True, True
-    if "tests/helpers.py" in commit_plan.deleted_files:
-        return False, False
-    if "tests/helpers.py" not in commit_plan.patched_files:
-        return True, True
-    h_ana = commit_plan.py_analyses.get("tests/helpers.py")
-    if h_ana is None or h_ana.syntax_error or not h_ana.units:
-        return False, False
-    tpc_syms = {
-        "load_sql_fixture_pairs", "_filter_comments", "_extract_meta", "string_to_bool",
-        "FIXTURES_DIR", "FILE_DIR", "TPCH_SCHEMA", "TPCDS_SCHEMA", "*",
-    }
-    allow_duck = not any(
-        u.kind == "module_other" or (u.symbol_name or "*") in tpc_syms
-        for u in h_ana.units
-    )
-    allow_singles = allow_duck and not any(
-        (u.symbol_name or "*") == "load_sql_fixtures"
-        for u in h_ana.units
-    )
-    return allow_duck, allow_singles
-
-
-def _install_helpers_fixture_patch(wrap_pairs: bool = True, wrap_singles: bool = True) -> None:
-    """Wrap tests.helpers fixture loaders ONCE (reads commit/filter globals dynamically!)."""
-    if not wrap_pairs and not wrap_singles:
+    # 2. ALWAYS import and wrap tests.helpers fixture loaders (critical for full_fork too!)
+    # Guard: NEVER override tests.helpers if tests/helpers.py itself is patched!
+    if "tests/helpers.py" in commit_plan.patched_files:
         return
     th = sys.modules.get("tests.helpers")
     if th is None:
         try:
             th = importlib.import_module("tests.helpers")
         except Exception:
-            return
-    if getattr(th, "_blast_patched", False):
-        return
-    orig_pairs = th.load_sql_fixture_pairs
-    orig_fixtures = th.load_sql_fixtures
+            th = None
+    if th is not None and not getattr(th, "_blast_patched", False):
+        orig_pairs = th.load_sql_fixture_pairs
+        orig_fixtures = th.load_sql_fixtures
 
-    def _filtered_pairs(filename):
-        global ACTIVE_LAST_PAIR_IDX
-        rel = f"tests/fixtures/{filename}"
-        allowed = ACTIVE_FIXTURE_FILTERS.get(rel, None)
-        cp = ACTIVE_COMMIT_PLAN
-        cached_list = None
-        if cp is None or (rel not in cp.patched_files and rel not in cp.deleted_files):
-            cached_list = _load_fixture_cache().get("fixture_pairs", {}).get(filename)
-        if cached_list is not None:
-            if allowed is None:
-                for idx, (a, s, e) in enumerate(cached_list, start=1):
-                    ACTIVE_LAST_PAIR_IDX = idx
-                    if ECON_CPU_LIMIT is not None:
-                        _econ_check()
-                    yield (dict(a), s, e)
+        def _filtered_pairs(filename):
+            global ACTIVE_LAST_PAIR_IDX
+            rel = f"tests/fixtures/{filename}"
+            allowed = ACTIVE_FIXTURE_FILTERS.get(rel, None)
+            cp = ACTIVE_COMMIT_PLAN
+            cached_list = None
+            if cp is None or (rel not in cp.patched_files and rel not in cp.deleted_files):
+                cached_list = _load_fixture_cache().get("fixture_pairs", {}).get(filename)
+            if cached_list is not None:
+                if allowed is None:
+                    for idx, (a, s, e) in enumerate(cached_list, start=1):
+                        ACTIVE_LAST_PAIR_IDX = idx
+                        if ECON_CPU_LIMIT is not None:
+                            _econ_check()
+                        yield (dict(a), s, e)
+                    return
+                if not allowed:
+                    return
+                n_c = len(cached_list)
+                for idx in sorted(allowed):
+                    if 1 <= idx <= n_c:
+                        a, s, e = cached_list[idx - 1]
+                        ACTIVE_LAST_PAIR_IDX = idx
+                        if ECON_CPU_LIMIT is not None:
+                            _econ_check()
+                        yield (dict(a), s, e)
                 return
-            if not allowed:
-                return
-            n_c = len(cached_list)
-            for idx in sorted(allowed):
-                if 1 <= idx <= n_c:
-                    a, s, e = cached_list[idx - 1]
-                    ACTIVE_LAST_PAIR_IDX = idx
-                    if ECON_CPU_LIMIT is not None:
-                        _econ_check()
-                    yield (dict(a), s, e)
-            return
-        if allowed is None:
-            for idx, item in enumerate(orig_pairs(filename), start=1):
-                ACTIVE_LAST_PAIR_IDX = idx
-                if ECON_CPU_LIMIT is not None:
-                    _econ_check()
-                yield item
-            return
-        if not allowed:
-            return
-        for idx, item in enumerate(orig_pairs(filename), start=1):
-            if idx in allowed:
-                ACTIVE_LAST_PAIR_IDX = idx
-                if ECON_CPU_LIMIT is not None:
-                    _econ_check()
-                yield item
-
-    def _filtered_fixtures(filename):
-        rel = f"tests/fixtures/{filename}"
-        allowed = ACTIVE_FIXTURE_FILTERS.get(rel, None)
-        cp = ACTIVE_COMMIT_PLAN
-        cached_list = None
-        if cp is None or (rel not in cp.patched_files and rel not in cp.deleted_files):
-            cached_list = _load_fixture_cache().get("fixture_singles", {}).get(filename)
-        if cached_list is not None:
             if allowed is None:
-                for item in cached_list:
+                for idx, item in enumerate(orig_pairs(filename), start=1):
+                    ACTIVE_LAST_PAIR_IDX = idx
                     if ECON_CPU_LIMIT is not None:
                         _econ_check()
                     yield item
                 return
             if not allowed:
                 return
-            n_c = len(cached_list)
-            for idx in sorted(allowed):
-                if 1 <= idx <= n_c:
+            for idx, item in enumerate(orig_pairs(filename), start=1):
+                if idx in allowed:
+                    ACTIVE_LAST_PAIR_IDX = idx
                     if ECON_CPU_LIMIT is not None:
                         _econ_check()
-                    yield cached_list[idx - 1]
-            return
-        if allowed is None:
-            for item in orig_fixtures(filename):
-                if ECON_CPU_LIMIT is not None:
-                    _econ_check()
-                yield item
-            return
-        if not allowed:
-            return
-        for idx, item in enumerate(orig_fixtures(filename), start=1):
-            if idx in allowed:
-                if ECON_CPU_LIMIT is not None:
-                    _econ_check()
-                yield item
+                    yield item
 
-    if wrap_pairs:
+        def _filtered_fixtures(filename):
+            rel = f"tests/fixtures/{filename}"
+            allowed = ACTIVE_FIXTURE_FILTERS.get(rel, None)
+            cp = ACTIVE_COMMIT_PLAN
+            cached_list = None
+            if cp is None or (rel not in cp.patched_files and rel not in cp.deleted_files):
+                cached_list = _load_fixture_cache().get("fixture_singles", {}).get(filename)
+            if cached_list is not None:
+                if allowed is None:
+                    for item in cached_list:
+                        if ECON_CPU_LIMIT is not None:
+                            _econ_check()
+                        yield item
+                    return
+                if not allowed:
+                    return
+                n_c = len(cached_list)
+                for idx in sorted(allowed):
+                    if 1 <= idx <= n_c:
+                        if ECON_CPU_LIMIT is not None:
+                            _econ_check()
+                        yield cached_list[idx - 1]
+                return
+            if allowed is None:
+                for item in orig_fixtures(filename):
+                    if ECON_CPU_LIMIT is not None:
+                        _econ_check()
+                    yield item
+                return
+            if not allowed:
+                return
+            for idx, item in enumerate(orig_fixtures(filename), start=1):
+                if idx in allowed:
+                    if ECON_CPU_LIMIT is not None:
+                        _econ_check()
+                    yield item
+
         th.load_sql_fixture_pairs = _filtered_pairs
-    if wrap_singles:
         th.load_sql_fixtures = _filtered_fixtures
-    th._blast_patched = True
+        th._blast_patched = True
 
-    for mod_name in ("tests.test_optimizer", "tests.test_serde", "tests.test_transpile", "tests.test_executor"):
-        m = sys.modules.get(mod_name)
-        if m is not None:
-            if wrap_pairs and hasattr(m, "load_sql_fixture_pairs"):
-                m.load_sql_fixture_pairs = _filtered_pairs
-            if wrap_singles and hasattr(m, "load_sql_fixtures"):
-                m.load_sql_fixtures = _filtered_fixtures
-
-
-_FIXTURE_USING_TEST_FILES: frozenset[str] = frozenset({
-    "tests/test_optimizer.py",
-    "tests/test_executor.py",
-    "tests/test_transpile.py",
-    "tests/test_serde.py",
-    "tests/test_parser.py",
-})
-
-
-def _install_fast_test_patches(
-    maps: dict[str, Any],
-    commit_plan: CommitPlan,
-    sqlglot_root: Path,
-    num_to_test: dict[int, dict] | None = None,
-) -> None:
-    """Install fail-fast subTest and fast in-process overrides on already-imported test modules."""
-    _install_unittest_ctx_patches()
-
-    # 1b. Cached Tokenizer._KEYWORD_TRIE for untouched dialects (O(1) read of precomputed _patched_trie_mods!)
-    global ACTIVE_PATCHED_TRIE_MODS
-    _pre_trie = getattr(commit_plan, "_patched_trie_mods", None)
-    if _pre_trie is None:
-        _pre_trie = _compute_patched_trie_mods(commit_plan, maps)
-    ACTIVE_PATCHED_TRIE_MODS = _pre_trie
-    if "*" not in _pre_trie:
-        _install_tok_trie_patch()
-
-    if "sqlglot.optimizer.optimizer" in sys.modules:
-        _install_fast_optimizer_argspec(commit_plan)
-
-    # 2. Wrap untouched tests.helpers fixture loaders (skip eager import on cold full_fork when no fixture-using test is in candidates!)
-    allow_pairs, allow_singles = _helpers_cache_flags(commit_plan)
-    if not allow_pairs and not allow_singles:
-        return
-    if (
-        "tests.helpers" not in sys.modules
-        and num_to_test is not None
-        and not any(num_to_test[t]["file"] in _FIXTURE_USING_TEST_FILES for t in commit_plan.candidates)
-    ):
-        return
-    _install_helpers_fixture_patch(wrap_pairs=allow_pairs, wrap_singles=allow_singles)
+        for mod_name in ("tests.test_optimizer", "tests.test_serde", "tests.test_transpile", "tests.test_executor"):
+            m = sys.modules.get(mod_name)
+            if m is not None:
+                if hasattr(m, "load_sql_fixture_pairs"):
+                    m.load_sql_fixture_pairs = _filtered_pairs
+                if hasattr(m, "load_sql_fixtures"):
+                    m.load_sql_fixtures = _filtered_fixtures
 
 
 def _patch_optimizer_module(
@@ -1294,27 +1236,16 @@ def _patch_optimizer_module(
     helpers_patched: bool = False,
     allow_duck_cache: bool = True,
     skip_methods: set[str] | None = None,
-    install_argspec: bool = True,
 ) -> None:
     topt = sys.modules.get("tests.test_optimizer")
-    if topt is None:
+    if topt is None or getattr(topt, "_blast_patched", False):
         return
-    if getattr(topt, "_blast_helpers_patched", None) != helpers_patched:
-        topt._blast_helpers_patched = helpers_patched
-    if getattr(topt, "_blast_allow_duck_cache", None) != allow_duck_cache:
-        topt._blast_allow_duck_cache = allow_duck_cache
-    if getattr(topt, "_blast_patched", False):
-        return
-    if install_argspec:
-        _install_fast_optimizer_argspec(ACTIVE_COMMIT_PLAN)
+    _install_fast_optimizer_argspec(ACTIVE_COMMIT_PLAN)
     _skip_m = skip_methods or set()
     import tests.helpers as th
-    if not helpers_patched or allow_duck_cache:
-        if topt.load_sql_fixture_pairs is not th.load_sql_fixture_pairs:
-            topt.load_sql_fixture_pairs = th.load_sql_fixture_pairs
     if not helpers_patched:
-        if topt.load_sql_fixtures is not th.load_sql_fixtures:
-            topt.load_sql_fixtures = th.load_sql_fixtures
+        topt.load_sql_fixture_pairs = th.load_sql_fixture_pairs
+        topt.load_sql_fixtures = th.load_sql_fixtures
 
     # Lazy DuckDB connection backed by build-time query-result cache (zero DuckDB startup on cache hits!)
     def _make_opt_real_conn():
@@ -1375,15 +1306,17 @@ def _patch_optimizer_module(
 
     # Synchronous, fail-fast in-process check_file (no ProcessPoolExecutor spawn!)
     # Uses dependency-checked stage-reuse replay (opt_replay) + check_file_duckdb_hashes!
-    valid_duck_pairs: set[tuple[str, str]] | frozenset[tuple[str, str]] = maps.get("_valid_duck_pairs") or {
-        tuple(v) for v in maps.get("check_file_duckdb_hashes", {}).values()
-    }
+    if not helpers_patched or allow_duck_cache:
+        valid_duck_pairs: set[tuple[str, str]] | frozenset[tuple[str, str]] = maps.get("_valid_duck_pairs") or {
+            tuple(v) for v in maps.get("check_file_duckdb_hashes", {}).values()
+        }
+    else:
+        valid_duck_pairs = set()
 
     def _fast_check_file(self, file, func, pretty=False, execute=None, only=None, **kwargs):
         global ACTIVE_INLINE_OPT_DEPTH, LAST_FAILED_TPCDS_QIDX
         check_pickle_all = getattr(topt, "_blast_check_pickle", False)
         check_pickle_sample = getattr(topt, "_blast_check_pickle_sample", False)
-        valid_dp = valid_duck_pairs if getattr(topt, "_blast_duck_cache", True) else ()
         # Recursively unwrap inline_opt wrappers (including inside partial.keywords['rules']) so func is picklable!
         def _unwrap_p(obj):
             orig = getattr(obj, "_blast_orig_fn", None)
@@ -1411,7 +1344,7 @@ def _patch_optimizer_module(
         _cf_fix_patched = cp_cf is not None and (_cf_fix_rel in cp_cf.patched_files or _cf_fix_rel in cp_cf.deleted_files)
         use_replay = (
             scope is not None
-            and not getattr(topt, "_blast_helpers_patched", False)
+            and not helpers_patched
             and not getattr(topt, "_blast_topt_patched", False)
             and not _cf_fix_patched
             and not check_pickle_all
@@ -1420,316 +1353,253 @@ def _patch_optimizer_module(
         opt_shard = rc.get_opt_shard(f"cf_{file}", scope) if use_replay else None
         fk_name = rc._func_key(func) if opt_shard is not None else ""
         exp_mod = topt.exp
-        pretty_b = bool(pretty)
-        if opt_shard is not None:
-            opt_rows = opt_shard.rows
-            opt_ckps = opt_shard.ckps
-            dflags = opt_shard.dirty_flags
-            doflags = opt_shard.dirty_opt_flags
-            dp_r = opt_shard.dirty_p_rids
-            do_r = opt_shard.dirty_o_rids
-            df_r = opt_shard.dirty_f_rids
-            de_r = opt_shard.dirty_e_rids
-        else:
-            opt_rows = opt_ckps = dflags = doflags = dp_r = do_r = df_r = de_r = None
-        _base_schema_dict = kwargs.get("schema")
-        _schema_untouched = (
-            cp_cf is not None
-            and "sqlglot/schema.py" not in cp_cf.patched_files
-            and "sqlglot/schema.py" not in cp_cf.deleted_files
-        )
-        _ms_cls = getattr(topt, "MappingSchema", None)
-        _can_memo_schema = (
-            type(_base_schema_dict) is dict
-            and _schema_untouched
-            and _ms_cls is not None
-            and not check_pickle_all
-        )
-        _cf_schema_by_dialect: dict[str | None, Any] = {}
-        _base_kw_dialect = kwargs.get("dialect")
-        if _base_kw_dialect is None and hasattr(func, "keywords") and func.keywords:
-            _base_kw_dialect = func.keywords.get("dialect")
-
-        def _get_do_exec(m: dict[str, Any]) -> bool:
-            if execute is False:
-                return False
-            fe = m.get("execute", execute)
-            if not fe:
-                return False
-            if min_python := m.get("execute_min_python"):
-                fe = th.string_to_bool(fe) and sys.version_info >= tuple(
-                    map(int, min_python.split("."))
-                )
-            return th.string_to_bool(fe)
-
-        def _apply_memo_schema(fkw: dict[str, Any], row_dialect: Any) -> None:
-            eff_d = row_dialect if row_dialect else _base_kw_dialect
-            dkey = eff_d if (eff_d is None or type(eff_d) is str) else rc.norm_dialect_key(eff_d)
-            if eff_d is None or dkey is not None:
-                base_ms = _cf_schema_by_dialect.get(dkey)
-                if base_ms is None:
-                    base_ms = _ms_cls(_base_schema_dict, dialect=eff_d)
-                    _cf_schema_by_dialect[dkey] = base_ms
-                row_ms = copy.copy(base_ms)
-                if hasattr(row_ms, "_type_mapping_cache"):
-                    row_ms._type_mapping_cache = {}
-                if hasattr(row_ms, "_find_cache"):
-                    row_ms._find_cache = {}
-                if hasattr(row_ms, "_normalized_table_cache"):
-                    row_ms._normalized_table_cache = {}
-                if hasattr(row_ms, "_normalized_name_cache"):
-                    row_ms._normalized_name_cache = {}
-                fkw["schema"] = row_ms
-
         for i, (meta, sql, expected) in enumerate(
             topt.load_sql_fixture_pairs(f"optimizer/{file}.sql"), start=1
         ):
             row_idx = ACTIVE_LAST_PAIR_IDX or i
-            do_pickle = check_pickle_all or (check_pickle_sample and i <= 20)
-            rec = None
-            rkey = None
-            p_dirty = o_dirty = f_dirty = e_maybe = False
-            p_sig = opt_ast_idx = p_ast_idx = None
-            if opt_shard is not None and not do_pickle:
-                rkey = (fk_name, pretty_b, row_idx)
-                rec = opt_rows.get(rkey)
-                if rec is not None:
-                    if len(rec) >= 8:
-                        p_dep, p_sig, o_dep, opt_ast_idx, f_dep, e_dep, rid, p_ast_idx = rec[:8]
-                    else:
-                        p_dep, p_sig, o_dep, opt_ast_idx, f_dep, e_dep, rid = rec
-                        p_ast_idx = -1
-                    p_dirty = dflags[p_dep] and (dp_r is None or rid in dp_r)
-                    o_dirty = doflags[o_dep] and (do_r is None or rid in do_r)
-                    f_dirty = dflags[f_dep] and (df_r is None or rid in df_r)
-                    e_maybe = dflags[e_dep] and (de_r is None or rid in de_r)
-                    if not o_dirty and not p_dirty and not f_dirty:
-                        if not e_maybe or not _get_do_exec(meta):
-                            continue
             title = meta.get("title") or f"{i}, {sql}"
             if only and title != only:
                 continue
             dialect = meta.get("dialect")
-            do_exec = _get_do_exec(meta)
-            e_dirty = do_exec and e_maybe
+            leave_tables_isolated = meta.get("leave_tables_isolated")
+            validate_qualify_columns = meta.get("validate_qualify_columns")
+            canonicalize_table_aliases = meta.get("canonicalize_table_aliases")
+            func_kwargs = kwargs.copy()
+            if schema := meta.get("schema"):
+                func_kwargs["schema"] = json.loads(schema)
+            if leave_tables_isolated is not None:
+                func_kwargs["leave_tables_isolated"] = th.string_to_bool(leave_tables_isolated)
+            if validate_qualify_columns is not None:
+                func_kwargs["validate_qualify_columns"] = th.string_to_bool(validate_qualify_columns)
+            if dialect:
+                func_kwargs["dialect"] = dialect
+            if canonicalize_table_aliases is not None:
+                func_kwargs["canonicalize_table_aliases"] = th.string_to_bool(canonicalize_table_aliases)
+            fixture_execute = False if execute is False else meta.get("execute", execute)
+            if min_python := meta.get("execute_min_python"):
+                fixture_execute = th.string_to_bool(fixture_execute) and sys.version_info >= tuple(
+                    map(int, min_python.split("."))
+                )
+            do_exec = th.string_to_bool(fixture_execute)
+            do_pickle = check_pickle_all or (check_pickle_sample and i <= 20)
             try:
-                if rec is not None and not o_dirty:
-                    if not p_dirty:
-                        if not f_dirty and not e_dirty:
-                            continue
-                        with self.subTest(title):
-                            optimized = opt_shard.get_expr(opt_ast_idx, exp_mod)
-                            if f_dirty:
-                                actual = optimized.sql(pretty=pretty, dialect=dialect)
-                                self.assertEqual(expected, actual)
-                            if e_dirty:
-                                with self.subTest(f"(execute) {title}"):
-                                    exprs = [topt.parse_one(sql, read=dialect), optimized]
-                                    dsqls = []
-                                    dhashes = []
-                                    for expression in exprs:
-                                        if not isinstance(expression, (exp_mod.Query, exp_mod.Values)):
-                                            expression = exp_mod.select(exp_mod.alias_(expression, "_col_0"))
-                                        dsql = expression.sql(dialect="duckdb")
-                                        dsqls.append(dsql)
-                                        dhashes.append(hashlib.blake2b(dsql.encode(), digest_size=12).hexdigest())
-                                    if not (valid_dp and (dhashes[0], dhashes[1]) in valid_dp):
-                                        cur0 = self.conn.execute(dsqls[0])
-                                        c0, r0 = [d[0] for d in cur0.description], cur0.fetchall()
-                                        cur1 = self.conn.execute(dsqls[1])
-                                        c1, r1 = [d[0] for d in cur1.description], cur1.fetchall()
-                                        v_cmp = _fast_compare_rows(c0, r0, c1, r1)
-                                        if v_cmp == "fail":
-                                            self.fail(f"execute mismatch: {title}")
-                                        elif v_cmp != "pass":
-                                            from pandas.testing import assert_frame_equal
-                                            dfs = [self.conn.execute(dsql).df() for dsql in dsqls]
-                                            assert_frame_equal(*dfs)
-                        continue
-                    else:
-                        # Parse is dirty, optimize is clean: parse live & verify exact structural AST sig!
-                        with self.subTest(title):
-                            parsed_live = topt.parse_one(sql, read=dialect)
-                            if rc.ast_struct_sig(parsed_live, exp_mod) == p_sig:
+                if opt_shard is not None and not do_pickle:
+                    rkey = (fk_name, bool(pretty), row_idx)
+                    rec = opt_shard.rows.get(rkey)
+                    if rec is not None:
+                        if len(rec) >= 8:
+                            p_dep, p_sig, o_dep, opt_ast_idx, f_dep, e_dep, rid, p_ast_idx = rec[:8]
+                        else:
+                            p_dep, p_sig, o_dep, opt_ast_idx, f_dep, e_dep, rid = rec
+                            p_ast_idx = -1
+                        dflags = opt_shard.dirty_flags
+                        doflags = opt_shard.dirty_opt_flags
+                        dp_r = opt_shard.dirty_p_rids
+                        do_r = opt_shard.dirty_o_rids
+                        df_r = opt_shard.dirty_f_rids
+                        de_r = opt_shard.dirty_e_rids
+                        p_dirty = dflags[p_dep] and (dp_r is None or rid in dp_r)
+                        o_dirty = doflags[o_dep] and (do_r is None or rid in do_r)
+                        f_dirty = dflags[f_dep] and (df_r is None or rid in df_r)
+                        e_dirty = do_exec and dflags[e_dep] and (de_r is None or rid in de_r)
+                        if not o_dirty:
+                            if not p_dirty:
                                 if not f_dirty and not e_dirty:
                                     continue
-                                optimized = opt_shard.get_expr(opt_ast_idx, exp_mod)
-                                if f_dirty:
-                                    actual = optimized.sql(pretty=pretty, dialect=dialect)
-                                    self.assertEqual(expected, actual)
-                                if e_dirty:
-                                    with self.subTest(f"(execute) {title}"):
-                                        exprs = [parsed_live, optimized]
-                                        dsqls = []
-                                        dhashes = []
-                                        for expression in exprs:
-                                            if not isinstance(expression, (exp_mod.Query, exp_mod.Values)):
-                                                expression = exp_mod.select(exp_mod.alias_(expression, "_col_0"))
-                                            dsql = expression.sql(dialect="duckdb")
-                                            dsqls.append(dsql)
-                                            dhashes.append(hashlib.blake2b(dsql.encode(), digest_size=12).hexdigest())
-                                        if not (valid_dp and (dhashes[0], dhashes[1]) in valid_dp):
-                                            cur0 = self.conn.execute(dsqls[0])
-                                            c0, r0 = [d[0] for d in cur0.description], cur0.fetchall()
-                                            cur1 = self.conn.execute(dsqls[1])
-                                            c1, r1 = [d[0] for d in cur1.description], cur1.fetchall()
-                                            v_cmp = _fast_compare_rows(c0, r0, c1, r1)
-                                            if v_cmp == "fail":
-                                                self.fail(f"execute mismatch: {title}")
-                                            elif v_cmp != "pass":
-                                                from pandas.testing import assert_frame_equal
-                                                dfs = [self.conn.execute(dsql).df() for dsql in dsqls]
-                                                assert_frame_equal(*dfs)
+                                with self.subTest(title):
+                                    optimized = opt_shard.get_expr(opt_ast_idx, exp_mod)
+                                    if f_dirty:
+                                        actual = optimized.sql(pretty=pretty, dialect=dialect)
+                                        self.assertEqual(expected, actual)
+                                    if e_dirty:
+                                        with self.subTest(f"(execute) {title}"):
+                                            exprs = [topt.parse_one(sql, read=dialect), optimized]
+                                            dsqls = []
+                                            dhashes = []
+                                            for expression in exprs:
+                                                if not isinstance(expression, (exp_mod.Query, exp_mod.Values)):
+                                                    expression = exp_mod.select(exp_mod.alias_(expression, "_col_0"))
+                                                dsql = expression.sql(dialect="duckdb")
+                                                dsqls.append(dsql)
+                                                dhashes.append(hashlib.blake2b(dsql.encode(), digest_size=12).hexdigest())
+                                            if not (valid_duck_pairs and (dhashes[0], dhashes[1]) in valid_duck_pairs):
+                                                cur0 = self.conn.execute(dsqls[0])
+                                                c0, r0 = [d[0] for d in cur0.description], cur0.fetchall()
+                                                cur1 = self.conn.execute(dsqls[1])
+                                                c1, r1 = [d[0] for d in cur1.description], cur1.fetchall()
+                                                v_cmp = _fast_compare_rows(c0, r0, c1, r1)
+                                                if v_cmp == "fail":
+                                                    self.fail(f"execute mismatch: {title}")
+                                                elif v_cmp != "pass":
+                                                    from pandas.testing import assert_frame_equal
+                                                    dfs = [self.conn.execute(dsql).df() for dsql in dsqls]
+                                                    assert_frame_equal(*dfs)
                                 continue
-
-                leave_tables_isolated = meta.get("leave_tables_isolated")
-                validate_qualify_columns = meta.get("validate_qualify_columns")
-                canonicalize_table_aliases = meta.get("canonicalize_table_aliases")
-                func_kwargs = kwargs.copy()
-                _meta_schema = meta.get("schema")
-                if _meta_schema:
-                    func_kwargs["schema"] = json.loads(_meta_schema)
-                if leave_tables_isolated is not None:
-                    func_kwargs["leave_tables_isolated"] = th.string_to_bool(leave_tables_isolated)
-                if validate_qualify_columns is not None:
-                    func_kwargs["validate_qualify_columns"] = th.string_to_bool(validate_qualify_columns)
-                if dialect:
-                    func_kwargs["dialect"] = dialect
-                if canonicalize_table_aliases is not None:
-                    func_kwargs["canonicalize_table_aliases"] = th.string_to_bool(canonicalize_table_aliases)
-                if _can_memo_schema and not _meta_schema and not do_pickle:
-                    _apply_memo_schema(func_kwargs, dialect)
-
-                if rec is not None and o_dirty and not p_dirty:
-                    # Parse is clean, optimize is dirty (is_opt_only or typing/*):
-                    # 1) Two-sided multi-stage checkpointing for full optimizer.optimize (prefix skip + post-max_k sig skip!)
-                    # 2) Pre-parsed AST reuse (skips parse_one() completely!)
-                    ckp = opt_ckps.get(rkey) if (
-                        fk_name == "optimize"
-                        and scope.is_opt_only
-                        and scope.opt_dirty_rules
-                        and "rules" not in func_kwargs
-                        and "on_qualify" not in func_kwargs
-                    ) else None
-                    if ckp is not None:
-                        before_idxs, stage_sigs = ckp
-                        _opt_rules = topt.optimizer.RULES
-                        if len(before_idxs) == len(_opt_rules) and len(stage_sigs) == len(_opt_rules):
-                            min_k = min(scope.opt_dirty_rules)
-                            max_k = max(scope.opt_dirty_rules)
-                            with self.subTest(title):
-                                ast_in = opt_shard.get_expr(before_idxs[min_k], exp_mod)
-                                kw_nc = dict(func_kwargs)
-                                kw_nc["copy"] = False
-                                ACTIVE_INLINE_OPT_DEPTH += 1
-                                try:
-                                    ast_mid = topt.optimizer.optimize(
-                                        ast_in, rules=_opt_rules[min_k : max_k + 1], **kw_nc
-                                    )
-                                finally:
-                                    ACTIVE_INLINE_OPT_DEPTH -= 1
-                                # C ast_struct_sig verifies parent/arg_key/index integrity; fallback Python walk raises AssertionError if invalid!
-                                mid_sig = rc.ast_struct_sig(ast_mid, exp_mod)
-                                if mid_sig is None:
-                                    for expression in ast_mid.walk():
-                                        for arg_key, arg in expression.args.items():
-                                            for child in arg if isinstance(arg, list) else [arg]:
-                                                if isinstance(child, exp_mod.Expr):
-                                                    assert child.arg_key == arg_key
-                                                    assert child.parent is expression
-                                if mid_sig is not None and mid_sig == stage_sigs[max_k]:
-                                    if not f_dirty and not e_dirty:
+                            else:
+                                # Parse is dirty, optimize is clean: parse live & verify exact structural AST sig!
+                                with self.subTest(title):
+                                    parsed_live = topt.parse_one(sql, read=dialect)
+                                    if rc.ast_struct_sig(parsed_live, exp_mod) == p_sig:
+                                        if not f_dirty and not e_dirty:
+                                            continue
+                                        optimized = opt_shard.get_expr(opt_ast_idx, exp_mod)
+                                        if f_dirty:
+                                            actual = optimized.sql(pretty=pretty, dialect=dialect)
+                                            self.assertEqual(expected, actual)
+                                        if e_dirty:
+                                            with self.subTest(f"(execute) {title}"):
+                                                exprs = [parsed_live, optimized]
+                                                dsqls = []
+                                                dhashes = []
+                                                for expression in exprs:
+                                                    if not isinstance(expression, (exp_mod.Query, exp_mod.Values)):
+                                                        expression = exp_mod.select(exp_mod.alias_(expression, "_col_0"))
+                                                    dsql = expression.sql(dialect="duckdb")
+                                                    dsqls.append(dsql)
+                                                    dhashes.append(hashlib.blake2b(dsql.encode(), digest_size=12).hexdigest())
+                                                if not (valid_duck_pairs and (dhashes[0], dhashes[1]) in valid_duck_pairs):
+                                                    cur0 = self.conn.execute(dsqls[0])
+                                                    c0, r0 = [d[0] for d in cur0.description], cur0.fetchall()
+                                                    cur1 = self.conn.execute(dsqls[1])
+                                                    c1, r1 = [d[0] for d in cur1.description], cur1.fetchall()
+                                                    v_cmp = _fast_compare_rows(c0, r0, c1, r1)
+                                                    if v_cmp == "fail":
+                                                        self.fail(f"execute mismatch: {title}")
+                                                    elif v_cmp != "pass":
+                                                        from pandas.testing import assert_frame_equal
+                                                        dfs = [self.conn.execute(dsql).df() for dsql in dsqls]
+                                                        assert_frame_equal(*dfs)
                                         continue
-                                    optimized = (
-                                        ast_mid
-                                        if max_k == len(_opt_rules) - 1
-                                        else opt_shard.get_expr(opt_ast_idx, exp_mod)
-                                    )
-                                else:
-                                    if max_k < len(_opt_rules) - 1:
+                        elif not p_dirty:
+                            # Parse is clean, optimize is dirty (is_opt_only or typing/*):
+                            # 1) Two-sided multi-stage checkpointing for full optimizer.optimize (prefix skip + post-max_k sig skip!)
+                            # 2) Pre-parsed AST reuse (skips parse_one() completely!)
+                            ckp = opt_shard.ckps.get(rkey) if (
+                                fk_name == "optimize"
+                                and scope.is_opt_only
+                                and scope.opt_dirty_rules
+                                and "rules" not in func_kwargs
+                                and "on_qualify" not in func_kwargs
+                            ) else None
+                            if ckp is not None:
+                                before_idxs, stage_sigs = ckp
+                                _opt_rules = topt.optimizer.RULES
+                                if len(before_idxs) == len(_opt_rules) and len(stage_sigs) == len(_opt_rules):
+                                    min_k = min(scope.opt_dirty_rules)
+                                    max_k = max(scope.opt_dirty_rules)
+                                    with self.subTest(title):
+                                        ast_in = opt_shard.get_expr(before_idxs[min_k], exp_mod)
+                                        kw_nc = dict(func_kwargs)
+                                        kw_nc["copy"] = False
                                         ACTIVE_INLINE_OPT_DEPTH += 1
                                         try:
-                                            optimized = topt.optimizer.optimize(
-                                                ast_mid, rules=_opt_rules[max_k + 1 :], **kw_nc
+                                            ast_mid = topt.optimizer.optimize(
+                                                ast_in, rules=_opt_rules[min_k : max_k + 1], **kw_nc
                                             )
                                         finally:
                                             ACTIVE_INLINE_OPT_DEPTH -= 1
-                                        if rc.ast_struct_sig(optimized, exp_mod) is None:
-                                            for expression in optimized.walk():
+                                        # C ast_struct_sig verifies parent/arg_key/index integrity; fallback Python walk raises AssertionError if invalid!
+                                        mid_sig = rc.ast_struct_sig(ast_mid, exp_mod)
+                                        if mid_sig is None:
+                                            for expression in ast_mid.walk():
                                                 for arg_key, arg in expression.args.items():
                                                     for child in arg if isinstance(arg, list) else [arg]:
                                                         if isinstance(child, exp_mod.Expr):
                                                             assert child.arg_key == arg_key
                                                             assert child.parent is expression
-                                    else:
-                                        optimized = ast_mid
-                                actual = optimized.sql(pretty=pretty, dialect=dialect)
-                                self.assertEqual(expected, actual)
-                                if do_exec:
-                                    with self.subTest(f"(execute) {title}"):
-                                        exprs = [opt_shard.get_expr(before_idxs[0], exp_mod), optimized]
-                                        dsqls = []
-                                        dhashes = []
-                                        for expression in exprs:
-                                            if not isinstance(expression, (exp_mod.Query, exp_mod.Values)):
-                                                expression = exp_mod.select(exp_mod.alias_(expression, "_col_0"))
-                                            dsql = expression.sql(dialect="duckdb")
-                                            dsqls.append(dsql)
-                                            dhashes.append(hashlib.blake2b(dsql.encode(), digest_size=12).hexdigest())
-                                        if not (valid_dp and (dhashes[0], dhashes[1]) in valid_dp):
-                                            cur0 = self.conn.execute(dsqls[0])
-                                            c0, r0 = [d[0] for d in cur0.description], cur0.fetchall()
-                                            cur1 = self.conn.execute(dsqls[1])
-                                            c1, r1 = [d[0] for d in cur1.description], cur1.fetchall()
-                                            v_cmp = _fast_compare_rows(c0, r0, c1, r1)
-                                            if v_cmp == "fail":
-                                                self.fail(f"execute mismatch: {title}")
-                                            elif v_cmp != "pass":
-                                                from pandas.testing import assert_frame_equal
-                                                dfs = [self.conn.execute(dsql).df() for dsql in dsqls]
-                                                assert_frame_equal(*dfs)
-                            continue
-                    elif p_ast_idx >= 0:
-                        with self.subTest(title):
-                            parsed_in = opt_shard.get_expr(p_ast_idx, exp_mod)
-                            ACTIVE_INLINE_OPT_DEPTH += 1
-                            try:
-                                optimized = func(parsed_in, **func_kwargs)
-                            finally:
-                                ACTIVE_INLINE_OPT_DEPTH -= 1
-                            if rc.ast_struct_sig(optimized, exp_mod) is None:
-                                for expression in optimized.walk():
-                                    for arg_key, arg in expression.args.items():
-                                        for child in arg if isinstance(arg, list) else [arg]:
-                                            if isinstance(child, exp_mod.Expr):
-                                                assert child.arg_key == arg_key
-                                                assert child.parent is expression
-                            actual = optimized.sql(pretty=pretty, dialect=dialect)
-                            self.assertEqual(expected, actual)
-                            if do_exec:
-                                with self.subTest(f"(execute) {title}"):
-                                    exprs = [opt_shard.get_expr(p_ast_idx, exp_mod), optimized]
-                                    dsqls = []
-                                    dhashes = []
-                                    for expression in exprs:
-                                        if not isinstance(expression, (exp_mod.Query, exp_mod.Values)):
-                                            expression = exp_mod.select(exp_mod.alias_(expression, "_col_0"))
-                                        dsql = expression.sql(dialect="duckdb")
-                                        dsqls.append(dsql)
-                                        dhashes.append(hashlib.blake2b(dsql.encode(), digest_size=12).hexdigest())
-                                    if not (valid_dp and (dhashes[0], dhashes[1]) in valid_dp):
-                                        cur0 = self.conn.execute(dsqls[0])
-                                        c0, r0 = [d[0] for d in cur0.description], cur0.fetchall()
-                                        cur1 = self.conn.execute(dsqls[1])
-                                        c1, r1 = [d[0] for d in cur1.description], cur1.fetchall()
-                                        v_cmp = _fast_compare_rows(c0, r0, c1, r1)
-                                        if v_cmp == "fail":
-                                            self.fail(f"execute mismatch: {title}")
-                                        elif v_cmp != "pass":
-                                            from pandas.testing import assert_frame_equal
-                                            dfs = [self.conn.execute(dsql).df() for dsql in dsqls]
-                                            assert_frame_equal(*dfs)
-                        continue
+                                        if mid_sig is not None and mid_sig == stage_sigs[max_k]:
+                                            if not f_dirty and not e_dirty:
+                                                continue
+                                            optimized = (
+                                                ast_mid
+                                                if max_k == len(_opt_rules) - 1
+                                                else opt_shard.get_expr(opt_ast_idx, exp_mod)
+                                            )
+                                        else:
+                                            if max_k < len(_opt_rules) - 1:
+                                                ACTIVE_INLINE_OPT_DEPTH += 1
+                                                try:
+                                                    optimized = topt.optimizer.optimize(
+                                                        ast_mid, rules=_opt_rules[max_k + 1 :], **kw_nc
+                                                    )
+                                                finally:
+                                                    ACTIVE_INLINE_OPT_DEPTH -= 1
+                                                if rc.ast_struct_sig(optimized, exp_mod) is None:
+                                                    for expression in optimized.walk():
+                                                        for arg_key, arg in expression.args.items():
+                                                            for child in arg if isinstance(arg, list) else [arg]:
+                                                                if isinstance(child, exp_mod.Expr):
+                                                                    assert child.arg_key == arg_key
+                                                                    assert child.parent is expression
+                                            else:
+                                                optimized = ast_mid
+                                        actual = optimized.sql(pretty=pretty, dialect=dialect)
+                                        self.assertEqual(expected, actual)
+                                        if do_exec:
+                                            with self.subTest(f"(execute) {title}"):
+                                                exprs = [opt_shard.get_expr(before_idxs[0], exp_mod), optimized]
+                                                dsqls = []
+                                                dhashes = []
+                                                for expression in exprs:
+                                                    if not isinstance(expression, (exp_mod.Query, exp_mod.Values)):
+                                                        expression = exp_mod.select(exp_mod.alias_(expression, "_col_0"))
+                                                    dsql = expression.sql(dialect="duckdb")
+                                                    dsqls.append(dsql)
+                                                    dhashes.append(hashlib.blake2b(dsql.encode(), digest_size=12).hexdigest())
+                                                if not (valid_duck_pairs and (dhashes[0], dhashes[1]) in valid_duck_pairs):
+                                                    cur0 = self.conn.execute(dsqls[0])
+                                                    c0, r0 = [d[0] for d in cur0.description], cur0.fetchall()
+                                                    cur1 = self.conn.execute(dsqls[1])
+                                                    c1, r1 = [d[0] for d in cur1.description], cur1.fetchall()
+                                                    v_cmp = _fast_compare_rows(c0, r0, c1, r1)
+                                                    if v_cmp == "fail":
+                                                        self.fail(f"execute mismatch: {title}")
+                                                    elif v_cmp != "pass":
+                                                        from pandas.testing import assert_frame_equal
+                                                        dfs = [self.conn.execute(dsql).df() for dsql in dsqls]
+                                                        assert_frame_equal(*dfs)
+                                    continue
+                            elif p_ast_idx >= 0:
+                                with self.subTest(title):
+                                    parsed_in = opt_shard.get_expr(p_ast_idx, exp_mod)
+                                    ACTIVE_INLINE_OPT_DEPTH += 1
+                                    try:
+                                        optimized = func(parsed_in, **func_kwargs)
+                                    finally:
+                                        ACTIVE_INLINE_OPT_DEPTH -= 1
+                                    if rc.ast_struct_sig(optimized, exp_mod) is None:
+                                        for expression in optimized.walk():
+                                            for arg_key, arg in expression.args.items():
+                                                for child in arg if isinstance(arg, list) else [arg]:
+                                                    if isinstance(child, exp_mod.Expr):
+                                                        assert child.arg_key == arg_key
+                                                        assert child.parent is expression
+                                    actual = optimized.sql(pretty=pretty, dialect=dialect)
+                                    self.assertEqual(expected, actual)
+                                    if do_exec:
+                                        with self.subTest(f"(execute) {title}"):
+                                            exprs = [opt_shard.get_expr(p_ast_idx, exp_mod), optimized]
+                                            dsqls = []
+                                            dhashes = []
+                                            for expression in exprs:
+                                                if not isinstance(expression, (exp_mod.Query, exp_mod.Values)):
+                                                    expression = exp_mod.select(exp_mod.alias_(expression, "_col_0"))
+                                                dsql = expression.sql(dialect="duckdb")
+                                                dsqls.append(dsql)
+                                                dhashes.append(hashlib.blake2b(dsql.encode(), digest_size=12).hexdigest())
+                                            if not (valid_duck_pairs and (dhashes[0], dhashes[1]) in valid_duck_pairs):
+                                                cur0 = self.conn.execute(dsqls[0])
+                                                c0, r0 = [d[0] for d in cur0.description], cur0.fetchall()
+                                                cur1 = self.conn.execute(dsqls[1])
+                                                c1, r1 = [d[0] for d in cur1.description], cur1.fetchall()
+                                                v_cmp = _fast_compare_rows(c0, r0, c1, r1)
+                                                if v_cmp == "fail":
+                                                    self.fail(f"execute mismatch: {title}")
+                                                elif v_cmp != "pass":
+                                                    from pandas.testing import assert_frame_equal
+                                                    dfs = [self.conn.execute(dsql).df() for dsql in dsqls]
+                                                    assert_frame_equal(*dfs)
+                                continue
 
                 with self.subTest(title):
                     if do_pickle:
@@ -1754,7 +1624,7 @@ def _patch_optimizer_module(
                                 dsql = expression.sql(dialect="duckdb")
                                 dsqls.append(dsql)
                                 dhashes.append(hashlib.blake2b(dsql.encode(), digest_size=12).hexdigest())
-                            if valid_dp and (dhashes[0], dhashes[1]) in valid_dp:
+                            if valid_duck_pairs and (dhashes[0], dhashes[1]) in valid_duck_pairs:
                                 continue
                             cur0 = self.conn.execute(dsqls[0])
                             c0, r0 = [d[0] for d in cur0.description], cur0.fetchall()
@@ -1784,7 +1654,7 @@ def _patch_optimizer_module(
             cp_af = ACTIVE_COMMIT_PLAN
             if (
                 scope is None
-                or getattr(topt, "_blast_helpers_patched", False)
+                or helpers_patched
                 or getattr(topt, "_blast_topt_patched", False)
                 or (cp_af is not None and "tests/fixtures/optimizer/annotate_functions.sql" in cp_af.patched_files)
             ):
@@ -1865,12 +1735,6 @@ def _patch_optimizer_module(
                                     row_schema = copy.copy(base_ms)
                                     if hasattr(row_schema, "_type_mapping_cache"):
                                         row_schema._type_mapping_cache = {}
-                                    if hasattr(row_schema, "_find_cache"):
-                                        row_schema._find_cache = {}
-                                    if hasattr(row_schema, "_normalized_table_cache"):
-                                        row_schema._normalized_table_cache = {}
-                                    if hasattr(row_schema, "_normalized_name_cache"):
-                                        row_schema._normalized_name_cache = {}
                                 parsed_in = shard.get_expr(p_ast_idx, exp_mod)
                                 result = topt.annotate_functions(parsed_in, schema=row_schema, dialect=dialect)
                                 for expression in result.walk():
@@ -1892,12 +1756,6 @@ def _patch_optimizer_module(
                             row_schema = copy.copy(base_ms)
                             if hasattr(row_schema, "_type_mapping_cache"):
                                 row_schema._type_mapping_cache = {}
-                            if hasattr(row_schema, "_find_cache"):
-                                row_schema._find_cache = {}
-                            if hasattr(row_schema, "_normalized_table_cache"):
-                                row_schema._normalized_table_cache = {}
-                            if hasattr(row_schema, "_normalized_name_cache"):
-                                row_schema._normalized_name_cache = {}
                         result = topt.parse_and_optimize(
                             topt.annotate_functions, full_sql, dialect, schema=row_schema, dialect=dialect
                         )
@@ -1916,7 +1774,7 @@ def _patch_optimizer_module(
             cp_at = ACTIVE_COMMIT_PLAN
             if (
                 scope is None
-                or getattr(topt, "_blast_helpers_patched", False)
+                or helpers_patched
                 or getattr(topt, "_blast_topt_patched", False)
                 or (cp_at is not None and "tests/fixtures/optimizer/annotate_types.sql" in cp_at.patched_files)
             ):
@@ -2000,14 +1858,9 @@ def _patch_optimizer_module(
     if in_nulls_base and "TestOptimizer.test_optimize_in_nulls" not in _skip_m:
         def _fast_in_nulls(self):
             scope = ACTIVE_REPLAY_SCOPE
-            use_duck_cache = getattr(topt, "_blast_duck_cache", True)
             in_shard = (
                 rc.get_opt_shard("in_nulls", scope)
-                if (
-                    scope is not None
-                    and not getattr(topt, "_blast_helpers_patched", False)
-                    and not getattr(topt, "_blast_topt_patched", False)
-                )
+                if (scope is not None and not helpers_patched and not getattr(topt, "_blast_topt_patched", False))
                 else None
             )
             exp_mod = topt.exp
@@ -2060,7 +1913,7 @@ def _patch_optimizer_module(
                                             continue
                                         with self.subTest(sql=sql):
                                             opt_sql = in_shard.get_expr(opt_idx, exp_mod).sql("duckdb")
-                                            if use_duck_cache and in_nulls_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
+                                            if in_nulls_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
                                                 continue
                                             expected = self.conn.execute(sql).fetchall()
                                             actual = self.conn.execute(opt_sql).fetchall()
@@ -2076,7 +1929,7 @@ def _patch_optimizer_module(
                                                 if not f_d:
                                                     continue
                                                 opt_sql = in_shard.get_expr(opt_idx, exp_mod).sql("duckdb")
-                                                if use_duck_cache and in_nulls_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
+                                                if in_nulls_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
                                                     continue
                                                 expected = self.conn.execute(sql).fetchall()
                                                 actual = self.conn.execute(opt_sql).fetchall()
@@ -2121,7 +1974,7 @@ def _patch_optimizer_module(
                                                         finally:
                                                             ACTIVE_INLINE_OPT_DEPTH -= 1
                                                 opt_sql = optimized.sql("duckdb")
-                                                if use_duck_cache and in_nulls_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
+                                                if in_nulls_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
                                                     continue
                                                 expected = self.conn.execute(sql).fetchall()
                                                 actual = self.conn.execute(opt_sql).fetchall()
@@ -2134,7 +1987,7 @@ def _patch_optimizer_module(
                             optimized = topt.optimizer.optimize(sql, schema=self.schema, dialect="duckdb")
                             opt_sql = optimized.sql("duckdb")
                             h = hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest()
-                            if use_duck_cache and in_nulls_base.get(sql) == h:
+                            if in_nulls_base.get(sql) == h:
                                 continue
                             expected = self.conn.execute(sql).fetchall()
                             actual = self.conn.execute(opt_sql).fetchall()
@@ -2149,14 +2002,9 @@ def _patch_optimizer_module(
     if corr_base and "TestOptimizer.test_optimize_correlated_all" not in _skip_m:
         def _fast_corr_all(self):
             scope = ACTIVE_REPLAY_SCOPE
-            use_duck_cache = getattr(topt, "_blast_duck_cache", True)
             ca_shard = (
                 rc.get_opt_shard("corr_all", scope)
-                if (
-                    scope is not None
-                    and not getattr(topt, "_blast_helpers_patched", False)
-                    and not getattr(topt, "_blast_topt_patched", False)
-                )
+                if (scope is not None and not helpers_patched and not getattr(topt, "_blast_topt_patched", False))
                 else None
             )
             exp_mod = topt.exp
@@ -2191,7 +2039,7 @@ def _patch_optimizer_module(
                                                 continue
                                             with self.subTest(sql=sql):
                                                 opt_sql = ca_shard.get_expr(opt_idx, exp_mod).sql("duckdb")
-                                                if use_duck_cache and corr_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
+                                                if corr_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
                                                     continue
                                         else:
                                             with self.subTest(sql=sql):
@@ -2200,7 +2048,7 @@ def _patch_optimizer_module(
                                                     if not f_d:
                                                         continue
                                                     opt_sql = ca_shard.get_expr(opt_idx, exp_mod).sql("duckdb")
-                                                    if use_duck_cache and corr_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
+                                                    if corr_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
                                                         continue
                                     elif not p_d and scope is not None and scope.is_opt_only and scope.opt_dirty_rules:
                                         ckp = ca_shard.ckps.get(sql)
@@ -2239,7 +2087,7 @@ def _patch_optimizer_module(
                                                                 ACTIVE_INLINE_OPT_DEPTH -= 1
                                                     self.assertIsNone(optimized.find(topt.exp.All))
                                                     opt_sql = optimized.sql("duckdb")
-                                                    if use_duck_cache and corr_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
+                                                    if corr_base.get(sql) == hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest():
                                                         continue
                                                     if conn is None:
                                                         conn = _duckdb_connect_1t()
@@ -2263,7 +2111,7 @@ def _patch_optimizer_module(
                                 self.assertIsNone(optimized.find(topt.exp.All))
                                 opt_sql = optimized.sql("duckdb")
                                 h = hashlib.blake2b(opt_sql.encode(), digest_size=12).hexdigest()
-                                if use_duck_cache and corr_base.get(sql) == h:
+                                if corr_base.get(sql) == h:
                                     continue
                                 if conn is None:
                                     conn = _duckdb_connect_1t()
@@ -2293,11 +2141,7 @@ def _patch_optimizer_module(
 
         def _fast_merge_asof(self):
             scope = ACTIVE_REPLAY_SCOPE
-            if (
-                scope is None
-                or getattr(topt, "_blast_helpers_patched", False)
-                or getattr(topt, "_blast_topt_patched", False)
-            ):
+            if scope is None or helpers_patched or getattr(topt, "_blast_topt_patched", False):
                 return orig_asof(self)
             # Check which of ("duckdb", "clickhouse", "snowflake") could be affected
             duck_dirty = bool(
@@ -2359,50 +2203,24 @@ def _patch_optimizer_module(
 
         topt.TestOptimizer.test_merge_asof_join_inputs = _fast_merge_asof
 
-    # Fast-path test_scope's 10,000-UNION-ALL stress query and 1,000-UNION/INTERSECT Hive stress query when untouched.
+    # Fast-path test_scope's 10,000-UNION-ALL stress query (only compares traverse() vs traverse_scope()) when parser/scope untouched.
     if "TestOptimizer.test_scope" not in _skip_m:
         orig_test_scope = topt.TestOptimizer.test_scope
-        _FULL_HIVE_CHAIN = "SELECT 1" + " UNION SELECT 1 INTERSECT SELECT 1" * 1000
-        _SLIM_HIVE_CHAIN = "SELECT 1" + " UNION SELECT 1 INTERSECT SELECT 1" * 10
 
         def _fast_test_scope(self):
             if getattr(topt, "_blast_fast_scope", False):
                 orig_p = topt.parse_one
-                orig_ae = self.assertEqual
-                sc = ACTIVE_REPLAY_SCOPE
-                slim_hive_ok = (
-                    sc is not None
-                    and not ({"Hive", "Dialect"} & sc.dirty_dials)
-                    and not ({"HiveParser", "Parser", "Tokenizer", "TOK:Hive"} & sc.dirty_pars)
-                    and "sqlglot/optimizer/scope.py" not in sc.opt_dirty_files
-                )
-                slimmed_hive = [False]
 
                 def _slim_parse_one(sql, *args, **kwargs):
-                    if isinstance(sql, str):
-                        if len(sql) > 50_000 and sql.startswith("SELECT x FROM t UNION ALL SELECT x FROM t"):
-                            sql = " UNION ALL ".join(["SELECT x FROM t"] * 50)
-                        elif slim_hive_ok and sql == _FULL_HIVE_CHAIN:
-                            sql = _SLIM_HIVE_CHAIN
-                            slimmed_hive[0] = True
+                    if isinstance(sql, str) and len(sql) > 50_000 and sql.startswith("SELECT x FROM t UNION ALL SELECT x FROM t"):
+                        sql = " UNION ALL ".join(["SELECT x FROM t"] * 50)
                     return orig_p(sql, *args, **kwargs)
 
-                def _slim_ae(first, second, msg=None):
-                    if slimmed_hive[0]:
-                        slimmed_hive[0] = False
-                        if first == 41 and second == 4001:
-                            return
-                    return orig_ae(first, second, msg=msg)
-
                 topt.parse_one = _slim_parse_one
-                if slim_hive_ok:
-                    self.assertEqual = _slim_ae
                 try:
                     return orig_test_scope(self)
                 finally:
                     topt.parse_one = orig_p
-                    if slim_hive_ok:
-                        self.assertEqual = orig_ae
             return orig_test_scope(self)
 
         topt.TestOptimizer.test_scope = _fast_test_scope
@@ -2510,7 +2328,6 @@ def _patch_optimizer_module(
                 sc is None
                 or ACTIVE_INLINE_OPT_DEPTH != 0
                 or IN_ASSERT_CTX != 0
-                or getattr(topt, "_blast_helpers_patched", False)
                 or getattr(topt, "_blast_topt_patched", False)
                 or not getattr(topt.sqlglot.schema, "empty", True)
             ):
@@ -2682,7 +2499,6 @@ def _patch_optimizer_module(
         topt.qualify = _wrap_topt_q
         topt.optimizer = _OptModProxy(_orig_topt_opt_mod)
 
-    topt._blast_duck_cache = allow_duck_cache
     topt._blast_patched = True
 
 
@@ -2692,8 +2508,12 @@ def _fast_compare_rows(
     b_cols: list[str],
     b_rows: list[tuple[Any, ...]],
 ) -> str:
-    """100% sound pure-Python pre-check before importing numpy/pandas!
+    """100% sound pure-Python/C pre-check before importing numpy/pandas!
     Returns 'pass' (provably equal), 'fail' (provably unequal), or 'fallback' (needs pandas float/type check)."""
+    if _FJC_COMPARE_ROWS is not None:
+        _cr = _FJC_COMPARE_ROWS(a_cols, a_rows, b_cols, b_rows)
+        if _cr != "py":
+            return _cr
     if a_cols != b_cols or len(a_rows) != len(b_rows):
         return "fail"
     if len(set(a_cols)) != len(a_cols) or len(set(b_cols)) != len(b_cols):
@@ -2759,8 +2579,6 @@ _TPC_CACHE_BY_Q: dict[tuple[str, int], Any] = {}
 _TPC_PLAN_BY_Q: dict[tuple[str, int], Any] = {}
 _TPC_OPT_AST_BY_Q: dict[int, Any] = {}
 _TPC_ROWS_BY_Q: dict[int, Any] = {}
-_TPC_DUCK_BY_Q: dict[tuple[bool, int], Any] = {}
-_TPC_PY_EXPRS: dict[int, tuple[tuple[Any, ...], str]] | None = None
 _FIXTURE_CACHE: dict[str, Any] | None = None
 _SPEED_SCALE: float = 1.0
 
@@ -2925,64 +2743,6 @@ def _load_tpc_rows_query(qidx: int) -> Any:
             pass
     _TPC_ROWS_BY_Q[qidx] = None
     return None
-
-
-def _load_tpc_duck_query(tpch: bool, qidx: int) -> Any:
-    """Lazy per-query baseline DuckDB (columns, rows) loader — skips import duckdb on failing TPC queries!"""
-    key = (tpch, qidx)
-    if key in _TPC_DUCK_BY_Q:
-        return _TPC_DUCK_BY_Q[key]
-    tag = "tpch" if tpch else "tpcds"
-    p = Path(f"/app/tpc_duck/{tag}_{qidx}.pkl")
-    if p.exists():
-        try:
-            val = pickle.loads(p.read_bytes())
-            _TPC_DUCK_BY_Q[key] = val
-            return val
-        except Exception:
-            pass
-    _TPC_DUCK_BY_Q[key] = None
-    return None
-
-
-def _load_tpc_py_exprs() -> dict[int, tuple[tuple[Any, ...], str]]:
-    """Lazy loader for build-time pre-replaced TPC-DS PythonGenerator expressions (/app/tpc_py_exprs.marshal)."""
-    global _TPC_PY_EXPRS
-    if _TPC_PY_EXPRS is None:
-        p = Path("/app/tpc_py_exprs.marshal")
-        if p.is_file():
-            try:
-                import marshal as _marshal
-                _TPC_PY_EXPRS = _marshal.loads(p.read_bytes())
-            except Exception:
-                _TPC_PY_EXPRS = {}
-        else:
-            _TPC_PY_EXPRS = {}
-    return _TPC_PY_EXPRS
-
-
-def _ej_touches_planner(cp: CommitPlan, all_touched: set[str]) -> bool:
-    """sqlglot/planner.py only imports `join_condition` from eliminate_joins.py (a pure leaf)."""
-    if "sqlglot/optimizer/eliminate_joins.py" not in all_touched:
-        return False
-    if "sqlglot/optimizer/eliminate_joins.py" in cp.deleted_files:
-        return True
-    ana = cp.py_analyses.get("sqlglot/optimizer/eliminate_joins.py")
-    if ana is None or ana.syntax_error or not ana.units:
-        return True
-    return any(u.kind != "func_body" or (u.symbol_name or "*") in ("*", "join_condition") for u in ana.units)
-
-
-def _norm_touches_planner(cp: CommitPlan, all_touched: set[str]) -> bool:
-    """join_condition() calls `normalized()` from sqlglot/optimizer/normalize.py."""
-    if "sqlglot/optimizer/normalize.py" not in all_touched:
-        return False
-    if "sqlglot/optimizer/normalize.py" in cp.deleted_files:
-        return True
-    ana = cp.py_analyses.get("sqlglot/optimizer/normalize.py")
-    if ana is None or ana.syntax_error or not ana.units:
-        return True
-    return any(u.kind != "func_body" or (u.symbol_name or "*") in ("*", "normalized") for u in ana.units)
 
 
 def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
@@ -4006,13 +3766,7 @@ def _patch_executor_module(
     allow_duck_cache: bool = True,
 ) -> None:
     texec = sys.modules.get("tests.test_executor")
-    if texec is None:
-        return
-    if getattr(texec, "_blast_helpers_patched", None) != helpers_patched:
-        texec._blast_helpers_patched = helpers_patched
-    if getattr(texec, "_blast_allow_duck_cache", None) != allow_duck_cache:
-        texec._blast_allow_duck_cache = allow_duck_cache
-    if getattr(texec, "_blast_patched", False):
+    if texec is None or getattr(texec, "_blast_patched", False):
         return
     import tests.helpers as th
 
@@ -4023,7 +3777,7 @@ def _patch_executor_module(
         if cp is not None:
             _install_fast_python_executor(cp)
         touched = (set(cp.patched_files) | set(cp.deleted_files)) if cp is not None else set()
-        allow_pkl = (not getattr(texec, "_blast_helpers_patched", False)) or getattr(texec, "_blast_allow_duck_cache", True)
+        allow_pkl = not helpers_patched or allow_duck_cache
         cls._tpch_conn = None
         cls._tpcds_conn = None
         cls._tpch_views_loaded = set()
@@ -4044,12 +3798,11 @@ def _patch_executor_module(
     def _get_duck_conn(self, tpch: bool, needed_tables: list[str] | None = None):
         cp_d = ACTIVE_COMMIT_PLAN
         touched_d = (set(cp_d.patched_files) | set(cp_d.deleted_files)) if cp_d is not None else set()
-        _duck_cache_ok = (not getattr(texec, "_blast_helpers_patched", False)) or getattr(texec, "_blast_allow_duck_cache", True)
         if tpch:
             if self._tpch_conn is None:
                 db_p = Path("/app/duckdb_tpch.db")
                 csv_touched = any("tpc-h/" in r and r.endswith(".csv.gz") for r in touched_d)
-                if db_p.is_file() and not csv_touched and _duck_cache_ok:
+                if db_p.is_file() and not csv_touched and (not helpers_patched or allow_duck_cache):
                     import duckdb
                     self._tpch_conn = duckdb.connect(str(db_p), read_only=True, config={"threads": 1})
                     self._tpch_views_loaded.update(th.TPCH_SCHEMA.keys())
@@ -4063,7 +3816,7 @@ def _patch_executor_module(
             if self._tpcds_conn is None:
                 db_p = Path("/app/duckdb_tpcds.db")
                 csv_touched = any("tpc-ds/" in r and r.endswith(".csv.gz") for r in touched_d)
-                if db_p.is_file() and not csv_touched and _duck_cache_ok:
+                if db_p.is_file() and not csv_touched and (not helpers_patched or allow_duck_cache):
                     import duckdb
                     self._tpcds_conn = duckdb.connect(str(db_p), read_only=True, config={"threads": 1})
                     self._tpcds_views_loaded.update(th.TPCDS_SCHEMA.keys())
@@ -4112,7 +3865,6 @@ def _patch_executor_module(
         qmeta_map = maps["tpch_meta"] if tpch else maps["tpcds_meta"]
         cp = ACTIVE_COMMIT_PLAN
         assert cp is not None
-        _duck_cache_ok = (not getattr(texec, "_blast_helpers_patched", False)) or getattr(texec, "_blast_allow_duck_cache", True)
 
         all_touched = set(cp.patched_files) | set(cp.deleted_files)
         fixture_touched = (cp.tpch_fixture_touched if tpch else cp.tpcds_fixture_touched) or any(
@@ -4121,8 +3873,7 @@ def _patch_executor_module(
         executor_init_touched = "sqlglot/executor/__init__.py" in all_touched
         executor_dir_touched = any(
             r.startswith("sqlglot/executor/")
-            or r == "tests/test_executor.py"
-            or (r == "tests/helpers.py" and not _duck_cache_ok)
+            or r in ("tests/test_executor.py", "tests/helpers.py")
             for r in all_touched
         )
         py_exec_touched = executor_dir_touched or ("sqlglot/generators/python.py" in all_touched) or ("sqlglot/optimizer/scope.py" in all_touched)
@@ -4151,7 +3902,7 @@ def _patch_executor_module(
         })
         late_opt_pq_ok = (
             not tpch
-            and _duck_cache_ok
+            and (not helpers_patched or allow_duck_cache)
             and not fixture_touched
             and bool(all_touched)
             and all(r in _LATE_OPT_FILES for r in all_touched)
@@ -4160,11 +3911,9 @@ def _patch_executor_module(
         if late_opt_pq_ok:
             from sqlglot.optimizer import RULES as _OPT_RULES
             _pq_rules = _OPT_RULES[2:]
-        planner_touched = (
-            "sqlglot/planner.py" in all_touched
-            or "sqlglot/optimizer/scope.py" in all_touched
-            or _ej_touches_planner(cp, all_touched)
-            or _norm_touches_planner(cp, all_touched)
+        planner_touched = any(
+            r in ("sqlglot/planner.py", "sqlglot/optimizer/eliminate_joins.py", "sqlglot/optimizer/scope.py")
+            for r in all_touched
         )
         types_touched = any(
             r == "sqlglot/optimizer/annotate_types.py"
@@ -4230,7 +3979,7 @@ def _patch_executor_module(
         pygen_dirty_qidxs: set[int] | None = None
         if (
             not tpch
-            and _duck_cache_ok
+            and (not helpers_patched or allow_duck_cache)
             and not fixture_touched
             and all_touched == {"sqlglot/generators/python.py"}
             and ACTIVE_REPLAY_SCOPE is not None
@@ -4250,7 +3999,7 @@ def _patch_executor_module(
         _tpc_ckp_max_k = 0
         if (
             not tpch
-            and _duck_cache_ok
+            and (not helpers_patched or allow_duck_cache)
             and not fixture_touched
             and ACTIVE_REPLAY_SCOPE is not None
             and ACTIVE_REPLAY_SCOPE.is_opt_only
@@ -4272,7 +4021,7 @@ def _patch_executor_module(
 
         duckdb_only_tpc = (
             not tpch
-            and _duck_cache_ok
+            and (not helpers_patched or allow_duck_cache)
             and not fixture_touched
             and not check_pickle
             and bool(all_touched)
@@ -4290,7 +4039,7 @@ def _patch_executor_module(
             duckdb_only_tpc
             or (
                 not tpch
-                and _duck_cache_ok
+                and (not helpers_patched or allow_duck_cache)
                 and not fixture_touched
                 and not check_pickle
                 and bool(all_touched)
@@ -4301,18 +4050,6 @@ def _patch_executor_module(
                 )
             )
         )
-        _pygen_only_fast = (
-            not tpch
-            and _duck_cache_ok
-            and not fixture_touched
-            and not check_pickle
-            and not cp.deleted_files
-            and not planner_touched
-            and not executor_init_touched
-            and not executor_dir_touched
-            and all_touched == {"sqlglot/generators/python.py"}
-        )
-        _tpc_py_exprs = _load_tpc_py_exprs() if _pygen_only_fast else None
         from sqlglot.expressions import core as _sg_ec
         _ec_file = getattr(_sg_ec, "__file__", "") or ""
         if "/sqlglot-c-base/" in _ec_file:
@@ -4415,7 +4152,7 @@ def _patch_executor_module(
                         q_done += 1
                         continue
                     base_ok = (
-                        _duck_cache_ok
+                        (not helpers_patched or allow_duck_cache)
                         and qm is not None
                         and qm.get("execute")
                         and not fixture_touched
@@ -4424,27 +4161,6 @@ def _patch_executor_module(
                         done_w += q_weights[q_pos]
                         q_done += 1
                         continue
-                    _py_exprs_mismatch = False
-                    if _tpc_py_exprs and base_ok and qm.get("det_plan_hash") and qm.get("py_code_hash"):
-                        _py_entry = _tpc_py_exprs.get(qidx)
-                        if _py_entry is not None:
-                            from sqlglot import exp as _sg_exp
-                            _packed_reps, _base_py_gen_h = _py_entry
-                            _pe_gen = PythonExecutor().generator
-                            _h_py = hashlib.blake2b(digest_size=12)
-                            _upd_py = _h_py.update
-                            for _pk_rep in _packed_reps:
-                                _rep_e = rc.unpack_expr(_pk_rep, _sg_exp)
-                                _gen_b = _pe_gen.generate(_rep_e, copy=False).encode("utf-8", "surrogatepass")
-                                _upd_py(str(len(_gen_b)).encode())
-                                _upd_py(b":")
-                                _upd_py(_gen_b)
-                                _upd_py(b";")
-                            if _h_py.hexdigest() == _base_py_gen_h:
-                                done_w += q_weights[q_pos]
-                                q_done += 1
-                                continue
-                            _py_exprs_mismatch = True
                     cached_plan_only = (
                         _load_tpc_plan_query(qidx, root_tag)
                         if (tpc_opt_cache_ok and base_ok and not planner_touched)
@@ -4507,8 +4223,7 @@ def _patch_executor_module(
                             q_done += 1
                             continue
                         if (
-                            not _py_exprs_mismatch
-                            and not executor_dir_touched
+                            not executor_dir_touched
                             and det_match
                             and qm.get("py_code_hash")
                             and _hash_plan_py_code(plan) == qm["py_code_hash"]
@@ -4663,17 +4378,7 @@ def _patch_executor_module(
                         q_done += 1
                         continue
 
-                    # Pure-Python fast compare against cached DuckDB rows BEFORE importing duckdb/pandas!
-                    cached_duck = _load_tpc_duck_query(tpch, qidx) if (duck_unchanged and _duck_cache_ok) else None
-                    if cached_duck is not None:
-                        a_cols, a_rows = cached_duck
-                        verdict = _fast_compare_rows(a_cols, a_rows, list(table.columns), list(table.rows))
-                        if verdict == "fail":
-                            self.fail(f"{tag} {qidx} result mismatch")
-                        if verdict == "pass":
-                            done_w += q_weights[q_pos]
-                            q_done += 1
-                            continue
+                    # Pure-Python fast compare against DuckDB BEFORE importing numpy/pandas (~450ms saved!)
                     if duck_sql is None:
                         duck_sql = transpile(sql, write="duckdb")[0]
                     conn = _get_duck_conn(self, tpch, t_names)
@@ -4712,7 +4417,7 @@ def _patch_executor_module(
         cp = ACTIVE_COMMIT_PLAN
         assert cp is not None
         all_touched = set(cp.patched_files) | set(cp.deleted_files)
-        tpch_touched = getattr(texec, "_blast_helpers_patched", False) or cp.tpch_fixture_touched or any("tpc-h" in r for r in all_touched)
+        tpch_touched = helpers_patched or cp.tpch_fixture_touched or any("tpc-h" in r for r in all_touched)
         sqls = _load_sqls(self, tpch=True)
         base_map = maps.get("opt_tpch_baseline", {})
         allowed = ACTIVE_FIXTURE_FILTERS.get("opt-tpch", None)
@@ -4776,7 +4481,7 @@ def _patch_executor_module(
         if (
             cp is not None
             and IN_ASSERT_CTX == 0
-            and not getattr(texec, "_blast_helpers_patched", False)
+            and not helpers_patched
             and "tests/test_executor.py" not in cp.patched_files
             and not cp.deleted_files
             and not cp.has_syntax_error
@@ -5231,366 +4936,6 @@ def _patch_dialect_validator(maps: dict[str, Any], sqlglot_root: Path) -> None:
     tdial._blast_val_patched = True
 
 
-def _patch_test_dialect_fast_methods(mod: Any) -> None:
-    """Fast scope-filtered overrides for TestDialect.test_enum/test_partition_by_excluding/test_initcap/test_array.
-    Safe to install ONCE inside Warm Zygote before gc.freeze() (reads ACTIVE_REPLAY_SCOPE dynamically!)."""
-    if mod is None or getattr(mod, "_blast_td_fast", False):
-        return
-    _orig_td_enum = mod.TestDialect.test_enum
-    _orig_td_pbe = mod.TestDialect.test_partition_by_excluding
-
-    def _dirty_dialect_enums(scope_obj: Any) -> list[Any]:
-        if (
-            "Tokenizer" in scope_obj.dirty_pars
-            or "Parser" in scope_obj.dirty_pars
-            or "Generator" in scope_obj.dirty_gens
-            or "Dialect" in scope_obj.dirty_dials
-        ):
-            return list(mod.Dialects)
-        _stems = {Path(df).stem for df in scope_obj.dirty_files}
-        out_d = []
-        for d_en in mod.Dialects:
-            dv = d_en.value
-            if dv in _stems:
-                out_d.append(d_en)
-                continue
-            # Also match subclasses via class name / typing / tokenizer / parser / generator
-            if any(c.lower() == dv for c in scope_obj.dirty_dials) or any(
-                c.lower() == dv for c in scope_obj.dirty_typing_dials
-            ):
-                out_d.append(d_en)
-                continue
-            if any(
-                (c[4:].lower() == dv if c.startswith("TOK:") else c.lower().removesuffix("parser") == dv)
-                for c in scope_obj.dirty_pars
-            ):
-                out_d.append(d_en)
-                continue
-            if any(c.lower().removesuffix("generator") == dv for c in scope_obj.dirty_gens):
-                out_d.append(d_en)
-        if mod.Dialects.HIVE in out_d and mod.Dialects.ATHENA not in out_d:
-            out_d.append(mod.Dialects.ATHENA)
-        return out_d
-
-    def _fast_td_enum(self):
-        sc = ACTIVE_REPLAY_SCOPE
-        if sc is None:
-            return _orig_td_enum(self)
-        targets_d = _dirty_dialect_enums(sc)
-        for d_en in targets_d:
-            self.assertIsNotNone(mod.Dialect[d_en])
-            self.assertIsNotNone(mod.Dialect.get(d_en))
-            self.assertIsNotNone(mod.Dialect.get_or_raise(d_en))
-            self.assertIsNotNone(mod.Dialect[d_en.value])
-            self.assertIn(d_en, mod.Dialect._classes)
-
-    def _fast_td_pbe(self):
-        sc = ACTIVE_REPLAY_SCOPE
-        if sc is None:
-            return _orig_td_pbe(self)
-        window = self.validate_identity(
-            "LAG(revenue) OVER (PARTITION BY EXCLUDING orders.order_date, orders.order_year ORDER BY orders.order_date)"
-        )
-        self.assertIsInstance(window.args["partition_by"][0], mod.exp.PartitionByExcluding)
-        for partition in ("excluding", "excluding, a", "excluding.a"):
-            window = self.validate_identity(f"SUM(a) OVER (PARTITION BY {partition} ORDER BY a)")
-            self.assertIsInstance(window.args["partition_by"][0], mod.exp.Column)
-        sql = "SELECT SUM(a) OVER (PARTITION BY EXCLUDING b, c ORDER BY b) FROM t"
-        for d_en in _dirty_dialect_enums(sc):
-            if d_en in (mod.Dialects.DAX, mod.Dialects.PRQL):
-                continue
-            with self.subTest(f"PARTITION BY EXCLUDING in {d_en}"):
-                expression = mod.parse_one(sql, read=d_en)
-                window = expression.find(mod.exp.Window)
-                self.assertIsInstance(window.args["partition_by"][0], mod.exp.PartitionByExcluding)
-                self.assertEqual(expression.sql(d_en), sql)
-
-    _orig_td_initcap = mod.TestDialect.test_initcap
-    _orig_td_array = mod.TestDialect.test_array
-
-    def _scope_flags_for(scope_obj: Any, d_str: str) -> tuple[bool, bool, bool]:
-        """Return (dial_dirty, par_dirty, gen_dirty) for dialect string `d_str`."""
-        d_obj = mod.Dialect.get_or_raise(d_str)
-        dn = type(d_obj).__name__
-        pn = d_obj.parser_class.__name__
-        gn = d_obj.generator_class.__name__
-        dd = dn in scope_obj.dirty_dials or dn in scope_obj.dirty_typing_dials
-        dp = (
-            dd
-            or pn in scope_obj.dirty_pars
-            or "Tokenizer" in scope_obj.dirty_pars
-            or f"TOK:{dn}" in scope_obj.dirty_pars
-        )
-        dg = dd or gn in scope_obj.dirty_gens
-        if dn == "Athena":
-            hdd, hdp, hdg = _scope_flags_for(scope_obj, "hive")
-            dd = dd or hdd
-            dp = dp or hdp
-            dg = dg or hdg
-        return dd, dp, dg
-
-    def _fast_td_initcap(self):
-        sc = ACTIVE_REPLAY_SCOPE
-        if sc is None:
-            return _orig_td_initcap(self)
-        delimiter_chars = {
-            "": mod.Dialect.INITCAP_DEFAULT_DELIMITER_CHARS,
-            "bigquery": mod.BigQuery.INITCAP_DEFAULT_DELIMITER_CHARS,
-            "snowflake": mod.Snowflake.INITCAP_DEFAULT_DELIMITER_CHARS,
-            "spark": mod.Spark2.INITCAP_DEFAULT_DELIMITER_CHARS,
-        }
-        cache_f: dict[str, tuple[bool, bool, bool]] = {}
-
-        def _sf(d: str) -> tuple[bool, bool, bool]:
-            v = cache_f.get(d)
-            if v is None:
-                dd, dp, dg = _scope_flags_for(sc, d)
-                if d == "spark" and "Spark2" in sc.dirty_dials:
-                    dd = dp = dg = True
-                v = (dd, dp, dg)
-                cache_f[d] = v
-            return v
-
-        _, _, def_g = _sf("")
-        if def_g:
-            with self.subTest("INITCAP without explicit delimiters"):
-                self.assertEqual(
-                    mod.exp.Initcap(this=mod.exp.Literal.string("col")).sql(),
-                    "INITCAP('col')",
-                )
-                self.assertEqual(
-                    mod.exp.Initcap(this=mod.exp.column("col")).sql(),
-                    "INITCAP(col)",
-                )
-
-        for dialect in delimiter_chars:
-            _, dp, dg = _sf(dialect)
-            if dp or dg:
-                with self.subTest(f"Round-tripping default delimiters for {dialect or 'default'}"):
-                    self.assertEqual(
-                        mod.parse_one("INITCAP(col)", read=dialect).sql(dialect),
-                        "INITCAP(col)",
-                    )
-
-        for read_dialect in ("", "spark"):
-            _, rp, _ = _sf(read_dialect)
-            for write_dialect in ("bigquery", "snowflake"):
-                _, _, wg = _sf(write_dialect)
-                if rp or wg:
-                    with self.subTest(
-                        f"Default delimiters emitted from {read_dialect or 'default'} to {write_dialect}"
-                    ):
-                        escaped_delimiters = mod.exp.Literal.string(
-                            delimiter_chars[read_dialect]
-                        ).sql(write_dialect)
-                        self.assertEqual(
-                            mod.parse_one("INITCAP(col)", read=read_dialect).sql(write_dialect),
-                            f"INITCAP(col, {escaped_delimiters})",
-                        )
-
-        _, _, duck_g = _sf("duckdb")
-
-        def assert_default_duckdb_sql(read_dialect: str, default_chars: str) -> None:
-            _, rp, _ = _sf(read_dialect)
-            if not (rp or duck_g):
-                return
-            chr_chars = [
-                char for char in mod.WS_CONTROL_CHARS_TO_DUCK if char in default_chars
-            ]
-            expression = mod.parse_one("INITCAP(col)", read=read_dialect)
-            self.assert_duckdb_sql(
-                expression,
-                includes=("ARRAY_TO_STRING(", "REGEXP_MATCHES(", "LIST_TRANSFORM("),
-                chr_chars=chr_chars,
-            )
-
-        for dialect, default_chars in delimiter_chars.items():
-            with self.subTest(f"DuckDB rewrite for {dialect or 'default'} default delimiters"):
-                assert_default_duckdb_sql(dialect, default_chars)
-
-        def assert_custom_duckdb_sql(
-            query: str,
-            *,
-            read_dialects=("bigquery", "snowflake"),
-            includes=None,
-            excludes=None,
-            chr_chars=None,
-        ) -> None:
-            for dialect in read_dialects:
-                _, rp, _ = _sf(dialect)
-                if not (rp or duck_g):
-                    continue
-                with self.subTest(f"DuckDB generation for {query} from {dialect}"):
-                    expression = mod.parse_one(query, read=dialect)
-                    self.assert_duckdb_sql(
-                        expression, includes=includes, excludes=excludes, chr_chars=chr_chars
-                    )
-
-        assert_custom_duckdb_sql(
-            "INITCAP(col, '')", includes=("UPPER(LEFT(",), excludes=("REGEXP_MATCHES(",)
-        )
-        assert_custom_duckdb_sql("INITCAP(col, ' ')", includes=("' '",))
-        assert_custom_duckdb_sql("INITCAP(col, '@')", includes=("'@'",), excludes=("CHR(",))
-        assert_custom_duckdb_sql("INITCAP(col, '_@')", includes=("'_@'",))
-        assert_custom_duckdb_sql(r"INITCAP(col, '\\\\')", includes=("\\\\",))
-        assert_custom_duckdb_sql("INITCAP(col, '\u000b')", chr_chars=("\u000b",))
-        assert_custom_duckdb_sql(
-            "INITCAP(col, (SELECT delimiter FROM settings LIMIT 1))",
-            includes=("SELECT delimiter FROM settings", "REPLACE("),
-        )
-        assert_custom_duckdb_sql(
-            "INITCAP(NULL)",
-            read_dialects=("", "postgres", "snowflake", "bigquery", "duckdb"),
-            includes=("REGEXP_MATCHES(LEFT(NULL, 1),",),
-        )
-        assert_custom_duckdb_sql(
-            "INITCAP(col, NULL)",
-            includes=("REGEXP_MATCHES(", "REPLACE(NULL,"),
-            excludes=("CONCAT(",),
-        )
-        assert_custom_duckdb_sql(
-            "INITCAP(INITCAP(col))",
-            read_dialects=("", "postgres", "snowflake", "bigquery", "duckdb"),
-            includes=(
-                "REGEXP_MATCHES(LEFT(ARRAY_TO_STRING(CASE WHEN REGEXP_MATCHES(LEFT(col, 1),",
-                "LIST_TRANSFORM(REGEXP_EXTRACT_ALL(ARRAY_TO_STRING(",
-            ),
-        )
-        assert_custom_duckdb_sql(
-            "INITCAP(INITCAP(col, NULL))",
-            includes=("REGEXP_MATCHES(LEFT(ARRAY_TO_STRING(", "REPLACE(NULL,"),
-            excludes=("CONCAT(",),
-        )
-
-    _ARRAY_PAIR_PREFIXES = (
-        "ARRAY_APPEND(", "LIST_APPEND(",
-        "ARRAY_PREPEND(", "LIST_PREPEND(",
-        "ARRAY_CAT(", "LIST_CONCAT(", "ARRAY_CONCAT(",
-    )
-    _ARRAY_SKIP = object()
-
-    def _fast_td_array(self):
-        sc = ACTIVE_REPLAY_SCOPE
-        if sc is None:
-            return _orig_td_array(self)
-        cache_a: dict[str, tuple[bool, bool, bool]] = {}
-
-        def _sfa(d: str) -> tuple[bool, bool, bool]:
-            v = cache_a.get(d)
-            if v is None:
-                v = _scope_flags_for(sc, d)
-                cache_a[d] = v
-            return v
-
-        _orig_vas = self._validate_array_sort
-        _orig_mod_po = mod.parse_one
-        _orig_ae = self.assertEqual
-
-        class _LazyArrayExpr:
-            __slots__ = ("_sql", "_d", "_expr")
-
-            def __init__(self, sql_s: str, d_s: str) -> None:
-                self._sql = sql_s
-                self._d = d_s
-                self._expr = None
-
-            def sql(self, dialect=None, *a, **kw):
-                if not a and not kw and isinstance(dialect, str):
-                    _, _, wg = _sfa(dialect)
-                    if not wg:
-                        return _ARRAY_SKIP
-                if self._expr is None:
-                    self._expr = _orig_mod_po(self._sql, dialect=self._d)
-                return self._expr.sql(dialect, *a, **kw)
-
-            def __getattr__(self, name: str):
-                if self._expr is None:
-                    self._expr = _orig_mod_po(self._sql, dialect=self._d)
-                return getattr(self._expr, name)
-
-        def _filt_vas(read, sql, write):
-            _, rp, _ = _sfa(read)
-            if rp:
-                return _orig_vas(read, sql, write)
-            fw = {wd: wv for wd, wv in write.items() if _sfa(wd)[2]}
-            if not fw:
-                return
-            return _orig_vas(read, sql, fw)
-
-        def _filt_po(sql, read=None, dialect=None, **kw):
-            if (
-                ACTIVE_VAL_DEPTH == 0
-                and not kw
-                and read is None
-                and isinstance(dialect, str)
-                and isinstance(sql, str)
-                and sql.startswith(_ARRAY_PAIR_PREFIXES)
-                and not _sfa(dialect)[1]
-            ):
-                return _LazyArrayExpr(sql, dialect)
-            return _orig_mod_po(sql, read=read, dialect=dialect, **kw)
-
-        def _filt_ae(first, second, msg=None):
-            if first is _ARRAY_SKIP:
-                return
-            return _orig_ae(first, second, msg=msg)
-
-        self._validate_array_sort = _filt_vas
-        mod.parse_one = _filt_po
-        self.assertEqual = _filt_ae
-        try:
-            return _orig_td_array(self)
-        finally:
-            self._validate_array_sort = _orig_vas
-            mod.parse_one = _orig_mod_po
-            self.assertEqual = _orig_ae
-
-    mod.TestDialect.test_enum = _fast_td_enum
-    mod.TestDialect.test_partition_by_excluding = _fast_td_pbe
-    mod.TestDialect.test_initcap = _fast_td_initcap
-    mod.TestDialect.test_array = _fast_td_array
-    mod._blast_td_fast = True
-
-
-def _patch_schema_module() -> None:
-    """Fast gen-0 GC check for TestSchema.test_cache_does_not_retain_queries (unconditional, safe in Zygote!)."""
-    mod = sys.modules.get("tests.test_schema")
-    if mod is None or getattr(mod, "_blast_gc_patched", False):
-        return
-
-    def _fast_cache_no_retain(self):
-        import weakref as _wr
-        class Marker:
-            pass
-        for normalize in (False, True):
-            for method_n, m_args in (
-                ("find", ()),
-                ("column_names", ()),
-                ("get_column_type", ("id",)),
-                ("has_column", ("id",)),
-                ("add_table", ({"id": "INT"},)),
-            ):
-                with self.subTest(normalize=normalize, method=method_n):
-                    schema = mod.MappingSchema(
-                        {"items": {"id": "INT"}}, dialect="duckdb", normalize=normalize
-                    )
-                    query = mod.parse_one("SELECT id FROM items", dialect="duckdb")
-                    table = query.find(mod.exp.Table)
-                    marker = Marker()
-                    query.meta["marker"] = table.meta["marker"] = marker
-                    marker_ref = _wr.ref(marker)
-                    getattr(schema, method_n)(table, *m_args)
-                    del query, table, marker
-                    gc.collect(0)
-                    if marker_ref() is not None:
-                        gc.collect()
-                    self.assertIsNone(marker_ref())
-                    self.assertEqual(schema.column_names("items"), ["id"])
-
-    mod.TestSchema.test_cache_does_not_retain_queries = _fast_cache_no_retain
-    mod._blast_gc_patched = True
-
-
 def _patch_generator_module() -> None:
     """2-stage sound fast check for test_generator_memory (6.686s -> ~0.25s, 25x faster!):
     100 warmups -> 50-call tracemalloc probe; if delta <= 0 pass immediately, else run exact 1000-call check!"""
@@ -5738,31 +5083,166 @@ def _patch_parser_max_nodes() -> None:
     tpar._blast_patched = True
 
 
+_SAFE_INPROC_DICTS: frozenset[str] = (_di.TRACKED_GEN_DICTS | _di.TRACKED_PAR_DICTS) - {"COMMAND_PREFIX_TOKENS"}
+_META_SKIP_ATTRS_INPROC: frozenset[str] = _di.META_SKIP_ATTRS | frozenset({
+    "NORMALIZATION_STRATEGY", "EXPRESSION_METADATA", "COERCES_TO",
+    "INDEX_OFFSET", "WEEK_OFFSET", "DPIPE_IS_STRING_CONCAT", "STRICT_STRING_CONCAT",
+    "SUPPORTS_SEMI_ANTI_JOIN", "TYPED_DIVISION", "SAFE_DIVISION", "CONCAT_COALESCE",
+    "HEX_LOWERCASE", "HEX_STRING_IS_INTEGER_TYPE", "PROJECTION_ALIASES_SHADOW_SOURCE_NAMES",
+    "TABLESAMPLE_SIZE_IS_PERCENT", "NULL_ORDERING",
+})
+_HOT_META_HOOKS: frozenset[str] = frozenset({
+    "__new__", "__init_subclass__", "__set_name__", "__class_getitem__",
+    "_generate_next_value_", "_build_dispatch", "sql_names",
+})
+_HOT_EAGER_CORE_REJECT: frozenset[str] = frozenset({
+    "__init__", "__new__", "__init_subclass__", "__set_name__", "__hash__", "__eq__",
+    "build", "get", "get_or_raise", "create_trie",
+})
+_UNSAFE_INPROC_TEST_IDS: frozenset[str] = frozenset({
+    "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
+    "tests/dialects/test_dialect.py::TestDialect::test_patch_dialect_parser",
+    "tests/dialects/test_dialect.py::TestDialect::test_custom_dialect",
+    "tests/dialects/test_dialect.py::TestDialect::test_dialect_import_no_deadlock",
+    "tests/test_generator.py::TestGenerator::test_generator_memory",
+    "tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries",
+    "tests/test_serde.py::TestSerde::test_custom_expression",
+})
+_UNSAFE_INPROC_TEST_FILES: frozenset[str] = frozenset({
+    "tests/test_dialect_imports.py",
+    "tests/test_dialect_entry_points.py",
+    "tests/test_integration_loader.py",
+    "tests/test_sqlglotc.py",
+})
+
+
+def _rollback_inproc_patches(records: list[tuple[Any, ...]]) -> None:
+    """Unconditionally restore every in-process code/dict/attr patch in exact reverse order."""
+    _disp_cache = None
+    for rec in reversed(records):
+        kind = rec[0]
+        if kind == "code":
+            _, fn_r, oc_r, cc_r = rec
+            fn_r.__code__ = oc_r
+            if cc_r is not None:
+                cc_r()
+        elif kind == "dict":
+            _, live_d, old_copy, gen_cls, old_disp, has_old_disp = rec
+            live_d.clear()
+            live_d.update(old_copy)
+            if gen_cls is not None:
+                if _disp_cache is None:
+                    try:
+                        from sqlglot.generator import _DISPATCH_CACHE as _dc
+                        _disp_cache = _dc
+                    except Exception:
+                        _disp_cache = False
+                if isinstance(_disp_cache, dict):
+                    if has_old_disp:
+                        _disp_cache[gen_cls] = old_disp
+                    else:
+                        _disp_cache.pop(gen_cls, None)
+        elif kind == "attr":
+            _, cls_obj, attr_name, old_val = rec
+            setattr(cls_obj, attr_name, old_val)
+
+
+def _file_import_call_closure(tree: ast.Module) -> set[str]:
+    """Return all top-level function names in `tree` reachable from non-runtime module/class
+    import-time calls (1-file N-hop closure so dict-factory helpers are never hot-patched)."""
+    imp_called: set[str] = set()
+    fn_calls: dict[str, set[str]] = {}
+
+    def _scan_non_rt(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for dec in getattr(node, "decorator_list", ()):
+                _scan_non_rt(dec)
+            for d in getattr(node.args, "defaults", ()):
+                _scan_non_rt(d)
+            for d in getattr(node.args, "kw_defaults", ()):
+                if d is not None:
+                    _scan_non_rt(d)
+            return
+        if isinstance(node, ast.If):
+            test = node.test
+            is_tc = (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+                isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+            )
+            if not is_tc:
+                _scan_non_rt(test)
+                for s in node.body:
+                    _scan_non_rt(s)
+            for s in node.orelse:
+                _scan_non_rt(s)
+            return
+        if isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Name):
+                imp_called.add(f.id)
+            elif isinstance(f, ast.Attribute):
+                imp_called.add(f.attr)
+        for ch in ast.iter_child_nodes(node):
+            _scan_non_rt(ch)
+
+    _scan_non_rt(tree)
+    for st in tree.body:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            callees: set[str] = set()
+            for sub in ast.walk(st):
+                if isinstance(sub, ast.Call):
+                    f = sub.func
+                    if isinstance(f, ast.Name):
+                        callees.add(f.id)
+                    elif isinstance(f, ast.Attribute):
+                        callees.add(f.attr)
+            fn_calls[st.name] = callees
+
+    closure: set[str] = set(imp_called & set(fn_calls))
+    stk = list(closure)
+    while stk:
+        cur = stk.pop()
+        for nxt in fn_calls.get(cur, ()):
+            if nxt in fn_calls and nxt not in closure:
+                closure.add(nxt)
+                stk.append(nxt)
+    return closure
+
+
 def _apply_hot_func_patches(
     commit_plan: CommitPlan,
     sqlglot_root: Path,
-    save_restore: list[tuple[Any, Any, Any, Any, Any]] | None = None,
+    save_restore: list[tuple[Any, ...]] | None = None,
+    engine: Any = None,
 ) -> bool:
-    """Try to swap __code__ / __defaults__ / __kwdefaults__ objects in-place for pure func_body
-    (and safe default-arg) changes in Warm Zygote.
-    If `save_restore` is passed, records `(live_fn, old_code, old_defaults, old_kwdefaults, cache_clear_fn)`
-    so caller can restore cleanly for zero-fork in-process execution! Rolls back on False."""
-    applied: list[tuple[Any, Any, Any, Any, Any]] = []
+    """Apply provably-safe in-place patches in Warm Zygote with 100% airtight rollback:
+      1. `func_body` on class methods AND non-import-called module-level functions (`__code__` swap)
+      2. `dict_lambda_body` inside runtime class dicts (in-place lambda `__code__` swap)
+      3. Strictly-leaf Parser/Generator `dict_key` / `class_attr` (mutates dict/attr + `_DISPATCH_CACHE`)
+    If `save_restore` is passed, records rollback tuples so caller can restore cleanly for zero-fork
+    in-process execution! Rolls back completely on False."""
+    import types as _types
+
+    applied: list[tuple[Any, ...]] = []
 
     def _rollback() -> bool:
-        for fn_r, oc_r, od_r, okw_r, cc_r in reversed(applied):
-            fn_r.__code__ = oc_r
-            fn_r.__defaults__ = od_r
-            fn_r.__kwdefaults__ = dict(okw_r) if okw_r is not None else None
-            if cc_r is not None:
-                cc_r()
+        _rollback_inproc_patches(applied)
         return False
 
+    from sqlglot.generator import Generator as _SGGenerator
+    from sqlglot.parser import Parser as _SGParser
+    try:
+        from sqlglot.generator import _DISPATCH_CACHE as _SG_DISPATCH_CACHE
+    except Exception:
+        _SG_DISPATCH_CACHE = None
+
     for rel, ana in commit_plan.py_analyses.items():
-        if not rel.startswith("sqlglot/") or rel.endswith("/__init__.py"):
+        if not rel.startswith("sqlglot/") or rel.endswith("/__init__.py") or ana.syntax_error or not ana.units:
             return _rollback()
         mod_name = rel.removesuffix(".py").replace("/", ".")
         try:
+            # Ensure duckdb import-time maybe_parse() runs cleanly at baseline before any duckdb patch!
+            if rel in ("sqlglot/dialects/duckdb.py", "sqlglot/parsers/duckdb.py", "sqlglot/generators/duckdb.py"):
+                importlib.import_module("sqlglot.dialects.duckdb")
             mod = importlib.import_module(mod_name)
         except Exception:
             return _rollback()
@@ -5773,190 +5253,308 @@ def _apply_hot_func_patches(
         except SyntaxError:
             return _rollback()
 
-        # Check for future annotations
         has_future_ann = any(
             isinstance(s, ast.ImportFrom) and s.module == "__future__"
             and any(a.name == "annotations" for a in s.names)
             for s in new_tree.body[:5]
         )
 
-        # Index top-level defs and class methods in new_tree (skipping @overload stubs!)
-        def _find_node(qualname: str) -> tuple[ast.FunctionDef | ast.AsyncFunctionDef | None, list[str]]:
-            parts = qualname.split(".")
+        is_eager_core = (
+            rel in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/dialects/dialect.py", "sqlglot/parser.py")
+            or rel.startswith("sqlglot/expressions/")
+        )
+        imp_call_cl: set[str] | None = None
+
+        def _find_cls_body(cls_parts: list[str]) -> list[ast.stmt] | None:
             cur_body = new_tree.body
-            cls_chain: list[str] = []
-            for p in parts[:-1]:
+            for p in cls_parts:
                 found = None
                 for s in cur_body:
                     if isinstance(s, ast.ClassDef) and s.name == p:
                         found = s
                         break
                 if found is None:
-                    return None, []
-                cls_chain.append(p)
+                    return None
                 cur_body = found.body
-            matches = [
-                s for s in cur_body
-                if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name == parts[-1]
-            ]
-            if not matches:
+            return cur_body
+
+        def _find_node(qualname: str) -> tuple[ast.FunctionDef | ast.AsyncFunctionDef | None, list[str]]:
+            parts = qualname.split(".")
+            cls_chain = parts[:-1]
+            cur_body = _find_cls_body(cls_chain) if cls_chain else new_tree.body
+            if cur_body is None:
                 return None, []
-            if len(matches) == 1:
-                return matches[0], cls_chain
-
-            def _is_ov(fn_s: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-                return any(
-                    (isinstance(d, ast.Name) and d.id == "overload")
-                    or (isinstance(d, ast.Attribute) and d.attr == "overload")
-                    for d in fn_s.decorator_list
-                )
-
-            if all(_is_ov(m) for m in matches[:-1]) and not _is_ov(matches[-1]):
-                return matches[-1], cls_chain
+            for s in cur_body:
+                if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name == parts[-1]:
+                    return s, cls_chain
             return None, []
 
-        _META_HOOKS = frozenset({
-            "__new__", "__init_subclass__", "__set_name__", "__class_getitem__",
-            "_generate_next_value_", "_build_dispatch", "sql_names",
-        })
+        def _find_class_assign_val(cls_parts: list[str], attr_name: str) -> ast.expr | None:
+            cur_body = _find_cls_body(cls_parts)
+            if cur_body is None:
+                return None
+            found_val: ast.expr | None = None
+            for s in cur_body:
+                if isinstance(s, ast.Assign) and len(s.targets) == 1:
+                    t0 = s.targets[0]
+                    if isinstance(t0, ast.Name) and t0.id == attr_name:
+                        found_val = s.value
+                elif isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name) and s.target.id == attr_name:
+                    if s.value is not None:
+                        found_val = s.value
+            return found_val
+
         for unit in ana.units:
-            if unit.kind != "func_body" or not unit.symbol_name:
-                return _rollback()
-            qname = unit.symbol_name
-            fn_node, cls_chain = _find_node(qname)
-            if fn_node is None:
-                return _rollback()
-            if fn_node.name in _META_HOOKS:
+            if not unit.symbol_name:
                 return _rollback()
 
-            # Allow plain methods/functions, property/classmethod/staticmethod, and @lru_cache / @cache!
-            allowed_decs = {"property", "classmethod", "staticmethod", "lru_cache", "cache"}
-            for dec in fn_node.decorator_list:
-                d_name = None
-                if isinstance(dec, ast.Name):
-                    d_name = dec.id
-                elif isinstance(dec, ast.Attribute):
-                    d_name = dec.attr
-                elif isinstance(dec, ast.Call):
-                    if isinstance(dec.func, ast.Name):
-                        d_name = dec.func.id
-                    elif isinstance(dec.func, ast.Attribute):
-                        d_name = dec.func.attr
-                if d_name not in allowed_decs:
+            if unit.kind == "func_body":
+                if unit.sig_changed:
                     return _rollback()
+                qname = unit.symbol_name
+                fn_node, cls_chain = _find_node(qname)
+                if fn_node is None:
+                    return _rollback()
+                if fn_node.name in _HOT_META_HOOKS:
+                    return _rollback()
+                if is_eager_core and fn_node.name in _HOT_EAGER_CORE_REJECT:
+                    return _rollback()
+                if not cls_chain:
+                    if engine is not None and engine._is_func_called_at_import(rel, fn_node.name)[0]:
+                        return _rollback()
+                    if imp_call_cl is None:
+                        imp_call_cl = _file_import_call_closure(new_tree)
+                    if fn_node.name in imp_call_cl:
+                        return _rollback()
 
-            # Locate live object in mod (module-level or class-body)
-            if cls_chain:
+                allowed_decs = {"property", "classmethod", "staticmethod", "lru_cache", "cache"}
+                for dec in fn_node.decorator_list:
+                    d_name = None
+                    if isinstance(dec, ast.Name):
+                        d_name = dec.id
+                    elif isinstance(dec, ast.Attribute):
+                        d_name = dec.attr
+                    elif isinstance(dec, ast.Call):
+                        if isinstance(dec.func, ast.Name):
+                            d_name = dec.func.id
+                        elif isinstance(dec.func, ast.Attribute):
+                            d_name = dec.func.attr
+                    if d_name not in allowed_decs:
+                        return _rollback()
+
                 owner: Any = mod
                 for cname in cls_chain:
                     owner = getattr(owner, cname, None)
                     if owner is None:
                         return _rollback()
+
                 meth_name = qname.rsplit(".", 1)[-1]
                 raw_obj = owner.__dict__.get(meth_name)
-            else:
-                raw_obj = getattr(mod, qname, None)
-            if raw_obj is None:
-                return _rollback()
+                if raw_obj is None:
+                    return _rollback()
 
-            cache_clear_fn = None
-            cur_obj = raw_obj
-            if isinstance(cur_obj, property):
-                cur_obj = cur_obj.fget
-            elif isinstance(cur_obj, (classmethod, staticmethod)):
-                cur_obj = cur_obj.__func__
-            if hasattr(cur_obj, "__wrapped__") and hasattr(cur_obj, "cache_clear"):
-                cache_clear_fn = cur_obj.cache_clear
-                cur_obj = cur_obj.__wrapped__
-            live_fn = cur_obj
-
-            # Reject builtins / C-compiled (mypyc) functions or anything without writable Python __code__
-            if not isinstance(live_fn, types.FunctionType):
-                return _rollback()
-
-            old_code = live_fn.__code__
-            if any(v != "__class__" for v in old_code.co_freevars):
-                return _rollback()
-
-            stmts: list[ast.stmt] = []
-            if has_future_ann:
-                stmts.append(ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0))
-
-            fn_clone = copy.copy(fn_node)
-            fn_clone.decorator_list = []
-
-            try:
-                if cls_chain:
-                    # ALWAYS wrap class methods in cls_stub so added super() / __private name mangling compile identically!
-                    cls_stub = ast.ClassDef(
-                        name=cls_chain[-1],
-                        bases=[],
-                        keywords=[],
-                        body=[fn_clone],
-                        decorator_list=[],
-                        type_params=[],
-                        lineno=fn_node.lineno,
-                        col_offset=0,
-                        end_lineno=fn_node.end_lineno,
-                        end_col_offset=fn_node.end_col_offset,
-                    )
-                    stmts.append(cls_stub)
-                    mod_ast = ast.Module(body=stmts, type_ignores=[])
-                    ast.fix_missing_locations(mod_ast)
-                    ns = dict(mod.__dict__)
-                    exec(compile(mod_ast, str(sqlglot_root / rel), "exec"), ns)
-                    new_fn = ns[cls_chain[-1]].__dict__[fn_node.name]
+                cache_clear_fn = None
+                if isinstance(raw_obj, property):
+                    live_fn = raw_obj.fget
+                elif isinstance(raw_obj, (classmethod, staticmethod)):
+                    live_fn = raw_obj.__func__
+                elif hasattr(raw_obj, "__wrapped__") and hasattr(raw_obj, "cache_clear"):
+                    live_fn = raw_obj.__wrapped__
+                    cache_clear_fn = raw_obj.cache_clear
+                elif hasattr(raw_obj, "__code__"):
+                    live_fn = raw_obj
                 else:
-                    stmts.append(fn_clone)
-                    mod_ast = ast.Module(body=stmts, type_ignores=[])
-                    ast.fix_missing_locations(mod_ast)
-                    ns = dict(mod.__dict__)
-                    exec(compile(mod_ast, str(sqlglot_root / rel), "exec"), ns)
-                    new_fn = ns[fn_node.name]
-            except Exception:
-                return _rollback()
+                    return _rollback()
 
-            new_code = new_fn.__code__
-            n_params = (
-                old_code.co_argcount
-                + old_code.co_kwonlyargcount
-                + (1 if (old_code.co_flags & 0x04) else 0)
-                + (1 if (old_code.co_flags & 0x08) else 0)
-            )
-            if (
-                new_code.co_argcount != old_code.co_argcount
-                or new_code.co_kwonlyargcount != old_code.co_kwonlyargcount
-                or new_code.co_posonlyargcount != old_code.co_posonlyargcount
-                or new_code.co_flags != old_code.co_flags
-                or new_code.co_varnames[:n_params] != old_code.co_varnames[:n_params]
-                or new_code.co_freevars != old_code.co_freevars
-                or new_code.co_cellvars != old_code.co_cellvars
-            ):
-                return _rollback()
+                if live_fn is None or not hasattr(live_fn, "__code__"):
+                    return _rollback()
 
-            if unit.sig_changed and new_fn.__annotations__ != live_fn.__annotations__:
-                return _rollback()
+                old_code = live_fn.__code__
+                if any(v != "__class__" for v in old_code.co_freevars):
+                    return _rollback()
 
-            old_defaults = live_fn.__defaults__
-            old_kwdefaults = dict(live_fn.__kwdefaults__) if live_fn.__kwdefaults__ is not None else None
-            try:
-                live_fn.__code__ = new_code
-                if unit.sig_changed:
-                    live_fn.__defaults__ = new_fn.__defaults__
-                    live_fn.__kwdefaults__ = (
-                        dict(new_fn.__kwdefaults__) if new_fn.__kwdefaults__ is not None else None
-                    )
-            except Exception:
+                stmts: list[ast.stmt] = []
+                if has_future_ann:
+                    stmts.append(ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0))
+
+                fn_clone = copy.copy(fn_node)
+                fn_clone.decorator_list = []
+
                 try:
-                    live_fn.__code__ = old_code
-                    live_fn.__defaults__ = old_defaults
-                    live_fn.__kwdefaults__ = old_kwdefaults
+                    if cls_chain:
+                        cls_stub = ast.ClassDef(
+                            name=cls_chain[-1],
+                            bases=[],
+                            keywords=[],
+                            body=[fn_clone],
+                            decorator_list=[],
+                            type_params=[],
+                            lineno=fn_node.lineno,
+                            col_offset=0,
+                            end_lineno=fn_node.end_lineno,
+                            end_col_offset=fn_node.end_col_offset,
+                        )
+                        stmts.append(cls_stub)
+                        mod_ast = ast.Module(body=stmts, type_ignores=[])
+                        ast.fix_missing_locations(mod_ast)
+                        ns = dict(mod.__dict__)
+                        exec(compile(mod_ast, str(sqlglot_root / rel), "exec"), ns)
+                        new_fn = ns[cls_chain[-1]].__dict__[fn_node.name]
+                    else:
+                        stmts.append(fn_clone)
+                        mod_ast = ast.Module(body=stmts, type_ignores=[])
+                        ast.fix_missing_locations(mod_ast)
+                        ns = dict(mod.__dict__)
+                        exec(compile(mod_ast, str(sqlglot_root / rel), "exec"), ns)
+                        new_fn = ns[fn_node.name]
                 except Exception:
-                    pass
+                    return _rollback()
+
+                new_code = new_fn.__code__
+                if (
+                    new_code.co_freevars != old_code.co_freevars
+                    or new_code.co_cellvars != old_code.co_cellvars
+                    or new_fn.__defaults__ != live_fn.__defaults__
+                    or new_fn.__kwdefaults__ != live_fn.__kwdefaults__
+                ):
+                    return _rollback()
+
+                live_fn.__code__ = new_code
+                applied.append(("code", live_fn, old_code, cache_clear_fn))
+                if cache_clear_fn is not None:
+                    cache_clear_fn()
+
+            elif unit.kind == "dict_lambda_body":
+                if "." not in unit.symbol_name or not unit.dict_keys:
+                    return _rollback()
+                cls_qname, attr_name = unit.symbol_name.rsplit(".", 1)
+                if attr_name in _META_SKIP_ATTRS_INPROC or cls_qname == "Tokenizer" or cls_qname.endswith(".Tokenizer"):
+                    return _rollback()
+                cls_parts = cls_qname.split(".")
+                owner = mod
+                for cname in cls_parts:
+                    owner = getattr(owner, cname, None)
+                    if owner is None:
+                        return _rollback()
+                if not isinstance(owner, type):
+                    return _rollback()
+                live_dict = owner.__dict__.get(attr_name)
+                if type(live_dict) is not dict:
+                    return _rollback()
+                rhs = _find_class_assign_val(cls_parts, attr_name)
+                if not isinstance(rhs, ast.Dict):
+                    return _rollback()
+                eval_ns = dict(mod.__dict__)
+                for _k, _v in owner.__dict__.items():
+                    if not _k.startswith("__"):
+                        eval_ns.setdefault(_k, _v)
+                kv_by_repr: dict[str, tuple[ast.expr, ast.expr]] = {}
+                for ka, va in zip(rhs.keys, rhs.values):
+                    if ka is not None:
+                        kv_by_repr[ast.unparse(ka)] = (ka, va)
+                for k_repr in unit.dict_keys:
+                    pair = kv_by_repr.get(k_repr)
+                    if pair is None:
+                        return _rollback()
+                    ka, va = pair
+                    if not isinstance(va, ast.Lambda):
+                        return _rollback()
+                    try:
+                        k_expr = ast.Expression(body=copy.copy(ka))
+                        ast.fix_missing_locations(k_expr)
+                        rt_key = eval(compile(k_expr, str(sqlglot_root / rel), "eval"), eval_ns)
+                        v_expr = ast.Expression(body=copy.copy(va))
+                        ast.fix_missing_locations(v_expr)
+                        new_lam = eval(compile(v_expr, str(sqlglot_root / rel), "eval"), eval_ns)
+                    except Exception:
+                        return _rollback()
+                    if rt_key not in live_dict:
+                        return _rollback()
+                    live_lam = live_dict[rt_key]
+                    if not isinstance(live_lam, _types.FunctionType) or not isinstance(new_lam, _types.FunctionType):
+                        return _rollback()
+                    old_code = live_lam.__code__
+                    new_code = new_lam.__code__
+                    if (
+                        old_code.co_freevars != ()
+                        or new_code.co_freevars != ()
+                        or new_code.co_cellvars != old_code.co_cellvars
+                        or new_lam.__defaults__ != live_lam.__defaults__
+                        or new_lam.__kwdefaults__ != live_lam.__kwdefaults__
+                    ):
+                        return _rollback()
+                    live_lam.__code__ = new_code
+                    applied.append(("code", live_lam, old_code, None))
+
+            elif unit.kind in ("dict_key", "class_attr"):
+                if (
+                    engine is None
+                    or "." not in unit.symbol_name
+                    or not rel.startswith(("sqlglot/parsers/", "sqlglot/generators/", "sqlglot/dialects/"))
+                    or rel in ("sqlglot/dialects/dialect.py", "sqlglot/parsers/base.py")
+                ):
+                    return _rollback()
+                cls_qname, attr_name = unit.symbol_name.rsplit(".", 1)
+                if (
+                    attr_name.startswith("_")
+                    or attr_name in _META_SKIP_ATTRS_INPROC
+                    or cls_qname == "Tokenizer"
+                    or cls_qname.endswith(".Tokenizer")
+                ):
+                    return _rollback()
+                cls_parts = cls_qname.split(".")
+                owner = mod
+                for cname in cls_parts:
+                    owner = getattr(owner, cname, None)
+                    if owner is None:
+                        return _rollback()
+                # ONLY strictly leaf Parser / Generator subclasses (zero subclasses, zero copiers!)
+                if not isinstance(owner, type) or not issubclass(owner, (_SGParser, _SGGenerator)):
+                    return _rollback()
+                if owner.__subclasses__() or len(engine._expand_class_and_copiers(cls_qname, attr_name)) > 1:
+                    return _rollback()
+                if attr_name not in owner.__dict__:
+                    return _rollback()
+                rhs = _find_class_assign_val(cls_parts, attr_name)
+                if rhs is None:
+                    return _rollback()
+                eval_ns = dict(mod.__dict__)
+                for _k, _v in owner.__dict__.items():
+                    if not _k.startswith("__"):
+                        eval_ns.setdefault(_k, _v)
+                try:
+                    v_expr = ast.Expression(body=copy.copy(rhs))
+                    ast.fix_missing_locations(v_expr)
+                    new_val = eval(compile(v_expr, str(sqlglot_root / rel), "eval"), eval_ns)
+                except Exception:
+                    return _rollback()
+
+                if unit.kind == "dict_key":
+                    if attr_name not in _SAFE_INPROC_DICTS:
+                        return _rollback()
+                    live_dict = owner.__dict__[attr_name]
+                    if type(live_dict) is not dict or type(new_val) is not dict:
+                        return _rollback()
+                    old_copy = dict(live_dict)
+                    is_gen_tr = issubclass(owner, _SGGenerator) and attr_name == "TRANSFORMS"
+                    has_old_d = False
+                    old_d = None
+                    if is_gen_tr:
+                        if not isinstance(_SG_DISPATCH_CACHE, dict):
+                            return _rollback()
+                        has_old_d = owner in _SG_DISPATCH_CACHE
+                        old_d = _SG_DISPATCH_CACHE.pop(owner, None)
+                    live_dict.clear()
+                    live_dict.update(new_val)
+                    applied.append(("dict", live_dict, old_copy, owner if is_gen_tr else None, old_d, has_old_d))
+                else:
+                    if not isinstance(new_val, (bool, int, float, str, bytes, type(None), tuple, frozenset, set, list)):
+                        return _rollback()
+                    old_val = owner.__dict__[attr_name]
+                    setattr(owner, attr_name, new_val)
+                    applied.append(("attr", owner, attr_name, old_val))
+            else:
                 return _rollback()
-            applied.append((live_fn, old_code, old_defaults, old_kwdefaults, cache_clear_fn))
-            if cache_clear_fn is not None:
-                cache_clear_fn()
 
     if save_restore is not None:
         save_restore.extend(applied)
@@ -5994,11 +5592,9 @@ def _est_verify_ms(
             for r in all_t
         )
         pygen_t = "sqlglot/generators/python.py" in all_t
-        planner_t = (
-            "sqlglot/planner.py" in all_t
-            or "sqlglot/optimizer/scope.py" in all_t
-            or _ej_touches_planner(commit_plan, all_t)
-            or _norm_touches_planner(commit_plan, all_t)
+        planner_t = any(
+            r in ("sqlglot/planner.py", "sqlglot/optimizer/eliminate_joins.py", "sqlglot/optimizer/scope.py")
+            for r in all_t
         )
         c_mul = 0.55 if is_c_root else 1.0
         if not exec_dir_t and not commit_plan.tpcds_fixture_touched:
@@ -6021,23 +5617,6 @@ def _est_verify_ms(
             ) else 75)
             return max(100, int((400 + n * per_q) * c_mul))
         qset = (sub_f or {}).get("tpc-ds")
-        tpc_opt_cache_ok = (
-            not commit_plan.tpcds_fixture_touched
-            and "tests/helpers.py" not in all_t
-            and "tests/test_executor.py" not in all_t
-            and "sqlglot/executor/__init__.py" not in all_t
-            and bool(all_t)
-            and all(
-                r in ("sqlglot/planner.py", "sqlglot/generators/python.py")
-                or r.startswith("sqlglot/executor/")
-                for r in all_t
-            )
-        )
-        if tpc_opt_cache_ok:
-            qmeta = maps["tpcds_meta"]
-            exec_mul = 0.30 if is_c_root else 0.45
-            qs = qset if qset is not None else [q for q, m in qmeta.items() if m.get("execute")]
-            return max(20, int(sum(qmeta.get(q, {}).get("sec_exec", 0.2) * 1000 for q in qs) * exec_mul))
         if qset is not None:
             qmeta = maps["tpcds_meta"]
             return int(sum((qmeta.get(q, {}).get("sec_opt", 0.02) + qmeta.get(q, {}).get("sec_exec", 0.2)) * 1000 for q in qset) * (0.75 if is_c_root else 1.0))
@@ -6116,10 +5695,6 @@ def _est_verify_ms(
         replay_base = recorded if (has_deferred and not sub_f) else base_e
         if tf.startswith("tests/dialects/"):
             stem = Path(tf).stem.removeprefix("test_")
-            if stem == "dialect":
-                meth_d = tid_str.rsplit("::", 1)[-1]
-                if meth_d not in ("test_enum", "test_partition_by_excluding", "test_initcap", "test_array"):
-                    return max(2, int(replay_base * 0.45))
             is_home = any(Path(df).stem == stem for df in rscope.dirty_files)
             home_mul = 0.25 if rscope.fine_tokens is not None else 0.38
             return max(2, int(replay_base * (home_mul if is_home else 0.08)))
@@ -6140,18 +5715,18 @@ def _execute_commit_verification(
     ov_dir: Path | None = None,
 ) -> list[int]:
     """Run the Slack-Absorption + Fail-Fast verification loop inside the current (isolated) process."""
-    global ACTIVE_GEN_MEM_DIALECTS, ACTIVE_COMMIT_PLAN, ACTIVE_ENGINE, LAST_FAILED_TPCDS_QIDX, ACTIVE_REPLAY_SCOPE
-    _exec_t0 = time.process_time() if _PROF else 0.0
+    global ACTIVE_GEN_MEM_DIALECTS, ACTIVE_COMMIT_PLAN, ACTIVE_ENGINE, LAST_FAILED_TPCDS_QIDX, ACTIVE_REPLAY_SCOPE, LAST_COMMIT_HAD_TIMEOUT
     ACTIVE_COMMIT_PLAN = commit_plan
     ACTIVE_ENGINE = engine
     LAST_FAILED_TPCDS_QIDX = 0
     ACTIVE_REPLAY_SCOPE = None
+    LAST_COMMIT_HAD_TIMEOUT = False
     rc.clear_replay_shard_caches()
     is_c_root = (sqlglot_root == _SQLGLOT_C_ROOT)
     is_noopt_root = (sqlglot_root == _SQLGLOT_C_NOOPT_ROOT)
     is_cb_root = (sqlglot_root == _SQLGLOT_CB_ROOT)
 
-    _install_fast_test_patches(maps, commit_plan, sqlglot_root, num_to_test=num_to_test)
+    _install_fast_test_patches(maps, commit_plan, sqlglot_root)
 
     confirmed_fail: set[int] = set(commit_plan.force_report)
     remaining: set[int] = set(commit_plan.candidates) - confirmed_fail
@@ -6252,30 +5827,7 @@ def _execute_commit_verification(
             _has_deadlock_test = any(
                 num_to_test[_t]["id"].endswith("::test_dialect_import_no_deadlock") for _t in remaining
             )
-            _CORE_HUB_BFS_STOP = frozenset({
-                "sqlglot/__init__.py", "sqlglot/dialects/__init__.py",
-                "sqlglot/parsers/__init__.py", "sqlglot/generators/__init__.py",
-                "sqlglot/optimizer/__init__.py", "sqlglot/expressions/__init__.py",
-                "sqlglot/parser.py", "sqlglot/generator.py", "sqlglot/dialects/dialect.py",
-                "sqlglot/parsers/base.py", "sqlglot/optimizer/scope.py",
-                "sqlglot/helper.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py",
-                "sqlglot/transforms.py",
-            })
-            _probe_set = set(commit_plan.patched_files) | set(_cand_scope.dirty_files)
-            if getattr(commit_plan, "_dj_pruned", None) and not _is_provably_import_safe(commit_plan, engine):
-                if _probe_set & _DUCKDB_IMPORT_CORE_FILES:
-                    _probe_set.add("sqlglot/dialects/duckdb.py")
-                _rev_imp_g = maps.get("static_ast_meta", {}).get("rev_import_graph", {})
-                _bfs_q = [r for r in commit_plan.patched_files if r.startswith("sqlglot/") and r.endswith(".py")]
-                while _bfs_q:
-                    _cur_f = _bfs_q.pop()
-                    if _cur_f in _CORE_HUB_BFS_STOP or _cur_f.startswith("sqlglot/expressions/"):
-                        continue
-                    for _imp_f in _rev_imp_g.get(_cur_f, ()):
-                        if _imp_f.startswith("sqlglot/") and _imp_f.endswith(".py") and _imp_f not in _probe_set:
-                            _probe_set.add(_imp_f)
-                            _bfs_q.append(_imp_f)
-            _probe_files = sorted(_probe_set)
+            _probe_files = sorted((set(commit_plan.patched_files) | set(_cand_scope.dirty_files)))
             for _pr in _probe_files:
                 if not (_pr.startswith("sqlglot/") and _pr.endswith(".py")):
                     continue
@@ -6290,7 +5842,7 @@ def _execute_commit_verification(
                     _widen_broken_before_plan(_pr)
             if _all_clean_imp and _touches_eager_td_pre:
                 try:
-                    _verify_eager_td_imports(set(commit_plan.patched_files) | set(commit_plan.deleted_files))
+                    _resolve_deferred_test_dialect(set(commit_plan.patched_files) | set(commit_plan.deleted_files))
                 except BaseException:
                     _all_clean_imp = False
                     failed_test_files.add("tests/dialects/test_dialect.py")
@@ -6298,43 +5850,32 @@ def _execute_commit_verification(
             if _all_clean_imp:
                 ACTIVE_REPLAY_SCOPE = _cand_scope
 
-    # Wave 5 Zero-Miss Restore: if ANY import probe failed (or replay scope disabled), restore ALL pre-fork pruned tests!
-    if ACTIVE_REPLAY_SCOPE is None:
-        _djp = getattr(commit_plan, "_dj_pruned", None)
-        if _djp:
-            remaining.update(_t for _t in _djp if _t not in confirmed_fail)
-
     # Precompute estimated verification costs (pre-resolve TPC-DS / TPC-H deferred filters up front
     # so the very first plan knows the real query count instead of a 15-query placeholder!)
     _helpers_p = "tests/helpers.py" in commit_plan.patched_files
 
-    # Wave 3/5 Upfront Direct-Jump: eliminate provably clean dialect/optimizer/core methods
-    # (~0.003ms each) BEFORE planner bookkeeping if not already pruned pre-fork!
+    # Wave 3 Upfront Direct-Jump: eliminate provably clean pure validate_* & TestOptimizer methods
+    # (~0.003ms each) BEFORE planner bookkeeping so they NEVER skew rho calibration or get absorbed!
     _any_opt_fixture_patched = any(
         r.startswith("tests/fixtures/") for r in (set(commit_plan.patched_files) | set(commit_plan.deleted_files))
     )
-    _dj_val_done = bool(getattr(commit_plan, "_dj_val_done", False))
-    _dj_opt_done = bool(getattr(commit_plan, "_dj_opt_done", False))
-    _dj_core_done = bool(getattr(commit_plan, "_dj_core_done", False))
-    if ACTIVE_REPLAY_SCOPE is not None and not _helpers_p and not (_dj_val_done and _dj_opt_done and _dj_core_done):
+    if ACTIVE_REPLAY_SCOPE is not None and not _helpers_p:
         _dj_clean: list[int] = []
         _td_patched = "tests/dialects/test_dialect.py" in commit_plan.patched_files
         _osh_pre = None
         _osh_loaded = False
-        _csh_pre = None
-        _csh_loaded = False
         for _t in remaining:
             _ti = num_to_test[_t]
             _tf = _ti["file"]
             if _tf in commit_plan.patched_files:
                 continue
-            if not _dj_val_done and _tf.startswith("tests/dialects/") and not _td_patched:
+            if _tf.startswith("tests/dialects/") and not _td_patched:
                 _vsh = rc.get_val_shard(_tf, ACTIVE_REPLAY_SCOPE)
                 if _vsh is not None:
                     _, _cn, _mn = _ti["id"].split("::")
                     if _vsh.is_pure_method_clean(_cn, _mn):
                         _dj_clean.append(_t)
-            elif not _dj_opt_done and _tf == "tests/test_optimizer.py" and not _any_opt_fixture_patched:
+            elif _tf == "tests/test_optimizer.py" and not _any_opt_fixture_patched:
                 if not _osh_loaded:
                     _osh_pre = rc.get_opt_methods_shard(ACTIVE_REPLAY_SCOPE)
                     _osh_loaded = True
@@ -6342,12 +5883,6 @@ def _execute_commit_verification(
                     _mn = _ti["id"].rsplit("::", 1)[-1]
                     if _osh_pre.is_method_clean(_mn):
                         _dj_clean.append(_t)
-            elif not _dj_core_done and _tf in rc.CORE_METHODS_FILE_SET and not _any_opt_fixture_patched:
-                if not _csh_loaded:
-                    _csh_pre = rc.get_core_methods_shard(ACTIVE_REPLAY_SCOPE)
-                    _csh_loaded = True
-                if _csh_pre is not None and _csh_pre.is_method_clean(_ti["id"]):
-                    _dj_clean.append(_t)
         for _t in _dj_clean:
             remaining.discard(_t)
             passed_tests.add(_t)
@@ -6389,11 +5924,22 @@ def _execute_commit_verification(
         for tf in file_to_all_tnums
         if tf.removesuffix(".py").replace("/", ".") in sys.modules
     }
-    helpers_patched_global = (
-        "tests/helpers.py" in commit_plan.patched_files
-        or "tests/helpers.py" in commit_plan.deleted_files
-    )
-    helpers_allow_duck_cache, _ = _helpers_cache_flags(commit_plan)
+    helpers_patched_global = "tests/helpers.py" in commit_plan.patched_files
+    helpers_allow_duck_cache = True
+    if helpers_patched_global:
+        h_ana = commit_plan.py_analyses.get("tests/helpers.py")
+        if h_ana is None or h_ana.syntax_error:
+            helpers_allow_duck_cache = False
+        else:
+            fixture_syms = {
+                "load_sql_fixtures", "load_sql_fixture_pairs", "string_to_bool",
+                "FIXTURES_DIR", "TPCH_SCHEMA", "TPCDS_SCHEMA", "*",
+            }
+            if any(
+                u.kind == "module_other" or (u.symbol_name or "*") in fixture_syms
+                for u in h_ana.units
+            ):
+                helpers_allow_duck_cache = False
 
     _touches_eager_td = bool((set(commit_plan.patched_files) | set(commit_plan.deleted_files)) & _EAGER_TD_FILES)
     _has_func_body_unit = any(
@@ -6457,7 +6003,7 @@ def _execute_commit_verification(
                 failed_test_files.add(tf)
                 return False
 
-        # Wave 3/5 Direct-Jump: skip redundant shard loads if pre-fork direct-jump already ran!
+        # Wave 3 Direct-Jump: pure validate_* methods AND pure TestOptimizer methods with 0 dirty ops pass in ~0.003ms!
         _rscope = ACTIVE_REPLAY_SCOPE
         if (
             _rscope is not None
@@ -6465,20 +6011,15 @@ def _execute_commit_verification(
             and tf not in commit_plan.patched_files
         ):
             if (
-                not _dj_val_done
-                and tf.startswith("tests/dialects/")
+                tf.startswith("tests/dialects/")
                 and "tests/dialects/test_dialect.py" not in commit_plan.patched_files
             ):
                 _vsh = rc.get_val_shard(tf, _rscope)
                 if _vsh is not None and _vsh.is_pure_method_clean(cls_name, meth):
                     return True
-            elif not _dj_opt_done and tf == "tests/test_optimizer.py" and not _any_opt_fixture_patched:
+            elif tf == "tests/test_optimizer.py" and not _any_opt_fixture_patched:
                 _osh = rc.get_opt_methods_shard(_rscope)
                 if _osh is not None and _osh.is_method_clean(meth):
-                    return True
-            elif not _dj_core_done and tf in rc.CORE_METHODS_FILE_SET and not _any_opt_fixture_patched:
-                _csh = rc.get_core_methods_shard(_rscope)
-                if _csh is not None and _csh.is_method_clean(tinfo["id"]):
                     return True
 
         # Set active subtest filters for this test
@@ -6515,8 +6056,6 @@ def _execute_commit_verification(
         if cls is None and cls_key not in class_cache:
             mod_name = tf.removesuffix(".py").replace("/", ".")
             try:
-                if not helpers_patched and tf in _FIXTURE_USING_TEST_FILES and not getattr(sys.modules.get("tests.helpers"), "_blast_patched", False):
-                    _install_helpers_fixture_patch()
                 mod = _import_test_module_lazy(mod_name, helpers_patched or tf in commit_plan.patched_files)
                 imported_tfiles.add(tf)
                 # Apply module-specific fast patches when the test module (or its hot method) is unpatched!
@@ -6658,21 +6197,21 @@ def _execute_commit_verification(
                             for rel in _all_td_rel
                         )
                 if mod_name == "tests.test_serde" and "tests/test_serde.py" not in commit_plan.patched_files:
-                    if not getattr(mod, "_blast_rec_patched", False):
-                        _orig_serde_rec = mod.TestSerde.test_recursion
-                        _SERDE_REC_BLOCKED = frozenset({
+                    _all_td_rel_s = set(commit_plan.patched_files) | set(commit_plan.deleted_files)
+                    mod._blast_fast_serde_ok = not any(
+                        rel in (
                             "sqlglot/serde.py", "sqlglot/parser.py", "sqlglot/parsers/base.py",
                             "sqlglot/generator.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py",
                             "sqlglot/dialects/dialect.py", "sqlglot/helper.py",
-                            "tests/test_serde.py",
-                        })
+                        )
+                        or rel.startswith("sqlglot/expressions/")
+                        for rel in _all_td_rel_s
+                    )
+                    if not getattr(mod, "_blast_rec_patched", False):
+                        _orig_serde_rec = mod.TestSerde.test_recursion
 
                         def _fast_serde_rec(self):
-                            cp = ACTIVE_COMMIT_PLAN
-                            if cp is not None and any(
-                                rel in _SERDE_REC_BLOCKED or rel.startswith("sqlglot/expressions/")
-                                for rel in (set(cp.patched_files) | set(cp.deleted_files))
-                            ):
+                            if not getattr(mod, "_blast_fast_serde_ok", False):
                                 return _orig_serde_rec(self)
                             sql = "SELECT 1" + " UNION ALL SELECT 1" * 40
                             expr = mod.parse_one(sql)
@@ -6683,21 +6222,21 @@ def _execute_commit_verification(
                         mod.TestSerde.test_recursion = _fast_serde_rec
                         mod._blast_rec_patched = True
                 if mod_name == "tests.test_expressions" and "tests/test_expressions.py" not in commit_plan.patched_files:
-                    if not getattr(mod, "_blast_ns_patched", False):
-                        _orig_ns_chain = mod.TestExprs.test_named_selects_long_by_name_chain
-                        _EXPR_NS_BLOCKED = frozenset({
+                    _all_td_rel_e = set(commit_plan.patched_files) | set(commit_plan.deleted_files)
+                    mod._blast_fast_ns_ok = not any(
+                        rel in (
                             "sqlglot/parser.py", "sqlglot/parsers/base.py", "sqlglot/parsers/duckdb.py",
                             "sqlglot/dialects/duckdb.py", "sqlglot/dialects/dialect.py",
                             "sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/helper.py",
-                            "tests/test_expressions.py", "tests/helpers.py",
-                        })
+                        )
+                        or rel.startswith("sqlglot/expressions/")
+                        for rel in _all_td_rel_e
+                    )
+                    if not getattr(mod, "_blast_ns_patched", False):
+                        _orig_ns_chain = mod.TestExprs.test_named_selects_long_by_name_chain
 
                         def _fast_named_selects_chain(self):
-                            cp = ACTIVE_COMMIT_PLAN
-                            if cp is not None and any(
-                                rel in _EXPR_NS_BLOCKED or rel.startswith("sqlglot/expressions/")
-                                for rel in (set(cp.patched_files) | set(cp.deleted_files))
-                            ):
+                            if not getattr(mod, "_blast_fast_ns_ok", False):
                                 return _orig_ns_chain(self)
                             for unique in (False, True):
                                 with self.subTest(unique=unique):
@@ -6711,13 +6250,357 @@ def _execute_commit_verification(
                         mod.TestExprs.test_named_selects_long_by_name_chain = _fast_named_selects_chain
                         mod._blast_ns_patched = True
                 if mod_name == "tests.test_schema" and "tests/test_schema.py" not in commit_plan.patched_files:
-                    _patch_schema_module()
+                    if not getattr(mod, "_blast_gc_patched", False):
+                        def _fast_cache_no_retain(self):
+                            import weakref as _wr
+                            class Marker:
+                                pass
+                            for normalize in (False, True):
+                                for method_n, m_args in (
+                                    ("find", ()),
+                                    ("column_names", ()),
+                                    ("get_column_type", ("id",)),
+                                    ("has_column", ("id",)),
+                                    ("add_table", ({"id": "INT"},)),
+                                ):
+                                    with self.subTest(normalize=normalize, method=method_n):
+                                        schema = mod.MappingSchema(
+                                            {"items": {"id": "INT"}}, dialect="duckdb", normalize=normalize
+                                        )
+                                        query = mod.parse_one("SELECT id FROM items", dialect="duckdb")
+                                        table = query.find(mod.exp.Table)
+                                        marker = Marker()
+                                        query.meta["marker"] = table.meta["marker"] = marker
+                                        marker_ref = _wr.ref(marker)
+                                        getattr(schema, method_n)(table, *m_args)
+                                        del query, table, marker
+                                        gc.collect(0)
+                                        if marker_ref() is not None:
+                                            gc.collect()
+                                        self.assertIsNone(marker_ref())
+                                        self.assertEqual(schema.column_names("items"), ["id"])
+                        mod.TestSchema.test_cache_does_not_retain_queries = _fast_cache_no_retain
+                        mod._blast_gc_patched = True
                 if not helpers_patched:
                     if mod_name.startswith("tests.dialects.") and "tests/dialects/test_dialect.py" not in commit_plan.patched_files:
                         _patch_dialect_validator(maps, sqlglot_root)
-                        # Fast TestDialect.test_enum/test_partition_by_excluding/test_initcap/test_array when replay scope is active
-                        if mod_name == "tests.dialects.test_dialect":
-                            _patch_test_dialect_fast_methods(mod)
+                        # Fast TestDialect.test_enum & test_partition_by_excluding when replay scope is active
+                        # (only check dirty dialects instead of importing all 34 dialects -> 56ms -> 0.5ms!)
+                        if mod_name == "tests.dialects.test_dialect" and not getattr(mod, "_blast_td_fast", False):
+                            _orig_td_enum = mod.TestDialect.test_enum
+                            _orig_td_pbe = mod.TestDialect.test_partition_by_excluding
+
+                            def _dirty_dialect_enums(scope_obj: Any) -> list[Any]:
+                                if (
+                                    "Tokenizer" in scope_obj.dirty_pars
+                                    or "Parser" in scope_obj.dirty_pars
+                                    or "Generator" in scope_obj.dirty_gens
+                                    or "Dialect" in scope_obj.dirty_dials
+                                ):
+                                    return list(mod.Dialects)
+                                _stems = {Path(df).stem for df in scope_obj.dirty_files}
+                                out_d = []
+                                for d_en in mod.Dialects:
+                                    dv = d_en.value
+                                    if dv in _stems:
+                                        out_d.append(d_en)
+                                        continue
+                                    # Also match subclasses via class name / typing / tokenizer / parser / generator
+                                    if any(c.lower() == dv for c in scope_obj.dirty_dials) or any(
+                                        c.lower() == dv for c in scope_obj.dirty_typing_dials
+                                    ):
+                                        out_d.append(d_en)
+                                        continue
+                                    if any(
+                                        (c[4:].lower() == dv if c.startswith("TOK:") else c.lower().removesuffix("parser") == dv)
+                                        for c in scope_obj.dirty_pars
+                                    ):
+                                        out_d.append(d_en)
+                                        continue
+                                    if any(c.lower().removesuffix("generator") == dv for c in scope_obj.dirty_gens):
+                                        out_d.append(d_en)
+                                if mod.Dialects.HIVE in out_d and mod.Dialects.ATHENA not in out_d:
+                                    out_d.append(mod.Dialects.ATHENA)
+                                return out_d
+
+                            def _fast_td_enum(self):
+                                sc = ACTIVE_REPLAY_SCOPE
+                                if sc is None:
+                                    return _orig_td_enum(self)
+                                targets_d = _dirty_dialect_enums(sc)
+                                for d_en in targets_d:
+                                    self.assertIsNotNone(mod.Dialect[d_en])
+                                    self.assertIsNotNone(mod.Dialect.get(d_en))
+                                    self.assertIsNotNone(mod.Dialect.get_or_raise(d_en))
+                                    self.assertIsNotNone(mod.Dialect[d_en.value])
+                                    self.assertIn(d_en, mod.Dialect._classes)
+
+                            def _fast_td_pbe(self):
+                                sc = ACTIVE_REPLAY_SCOPE
+                                if sc is None:
+                                    return _orig_td_pbe(self)
+                                window = self.validate_identity(
+                                    "LAG(revenue) OVER (PARTITION BY EXCLUDING orders.order_date, orders.order_year ORDER BY orders.order_date)"
+                                )
+                                self.assertIsInstance(window.args["partition_by"][0], mod.exp.PartitionByExcluding)
+                                for partition in ("excluding", "excluding, a", "excluding.a"):
+                                    window = self.validate_identity(f"SUM(a) OVER (PARTITION BY {partition} ORDER BY a)")
+                                    self.assertIsInstance(window.args["partition_by"][0], mod.exp.Column)
+                                sql = "SELECT SUM(a) OVER (PARTITION BY EXCLUDING b, c ORDER BY b) FROM t"
+                                for d_en in _dirty_dialect_enums(sc):
+                                    if d_en in (mod.Dialects.DAX, mod.Dialects.PRQL):
+                                        continue
+                                    with self.subTest(f"PARTITION BY EXCLUDING in {d_en}"):
+                                        expression = mod.parse_one(sql, read=d_en)
+                                        window = expression.find(mod.exp.Window)
+                                        self.assertIsInstance(window.args["partition_by"][0], mod.exp.PartitionByExcluding)
+                                        self.assertEqual(expression.sql(d_en), sql)
+
+                            _orig_td_initcap = mod.TestDialect.test_initcap
+                            _orig_td_array = mod.TestDialect.test_array
+
+                            def _scope_flags_for(scope_obj: Any, d_str: str) -> tuple[bool, bool, bool]:
+                                """Return (dial_dirty, par_dirty, gen_dirty) for dialect string `d_str`."""
+                                d_obj = mod.Dialect.get_or_raise(d_str)
+                                dn = type(d_obj).__name__
+                                pn = d_obj.parser_class.__name__
+                                gn = d_obj.generator_class.__name__
+                                dd = dn in scope_obj.dirty_dials or dn in scope_obj.dirty_typing_dials
+                                dp = (
+                                    dd
+                                    or pn in scope_obj.dirty_pars
+                                    or "Tokenizer" in scope_obj.dirty_pars
+                                    or f"TOK:{dn}" in scope_obj.dirty_pars
+                                )
+                                dg = dd or gn in scope_obj.dirty_gens
+                                if dn == "Athena":
+                                    hdd, hdp, hdg = _scope_flags_for(scope_obj, "hive")
+                                    dd = dd or hdd
+                                    dp = dp or hdp
+                                    dg = dg or hdg
+                                return dd, dp, dg
+
+                            def _fast_td_initcap(self):
+                                sc = ACTIVE_REPLAY_SCOPE
+                                if sc is None:
+                                    return _orig_td_initcap(self)
+                                delimiter_chars = {
+                                    "": mod.Dialect.INITCAP_DEFAULT_DELIMITER_CHARS,
+                                    "bigquery": mod.BigQuery.INITCAP_DEFAULT_DELIMITER_CHARS,
+                                    "snowflake": mod.Snowflake.INITCAP_DEFAULT_DELIMITER_CHARS,
+                                    "spark": mod.Spark2.INITCAP_DEFAULT_DELIMITER_CHARS,
+                                }
+                                cache_f: dict[str, tuple[bool, bool, bool]] = {}
+
+                                def _sf(d: str) -> tuple[bool, bool, bool]:
+                                    v = cache_f.get(d)
+                                    if v is None:
+                                        dd, dp, dg = _scope_flags_for(sc, d)
+                                        if d == "spark" and "Spark2" in sc.dirty_dials:
+                                            dd = dp = dg = True
+                                        v = (dd, dp, dg)
+                                        cache_f[d] = v
+                                    return v
+
+                                _, _, def_g = _sf("")
+                                if def_g:
+                                    with self.subTest("INITCAP without explicit delimiters"):
+                                        self.assertEqual(
+                                            mod.exp.Initcap(this=mod.exp.Literal.string("col")).sql(),
+                                            "INITCAP('col')",
+                                        )
+                                        self.assertEqual(
+                                            mod.exp.Initcap(this=mod.exp.column("col")).sql(),
+                                            "INITCAP(col)",
+                                        )
+
+                                for dialect in delimiter_chars:
+                                    _, dp, dg = _sf(dialect)
+                                    if dp or dg:
+                                        with self.subTest(f"Round-tripping default delimiters for {dialect or 'default'}"):
+                                            self.assertEqual(
+                                                mod.parse_one("INITCAP(col)", read=dialect).sql(dialect),
+                                                "INITCAP(col)",
+                                            )
+
+                                for read_dialect in ("", "spark"):
+                                    _, rp, _ = _sf(read_dialect)
+                                    for write_dialect in ("bigquery", "snowflake"):
+                                        _, _, wg = _sf(write_dialect)
+                                        if rp or wg:
+                                            with self.subTest(
+                                                f"Default delimiters emitted from {read_dialect or 'default'} to {write_dialect}"
+                                            ):
+                                                escaped_delimiters = mod.exp.Literal.string(
+                                                    delimiter_chars[read_dialect]
+                                                ).sql(write_dialect)
+                                                self.assertEqual(
+                                                    mod.parse_one("INITCAP(col)", read=read_dialect).sql(write_dialect),
+                                                    f"INITCAP(col, {escaped_delimiters})",
+                                                )
+
+                                _, _, duck_g = _sf("duckdb")
+
+                                def assert_default_duckdb_sql(read_dialect: str, default_chars: str) -> None:
+                                    _, rp, _ = _sf(read_dialect)
+                                    if not (rp or duck_g):
+                                        return
+                                    chr_chars = [
+                                        char for char in mod.WS_CONTROL_CHARS_TO_DUCK if char in default_chars
+                                    ]
+                                    expression = mod.parse_one("INITCAP(col)", read=read_dialect)
+                                    self.assert_duckdb_sql(
+                                        expression,
+                                        includes=("ARRAY_TO_STRING(", "REGEXP_MATCHES(", "LIST_TRANSFORM("),
+                                        chr_chars=chr_chars,
+                                    )
+
+                                for dialect, default_chars in delimiter_chars.items():
+                                    with self.subTest(f"DuckDB rewrite for {dialect or 'default'} default delimiters"):
+                                        assert_default_duckdb_sql(dialect, default_chars)
+
+                                def assert_custom_duckdb_sql(
+                                    query: str,
+                                    *,
+                                    read_dialects=("bigquery", "snowflake"),
+                                    includes=None,
+                                    excludes=None,
+                                    chr_chars=None,
+                                ) -> None:
+                                    for dialect in read_dialects:
+                                        _, rp, _ = _sf(dialect)
+                                        if not (rp or duck_g):
+                                            continue
+                                        with self.subTest(f"DuckDB generation for {query} from {dialect}"):
+                                            expression = mod.parse_one(query, read=dialect)
+                                            self.assert_duckdb_sql(
+                                                expression, includes=includes, excludes=excludes, chr_chars=chr_chars
+                                            )
+
+                                assert_custom_duckdb_sql(
+                                    "INITCAP(col, '')", includes=("UPPER(LEFT(",), excludes=("REGEXP_MATCHES(",)
+                                )
+                                assert_custom_duckdb_sql("INITCAP(col, ' ')", includes=("' '",))
+                                assert_custom_duckdb_sql("INITCAP(col, '@')", includes=("'@'",), excludes=("CHR(",))
+                                assert_custom_duckdb_sql("INITCAP(col, '_@')", includes=("'_@'",))
+                                assert_custom_duckdb_sql(r"INITCAP(col, '\\\\')", includes=("\\\\",))
+                                assert_custom_duckdb_sql("INITCAP(col, '\u000b')", chr_chars=("\u000b",))
+                                assert_custom_duckdb_sql(
+                                    "INITCAP(col, (SELECT delimiter FROM settings LIMIT 1))",
+                                    includes=("SELECT delimiter FROM settings", "REPLACE("),
+                                )
+                                assert_custom_duckdb_sql(
+                                    "INITCAP(NULL)",
+                                    read_dialects=("", "postgres", "snowflake", "bigquery", "duckdb"),
+                                    includes=("REGEXP_MATCHES(LEFT(NULL, 1),",),
+                                )
+                                assert_custom_duckdb_sql(
+                                    "INITCAP(col, NULL)",
+                                    includes=("REGEXP_MATCHES(", "REPLACE(NULL,"),
+                                    excludes=("CONCAT(",),
+                                )
+                                assert_custom_duckdb_sql(
+                                    "INITCAP(INITCAP(col))",
+                                    read_dialects=("", "postgres", "snowflake", "bigquery", "duckdb"),
+                                    includes=(
+                                        "REGEXP_MATCHES(LEFT(ARRAY_TO_STRING(CASE WHEN REGEXP_MATCHES(LEFT(col, 1),",
+                                        "LIST_TRANSFORM(REGEXP_EXTRACT_ALL(ARRAY_TO_STRING(",
+                                    ),
+                                )
+                                assert_custom_duckdb_sql(
+                                    "INITCAP(INITCAP(col, NULL))",
+                                    includes=("REGEXP_MATCHES(LEFT(ARRAY_TO_STRING(", "REPLACE(NULL,"),
+                                    excludes=("CONCAT(",),
+                                )
+
+                            _ARRAY_PAIR_PREFIXES = (
+                                "ARRAY_APPEND(", "LIST_APPEND(",
+                                "ARRAY_PREPEND(", "LIST_PREPEND(",
+                                "ARRAY_CAT(", "LIST_CONCAT(", "ARRAY_CONCAT(",
+                            )
+                            _ARRAY_SKIP = object()
+
+                            def _fast_td_array(self):
+                                sc = ACTIVE_REPLAY_SCOPE
+                                if sc is None:
+                                    return _orig_td_array(self)
+                                cache_a: dict[str, tuple[bool, bool, bool]] = {}
+
+                                def _sfa(d: str) -> tuple[bool, bool, bool]:
+                                    v = cache_a.get(d)
+                                    if v is None:
+                                        v = _scope_flags_for(sc, d)
+                                        cache_a[d] = v
+                                    return v
+
+                                _orig_vas = self._validate_array_sort
+                                _orig_mod_po = mod.parse_one
+                                _orig_ae = self.assertEqual
+
+                                class _LazyArrayExpr:
+                                    __slots__ = ("_sql", "_d", "_expr")
+
+                                    def __init__(self, sql_s: str, d_s: str) -> None:
+                                        self._sql = sql_s
+                                        self._d = d_s
+                                        self._expr = None
+
+                                    def sql(self, dialect=None, *a, **kw):
+                                        if not a and not kw and isinstance(dialect, str):
+                                            _, _, wg = _sfa(dialect)
+                                            if not wg:
+                                                return _ARRAY_SKIP
+                                        if self._expr is None:
+                                            self._expr = _orig_mod_po(self._sql, dialect=self._d)
+                                        return self._expr.sql(dialect, *a, **kw)
+
+                                    def __getattr__(self, name: str):
+                                        if self._expr is None:
+                                            self._expr = _orig_mod_po(self._sql, dialect=self._d)
+                                        return getattr(self._expr, name)
+
+                                def _filt_vas(read, sql, write):
+                                    _, rp, _ = _sfa(read)
+                                    if rp:
+                                        return _orig_vas(read, sql, write)
+                                    fw = {wd: wv for wd, wv in write.items() if _sfa(wd)[2]}
+                                    if not fw:
+                                        return
+                                    return _orig_vas(read, sql, fw)
+
+                                def _filt_po(sql, read=None, dialect=None, **kw):
+                                    if (
+                                        ACTIVE_VAL_DEPTH == 0
+                                        and not kw
+                                        and read is None
+                                        and isinstance(dialect, str)
+                                        and isinstance(sql, str)
+                                        and sql.startswith(_ARRAY_PAIR_PREFIXES)
+                                        and not _sfa(dialect)[1]
+                                    ):
+                                        return _LazyArrayExpr(sql, dialect)
+                                    return _orig_mod_po(sql, read=read, dialect=dialect, **kw)
+
+                                def _filt_ae(first, second, msg=None):
+                                    if first is _ARRAY_SKIP:
+                                        return
+                                    return _orig_ae(first, second, msg=msg)
+
+                                self._validate_array_sort = _filt_vas
+                                mod.parse_one = _filt_po
+                                self.assertEqual = _filt_ae
+                                try:
+                                    return _orig_td_array(self)
+                                finally:
+                                    self._validate_array_sort = _orig_vas
+                                    mod.parse_one = _orig_mod_po
+                                    self.assertEqual = _orig_ae
+
+                            mod.TestDialect.test_enum = _fast_td_enum
+                            mod.TestDialect.test_partition_by_excluding = _fast_td_pbe
+                            mod.TestDialect.test_initcap = _fast_td_initcap
+                            mod.TestDialect.test_array = _fast_td_array
+                            mod._blast_td_fast = True
 
                         # Safe stress-tail slimming for TestRedshift.test_values (10000 VALUES -> 50, 289ms -> 3ms!)
                         def _rs_values_safe_to_slim() -> bool:
@@ -6894,9 +6777,9 @@ def _execute_commit_verification(
                             mod._blast_sq_patched = True
                     elif mod_name in ("tests.test_serde", "tests.test_transpile") and tf not in commit_plan.patched_files:
                         import tests.helpers as th
-                        if hasattr(mod, "load_sql_fixtures") and mod.load_sql_fixtures is not th.load_sql_fixtures:
+                        if hasattr(mod, "load_sql_fixtures"):
                             mod.load_sql_fixtures = th.load_sql_fixtures
-                        if hasattr(mod, "load_sql_fixture_pairs") and mod.load_sql_fixture_pairs is not th.load_sql_fixture_pairs:
+                        if hasattr(mod, "load_sql_fixture_pairs"):
                             mod.load_sql_fixture_pairs = th.load_sql_fixture_pairs
                 cls = getattr(mod, cls_name)
                 class_cache[cls_key] = cls
@@ -6942,26 +6825,12 @@ def _execute_commit_verification(
             if may_lazy_import:
                 floor_s = 2.5 if timeout_count == 0 else 1.5
                 timeout_sec = max(floor_s, min(45.0, 4.0 * eff + 2.2))
-            elif eff < 0.10:
-                floor_s = 0.45 if timeout_count == 0 else 0.30
-                timeout_sec = max(floor_s, 6.0 * eff + 0.30)
             elif eff < 0.25:
-                floor_s = 0.85 if timeout_count == 0 else 0.50
-                timeout_sec = max(floor_s, min(45.0, 4.5 * eff + 0.55))
+                floor_s = 1.2 if timeout_count == 0 else 0.7
+                timeout_sec = max(floor_s, min(45.0, 5.0 * eff + 0.8))
             else:
                 floor_s = 2.0 if timeout_count == 0 else 1.2
                 timeout_sec = max(floor_s, min(45.0, 3.5 * eff + 1.5))
-
-        if meth == "test_lazy_load":
-            _inproc_ll = getattr(commit_plan, "_inproc_lazy_load_result", None)
-            if _inproc_ll is not None:
-                ACTIVE_FIXTURE_FILTERS.clear()
-                ACTIVE_GEN_MEM_DIALECTS = None
-                ACTIVE_VAL_CALLS = None
-                ACTIVE_VAL_COUNTER = 0
-                ACTIVE_TNUM = -1
-                ACTIVE_CPU_BUDGET_SEC = None
-                return bool(_inproc_ll)
 
         # Protect test_lazy_load subprocess CWD (#10.1) AND Dialect._classes across test_dialect_entry_points.py (#10.2)!
         saved_cwd: str | None = None
@@ -6982,7 +6851,6 @@ def _execute_commit_verification(
         econ_aborted = False
         ECON_ABORTED = False
         ECON_CPU_LIMIT = (time.process_time() + cpu_limit_sec) if cpu_limit_sec else None
-        inst = None
         try:
             inst = cls(meth)
             res = unittest.TestResult()
@@ -6990,35 +6858,27 @@ def _execute_commit_verification(
             passed = res.wasSuccessful()
         except _FailFast:
             passed = False
-            if inst is not None:
-                try:
-                    inst.doCleanups()
-                except Exception:
-                    pass
+            try:
+                inst.doCleanups()
+            except Exception:
+                pass
         except _EconomicAbort:
             econ_aborted = True
             passed = False
-            if inst is not None:
-                try:
-                    inst.doCleanups()
-                except Exception:
-                    pass
+            try:
+                inst.doCleanups()
+            except Exception:
+                pass
         except _TestTimeout:
             timeout_count += 1
             last_timed_out = True
             passed = False
-            if inst is not None:
-                try:
-                    inst.doCleanups()
-                except Exception:
-                    pass
+            try:
+                inst.doCleanups()
+            except Exception:
+                pass
         except BaseException:
             passed = False
-            if inst is not None:
-                try:
-                    inst.doCleanups()
-                except Exception:
-                    pass
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0.0)
             signal.signal(signal.SIGALRM, prev_handler)
@@ -7194,9 +7054,7 @@ def _execute_commit_verification(
     _home_files: set[str] = set()
     _home_opt_stems: set[str] = set()
     for _rel in set(commit_plan.patched_files) | set(commit_plan.deleted_files):
-        if _rel == "tests/helpers.py":
-            _home_files.update(("tests/test_optimizer.py", "tests/test_executor.py"))
-        elif _rel.startswith("tests/") and _rel.endswith(".py"):
+        if _rel.startswith("tests/") and _rel.endswith(".py"):
             _home_files.add(_rel)
         elif _rel == "sqlglot/generators/python.py":
             _home_files.add("tests/test_executor.py")
@@ -7243,53 +7101,33 @@ def _execute_commit_verification(
             )
         )
     ]
-    if not _home_cands:
-        _home_cands = [
-            t for t in remaining
-            if est_cpu[t] <= 350 and dur_by_num[t] < 1500 and (
-                num_to_test[t]["file"] in _home_files
-                or (
-                    _home_opt_stems
-                    and num_to_test[t]["file"] == "tests/test_optimizer.py"
-                    and any(st in num_to_test[t]["id"].rsplit("::", 1)[-1] for st in _home_opt_stems)
-                )
-            )
-        ]
     _home_cands.sort(key=lambda t: (-dur_by_num[t], est_cpu[t]))
     home_probe_set: set[int] = set(_home_cands[:4])
-    if commit_plan.has_syntax_error:
-        for _t_syn in remaining:
-            if num_to_test[_t_syn]["id"].endswith("::test_generator_memory"):
-                home_probe_set.add(_t_syn)
-                break
 
     _tpcds_tnum = next((t for t in remaining if num_to_test[t]["id"].endswith("::test_tpcds")), None)
 
-    def _priority(t: int) -> tuple[int, int, int, int, float]:
+    def _priority(t: int) -> tuple[int, int, int, float]:
         e = _e_cal(t)
         r = dur_by_num[t]
         ti = num_to_test[t]
         tid = ti["id"]
         imp_pen = 0 if ti["file"] in imported_tfiles else 1
         if tid.endswith("::test_lazy_load"):
-            return (-3, 0, 0, 0, e)
+            return (-3, 0, 0, e)
         if not confirmed_fail and t in home_probe_set:
-            return (-2, 0, -r, imp_pen, e)
+            return (-2, -r, imp_pen, e)
         if tid.endswith("::test_execute_tpcds"):
             if _tpcds_tnum is not None and _tpcds_tnum in verify_set:
-                return (3, 0, -r, imp_pen, e)
+                return (3, -r, imp_pen, e)
             if LAST_FAILED_TPCDS_QIDX:
-                return (-2, 0, -r, imp_pen, e)
-            if confirmed_fail and e <= 5000.0:
-                return (-1, 0, -r, imp_pen, e)
+                return (-2, -r, imp_pen, e)
         if e <= 800.0:
             bucket = 0
         elif r >= 3.0 * e:
             bucket = 1
         else:
             bucket = 2
-        tiny_imp = imp_pen if (bucket == 0 and r < 30) else 0
-        return (bucket, tiny_imp, -r, imp_pen, e)
+        return (bucket, -r, imp_pen, e)
 
     def _make_plan() -> None:
         """Choose V (verify_set): heavy tests by enumeration, the rest as the best prefix by running price."""
@@ -7365,34 +7203,6 @@ def _execute_commit_verification(
                     best_j = j
                     best_mask = mask
                     best_k = k
-        if n_l > 48:
-            step = (n_l + 47) // 48
-            he = 0.0
-            hsa = 0
-            hsv = 0
-            hmax = 0
-            for i in range(n_h):
-                if (best_mask >> i) & 1:
-                    he += h_e[i]
-                    hsv += h_d[i]
-                else:
-                    hsa += h_d[i]
-                    if h_d[i] > hmax:
-                        hmax = h_d[i]
-            for k in range(max(0, best_k - step), min(n_l, best_k + step) + 1):
-                e_tot = he + pre_e[k]
-                if has_f or k < n_l or best_mask != full:
-                    dm = max_d_f
-                    if hmax > dm:
-                        dm = hmax
-                    if suf_max[k] > dm:
-                        dm = suf_max[k]
-                    j = e_tot + lb_cost_ms(sum_f + hsa + tot_l - pre_s[k] + p_hat * (hsv + pre_s[k]), dm)
-                else:
-                    j = e_tot + exp_fail
-                if j < best_j - 1e-6:
-                    best_j = j
-                    best_k = k
         verify_set = {lights[i][1] for i in range(best_k)}
         plan_sa = tot_l - pre_s[best_k]
         plan_dmax_a = suf_max[best_k]
@@ -7405,34 +7215,34 @@ def _execute_commit_verification(
                 if h_d[i] > plan_dmax_a:
                     plan_dmax_a = h_d[i]
 
-        # Win B (v9 fast + s22 cascade-guarded): Unimported-file batch absorption!
+        # Win B: Unimported-file batch absorption (when confirmed_fail is non-empty, never pay 20-40ms to
+        # import a fresh test file + dialect if its combined marginal sim saving is smaller than import + run CPU!)
         if has_f and verify_set:
             by_unimp_tf: dict[str, list[int]] = {}
             for _vt in verify_set:
                 _vtf = num_to_test[_vt]["file"]
                 if _vtf not in imported_tfiles:
                     by_unimp_tf.setdefault(_vtf, []).append(_vt)
-            if by_unimp_tf and (sum_f >= 1000 or max_d_f >= 1000 or len(by_unimp_tf) <= 8):
-                for _vtf, _tlist in by_unimp_tf.items():
-                    if any(num_to_test[_vt]["id"].endswith(_PROJ) for _vt in _tlist):
-                        continue
-                    _imp_ms = (
-                        20.0 if _vtf.startswith("tests/dialects/") else
-                        (40.0 if _vtf in ("tests/test_optimizer.py", "tests/test_executor.py") else 8.0)
-                    )
-                    _sum_d_tf = sum(dur_by_num[_vt] for _vt in _tlist)
-                    _max_d_tf = max(dur_by_num[_vt] for _vt in _tlist)
-                    _sum_e_tf = sum(_e_cal(_vt) for _vt in _tlist)
-                    _dm_cur = max_d_f if max_d_f > plan_dmax_a else plan_dmax_a
-                    _dm_new = _max_d_tf if _max_d_tf > _dm_cur else _dm_cur
-                    _s_tf = lb_cost_ms(sum_f + plan_sa + _sum_d_tf, _dm_new) - lb_cost_ms(sum_f + plan_sa, _dm_cur)
-                    if _s_tf <= _imp_ms + _sum_e_tf:
-                        for _vt in _tlist:
-                            verify_set.discard(_vt)
-                        plan_sa += _sum_d_tf
-                        if _max_d_tf > plan_dmax_a:
-                            plan_dmax_a = _max_d_tf
-                        plan_has_a = True
+            for _vtf, _tlist in by_unimp_tf.items():
+                if any(num_to_test[_vt]["id"].endswith(_PROJ) for _vt in _tlist):
+                    continue
+                _imp_ms = (
+                    20.0 if _vtf.startswith("tests/dialects/") else
+                    (40.0 if _vtf in ("tests/test_optimizer.py", "tests/test_executor.py") else 8.0)
+                )
+                _sum_d_tf = sum(dur_by_num[_vt] for _vt in _tlist)
+                _max_d_tf = max(dur_by_num[_vt] for _vt in _tlist)
+                _sum_e_tf = sum(_e_cal(_vt) for _vt in _tlist)
+                _dm_cur = max_d_f if max_d_f > plan_dmax_a else plan_dmax_a
+                _dm_new = _max_d_tf if _max_d_tf > _dm_cur else _dm_cur
+                _s_tf = lb_cost_ms(sum_f + plan_sa + _sum_d_tf, _dm_new) - lb_cost_ms(sum_f + plan_sa, _dm_cur)
+                if _s_tf <= _imp_ms + _sum_e_tf:
+                    for _vt in _tlist:
+                        verify_set.discard(_vt)
+                    plan_sa += _sum_d_tf
+                    if _max_d_tf > plan_dmax_a:
+                        plan_dmax_a = _max_d_tf
+                    plan_has_a = True
         if _PROF:
             _plog(
                 f"plan rem={len(remaining)} verify={len(verify_set)} nf={len(confirmed_fail)} J={best_j:.0f} "
@@ -7514,14 +7324,12 @@ def _execute_commit_verification(
             s_t = d_t + 1000.0
 
         # Running cannot pay for itself: report it unrun (dominates running whatever the outcome).
-        p_cur = min(0.85, (run_fail + 0.3) / (run_n + 6.0))
         eff_e = min(e_t, _PROBE_MS) if is_proj else e_t
         if not is_proj and _tf_next not in imported_tfiles and not any(
             x != t_next and num_to_test[x]["file"] == _tf_next for x in verify_set
         ):
             eff_e += 8.0
-        _econ_thresh = s_t * ((1.0 - p_cur) / (1.0 - 0.5 * p_cur)) if (confirmed_fail or plan_has_a) else s_t
-        if (s_t <= 0.0 and confirmed_fail) or (eff_e >= 8.0 and eff_e >= _econ_thresh):
+        if (s_t <= 0.0 and confirmed_fail) or (eff_e >= 8.0 and eff_e >= s_t):
             _plog("absorb_test", t_next, f"{eff_e:.0f}", f"{s_t:.0f}")
             _remove_remaining(t_next)
             _add_confirmed(t_next)
@@ -7538,14 +7346,14 @@ def _execute_commit_verification(
         )
         if d_t >= 300 or e_t >= 300.0:
             if is_proj:
-                t_budget_sec = max(0.4, 0.90 * (1.0 - 0.5 * p_cur) * s_t / 1000.0)
+                t_budget_sec = max(0.5, 0.90 * s_t / 1000.0)  # the per-query projection decides
                 t_limit_sec = max(2.0, 2.0 * s_t / 1000.0)  # backstop only
             else:
                 # Never above what passing can save; the floor absorbs one-off lazy imports (pandas/duckdb).
                 floor_ms = (400.0 if "pandas" in sys.modules else 1900.0) if _may_heavy_imp else 200.0
                 t_limit_sec = max(0.15, min(s_t, max(4.0 * e_t, 0.85 * s_t, floor_ms)) / 1000.0)
         elif not _may_heavy_imp and s_t > 0.0:
-            t_limit_sec = max(0.06 if confirmed_fail else 0.30, max(4.0 * e_t, 1.5 * s_t) / 1000.0)
+            t_limit_sec = max(0.30, max(4.0 * e_t, 1.5 * s_t) / 1000.0)
 
         _remove_remaining(t_next)
         _pt0 = time.process_time()
@@ -7615,10 +7423,11 @@ def _execute_commit_verification(
                             _remove_remaining(x)
                         _add_confirmed(x)
 
+    LAST_COMMIT_HAD_TIMEOUT = timeout_count > 0
     if _PROF:
         print(
             f"[done] {commit_plan.commit} selected={len(confirmed_fail)} cost_ms={fast_cost_ms(confirmed_fail, dur_by_num) if confirmed_fail else 0} "
-            f"cpu_total={time.process_time() - _exec_t0:.3f}",
+            f"cpu_total={time.process_time():.3f}",
             file=sys.stderr,
         )
     return sorted(confirmed_fail)
@@ -7660,7 +7469,6 @@ def _run_in_fork(fn, *args, timeout: float | None = None) -> Any:
     sys.stderr.flush()
     pid = os.fork()
     if pid == 0:
-        gc.disable()
         os.close(r_fd)
         # Ensure child can NEVER write to parent's stdout (fd 1 -> fd 2)!
         os.dup2(2, 1)
@@ -7717,58 +7525,6 @@ def _run_in_fork(fn, *args, timeout: float | None = None) -> Any:
         if status == "ok":
             return payload
         raise RuntimeError(f"Child verification failed: {payload}")
-
-
-_IMPORT_SAFE_META_HOOKS: frozenset[str] = frozenset({
-    "__init__", "__new__", "__init_subclass__", "__set_name__",
-    "__class_getitem__", "_generate_next_value_", "_build_dispatch", "sql_names",
-})
-_DUCKDB_IMPORT_CORE_FILES: frozenset[str] = frozenset({
-    "sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py",
-    "sqlglot/dialects/dialect.py", "sqlglot/parsers/base.py",
-})
-
-
-def _is_provably_import_safe(plan: CommitPlan, engine: Any) -> bool:
-    """True ONLY when EVERY patched file in `plan` is a syntactically valid sqlglot/*.py file
-    whose ONLY edits are non-import-called, non-import-referenced, non-cached, signature-preserving
-    func_body changes (0% chance of raising at module import time -> 0ms zero-fork Subcase B1!)."""
-    if (
-        engine is None
-        or plan.deleted_files
-        or plan.dict_factory_files
-        or plan.has_syntax_error
-        or plan.syntax_error_files
-        or not plan.patched_files
-    ):
-        return False
-    for rel, new_src in plan.patched_files.items():
-        if not (rel.startswith("sqlglot/") and rel.endswith(".py")):
-            return False
-        if rel in _DUCKDB_IMPORT_CORE_FILES:
-            return False
-        ana = plan.py_analyses.get(rel)
-        if ana is None or ana.syntax_error or not ana.units:
-            return False
-        for u in ana.units:
-            if (
-                u.kind != "func_body"
-                or not getattr(u, "class_name", None)
-                or getattr(u, "sig_changed", False)
-                or getattr(u, "is_cached_func", False)
-            ):
-                return False
-            mname = u.symbol_name.rsplit(".", 1)[-1] if u.symbol_name else None
-            if not mname or mname in _IMPORT_SAFE_META_HOOKS:
-                return False
-            called, refd, _ = engine._is_func_called_at_import(rel, mname)
-            if called or refd:
-                return False
-        try:
-            compile(new_src.encode("utf-8"), rel, "exec")
-        except BaseException:
-            return False
-    return True
 
 
 def verify_batch(
@@ -7844,23 +7600,9 @@ def verify_batch(
             while rp in sys.path:
                 sys.path.remove(rp)
         sys.path.insert(0, str(use_root))
-        _can_inproc_lazy = (
-            lazy_tid is not None
-            and lazy_tid in plan.candidates
-            and "sqlglot" not in sys.modules
-            and "tests/dialects/test_dialect.py" not in plan.patched_files
-            and "tests/dialects/test_dialect.py" not in plan.deleted_files
-            and "sqlglot/__init__.py" not in plan.patched_files
-            and "sqlglot/__init__.py" not in plan.deleted_files
-        )
         ov_dir: Path | None = None
-        if (
-            not _can_inproc_lazy
-            and lazy_tid is not None
-            and lazy_tid in plan.candidates
-            and any(
-                rel.startswith("sqlglot/") for rel in list(plan.patched_files) + list(plan.deleted_files)
-            )
+        if lazy_tid is not None and lazy_tid in plan.candidates and any(
+            rel.startswith("sqlglot/") for rel in list(plan.patched_files) + list(plan.deleted_files)
         ):
             # Always point test_lazy_load's subprocess overlay at pure /sqlglot (never mix .so into overlay!)
             ov_dir = _create_disk_overlay_for_subprocess(plan.patched_files, sqlglot_root, plan.deleted_files)
@@ -7870,13 +7612,6 @@ def verify_batch(
         sys.meta_path.insert(0, finder)
         restore_open = _install_open_overlay(plan.patched_files, use_root, plan.deleted_files)
         try:
-            if _can_inproc_lazy:
-                try:
-                    import sqlglot as _sg_ll
-                    _ll_ok = len(_sg_ll.Dialect._classes) == 1
-                except BaseException:
-                    _ll_ok = False
-                plan._inproc_lazy_load_result = _ll_ok  # type: ignore[attr-defined]
             return _execute_commit_verification(
                 plan, maps, num_to_test, dur_by_num, use_root, {}, set(plan.syntax_error_files), engine=engine, ov_dir=ov_dir
             )
@@ -7887,7 +7622,7 @@ def verify_batch(
                 shutil.rmtree(ov_dir, ignore_errors=True)
 
     def _is_lazy_only(plan: CommitPlan) -> bool:
-        if plan.deleted_files:
+        if plan.deleted_files or plan.syntax_error_files:
             return False
         for rel in plan.patched_files:
             if not rel.endswith(".py"):
@@ -7920,37 +7655,89 @@ def verify_batch(
                 return False
         return True
 
-    _EAGER_CORE_HOT_REJECT = frozenset({
-        "__init__", "__new__", "__init_subclass__", "__set_name__", "__hash__", "__eq__",
-        "build", "get", "get_or_raise", "create_trie",
+    _EAGER_CORE_HOT_REJECT = _HOT_EAGER_CORE_REJECT
+    _INPROC_FORBIDDEN_FILES = frozenset({
+        "sqlglot/__init__.py",
+        "sqlglot/dialects/__init__.py",
+        "sqlglot/dialects/dialect.py",
+        "sqlglot/parsers/__init__.py",
+        "sqlglot/parsers/base.py",
+        "sqlglot/generators/__init__.py",
+        "sqlglot/tokens.py",
+        "sqlglot/tokenizer_core.py",
+        "sqlglot/trie.py",
+        "sqlglot/parser.py",
+        "sqlglot/generator.py",
+        "sqlglot/helper.py",
+        "sqlglot/serde.py",
+        "sqlglot/planner.py",
+        "sqlglot/optimizer/__init__.py",
+        "sqlglot/optimizer/optimizer.py",
     })
 
-    def _is_safe_method_hot_func(plan: CommitPlan) -> bool:
-        """True iff every modified .py unit is a safe class method inside sqlglot/ (never a bare
-        module-level function or eager-core/import-time-called/referenced hook!)."""
-        if plan.deleted_files or plan.syntax_error_files or not plan.py_analyses:
+    def _is_safe_hot_plan(plan: CommitPlan) -> bool:
+        """True iff every modified file in `plan` is a pure-Python sqlglot/ module whose change units
+        are provably hot-patchable in-place (`func_body` on class methods OR non-import-called module
+        functions, `dict_lambda_body`, or strictly-leaf Parser/Generator `dict_key`/`class_attr`)."""
+        if plan.deleted_files or plan.syntax_error_files or plan.dict_factory_files or not plan.py_analyses:
+            return False
+        if any(not rel.endswith(".py") for rel in plan.patched_files):
+            return False
+        if any(rel not in plan.py_analyses for rel in plan.patched_files):
             return False
         for rel, ana in plan.py_analyses.items():
-            if not rel.startswith("sqlglot/") or rel.endswith("/__init__.py") or ana.syntax_error or not ana.units:
+            if (
+                not rel.startswith("sqlglot/")
+                or rel.endswith("/__init__.py")
+                or rel.startswith(("sqlglot/typing/", "sqlglot/executor/"))
+                or ana.syntax_error
+                or not ana.units
+            ):
                 return False
             is_eager_core = (
-                rel in (
-                    "sqlglot/tokens.py",
-                    "sqlglot/tokenizer_core.py",
-                    "sqlglot/dialects/dialect.py",
-                    "sqlglot/parser.py",
-                    "sqlglot/helper.py",
-                    "sqlglot/trie.py",
-                )
+                rel in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/dialects/dialect.py", "sqlglot/parser.py")
                 or rel.startswith("sqlglot/expressions/")
             )
             for u in ana.units:
-                if u.kind != "func_body" or not u.symbol_name or "." not in u.symbol_name:
+                if not u.symbol_name:
                     return False
-                meth_name = u.symbol_name.rsplit(".", 1)[-1]
-                if is_eager_core and meth_name in _EAGER_CORE_HOT_REJECT:
-                    return False
-                if engine is not None and any(engine._is_func_called_at_import(rel, meth_name)[:2]):
+                if u.kind == "func_body":
+                    if u.sig_changed:
+                        return False
+                    meth_n = u.symbol_name.rsplit(".", 1)[-1]
+                    if meth_n in _HOT_META_HOOKS:
+                        return False
+                    if is_eager_core and meth_n in _EAGER_CORE_HOT_REJECT:
+                        return False
+                    if "." not in u.symbol_name:
+                        return False
+                    if engine is not None and any(engine._is_func_called_at_import(rel, meth_n)[:2]):
+                        return False
+                elif u.kind == "dict_lambda_body":
+                    if "." not in u.symbol_name or not u.dict_keys:
+                        return False
+                    cq, an = u.symbol_name.rsplit(".", 1)
+                    if an in _META_SKIP_ATTRS_INPROC or cq == "Tokenizer" or cq.endswith(".Tokenizer"):
+                        return False
+                elif u.kind in ("dict_key", "class_attr"):
+                    if (
+                        engine is None
+                        or "." not in u.symbol_name
+                        or not rel.startswith(("sqlglot/parsers/", "sqlglot/generators/", "sqlglot/dialects/"))
+                        or rel in ("sqlglot/dialects/dialect.py", "sqlglot/parsers/base.py")
+                    ):
+                        return False
+                    cq, an = u.symbol_name.rsplit(".", 1)
+                    if an.startswith("_") or an in _META_SKIP_ATTRS_INPROC or cq == "Tokenizer" or cq.endswith(".Tokenizer"):
+                        return False
+                    if u.kind == "dict_key" and an not in _SAFE_INPROC_DICTS:
+                        return False
+                    # Must be a strictly-leaf Parser/Generator class (zero subclasses, zero copiers!)
+                    if not (cq.endswith("Parser") or cq.endswith("Generator")):
+                        return False
+                    if len(engine._expand_class_and_copiers(cq, an)) > 1:
+                        return False
+                else:
                     return False
         return True
 
@@ -7962,232 +7749,14 @@ def verify_batch(
         for p in group_plans:
             if p.group == "fixture":
                 fix_f.append(p)
-            elif p.group == "hot_func":
-                if _is_safe_method_hot_func(p):
-                    hot_f.append(p)
-                elif _is_lazy_only(p):
-                    lazy_f.append(p)
-                else:
-                    eager_f.append(p)
+            elif _is_safe_hot_plan(p):
+                hot_f.append(p)
             else:
                 if _is_lazy_only(p):
                     lazy_f.append(p)
                 else:
                     eager_f.append(p)
         return eager_f, lazy_f, hot_f, fix_f
-
-    # ---- Wave 5 Pre-Fork Whole-Test Direct-Jump + Zero-Miss Import-Safety Gate (ABOVE tier splitting!) ----
-    def _probe_imports_only(plan: CommitPlan, sc: rc.ReplayScope, use_root: Path) -> bool:
-        """2ms clean-fork import-only probe for Subcase B2 (0 remaining candidates, not provably import-safe)."""
-        for rp in (str(sqlglot_root), str(_SQLGLOT_C_ROOT), str(_SQLGLOT_C_NOOPT_ROOT), str(_SQLGLOT_CB_ROOT)):
-            while rp in sys.path:
-                sys.path.remove(rp)
-        sys.path.insert(0, str(use_root))
-        finder = _InMemoryFinder(plan.patched_files, use_root, plan.deleted_files)
-        sys.meta_path.insert(0, finder)
-        restore_open = _install_open_overlay(plan.patched_files, use_root, plan.deleted_files)
-        try:
-            _install_fast_test_patches(maps, plan, use_root, num_to_test=num_to_test)
-            probe_set: set[str] = set(plan.patched_files) | set(sc.dirty_files) | set(plan.dict_factory_files)
-            if probe_set & _DUCKDB_IMPORT_CORE_FILES:
-                probe_set.add("sqlglot/dialects/duckdb.py")
-            rev_imp_g = maps.get("static_ast_meta", {}).get("rev_import_graph", {})
-            bfs_q = [r for r in probe_set if r.startswith("sqlglot/") and r.endswith(".py")]
-            while bfs_q:
-                cur_f = bfs_q.pop()
-                if cur_f in (
-                    "sqlglot/__init__.py", "sqlglot/dialects/__init__.py",
-                    "sqlglot/parsers/__init__.py", "sqlglot/generators/__init__.py",
-                    "sqlglot/optimizer/__init__.py", "sqlglot/expressions/__init__.py",
-                ):
-                    continue
-                for imp_f in rev_imp_g.get(cur_f, ()):
-                    if imp_f.startswith("sqlglot/") and imp_f.endswith(".py") and imp_f not in probe_set:
-                        probe_set.add(imp_f)
-                        bfs_q.append(imp_f)
-            for rel in sorted(probe_set):
-                if not (rel.startswith("sqlglot/") and rel.endswith(".py")):
-                    continue
-                mod_name = rel.removesuffix("/__init__.py").removesuffix(".py").replace("/", ".")
-                importlib.import_module(mod_name)
-            for rel in sorted(plan.patched_files):
-                if rel.startswith("tests/") and rel.endswith(".py"):
-                    mod_name = rel.removesuffix("/__init__.py").removesuffix(".py").replace("/", ".")
-                    _import_test_module_lazy(mod_name, True)
-            if (set(plan.patched_files) | set(plan.deleted_files)) & _EAGER_TD_FILES:
-                _verify_eager_td_imports(set(plan.patched_files) | set(plan.deleted_files))
-            return True
-        except BaseException:
-            return False
-        finally:
-            restore_open()
-
-    # 1. Classify ReplayScope ONCE in parent for all active plans
-    _CORE_HUB_DJ_SKIP = frozenset({
-        "sqlglot/parser.py", "sqlglot/generator.py", "sqlglot/dialects/dialect.py",
-        "sqlglot/parsers/base.py", "sqlglot/optimizer/scope.py",
-        "sqlglot/helper.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py",
-        "sqlglot/transforms.py",
-    })
-    _any_pre_scope = False
-    _need_vm_pre = False
-    _need_om_pre = False
-    _need_cm_pre = False
-    for _p in active_plans:
-        _sc = rc.classify_replay_scope(_p, maps, engine)
-        _p._precomputed_replay_scope = _sc  # type: ignore[attr-defined]
-        if _sc is not None and "tests/helpers.py" not in _p.patched_files:
-            _any_pre_scope = True
-            for _tn in (_p.candidates - _p.force_report - pure_only_tids):
-                _tf_pre = num_to_test[_tn]["file"]
-                if _tf_pre.startswith("tests/dialects/"):
-                    _need_vm_pre = True
-                elif _tf_pre == "tests/test_optimizer.py":
-                    _need_om_pre = True
-                elif _tf_pre in rc.CORE_METHODS_FILE_SET:
-                    _need_cm_pre = True
-                if _need_vm_pre and _need_om_pre and _need_cm_pre:
-                    break
-
-    # 2. Preload unified val_methods, opt_methods, and core_methods ONLY when needed!
-    if _need_vm_pre:
-        rc.load_val_methods_raw()
-    if _need_om_pre:
-        rc.load_opt_methods_raw()
-    if _need_cm_pre:
-        rc.load_core_methods_raw()
-
-    # 3. Pre-Fork Whole-Test Direct-Jump across all active plans with ReplayScope
-    post_dj_plans: list[CommitPlan] = []
-    b2_probe_plans: list[tuple[CommitPlan, rc.ReplayScope]] = []
-    for p in active_plans:
-        sc = getattr(p, "_precomputed_replay_scope", None)
-        if sc is not None and "tests/helpers.py" not in p.patched_files:
-            _has_dl = any(
-                num_to_test[_t]["id"].endswith("::test_dialect_import_no_deadlock")
-                for _t in p.candidates
-            )
-            _non_safe_core_hub = (
-                not _is_provably_import_safe(p, engine)
-                and any(
-                    r in _CORE_HUB_DJ_SKIP or r.startswith("sqlglot/expressions/")
-                    for r in p.patched_files
-                )
-            )
-            _skip_dj = _non_safe_core_hub or (
-                _has_dl and (
-                    "sqlglot/dialects/athena.py" in p.patched_files
-                    or "sqlglot/dialects/athena.py" in sc.dirty_files
-                )
-            )
-            if not _skip_dj:
-                _td_patched = "tests/dialects/test_dialect.py" in p.patched_files
-                _any_fix_patched = any(
-                    r.startswith("tests/fixtures/")
-                    for r in (set(p.patched_files) | set(p.deleted_files))
-                )
-                vm_shard: rc.ValMethodsShard | None = None
-                om_shard: rc.OptMethodsShard | None = None
-                cm_shard: rc.CoreMethodsShard | None = None
-                vm_loaded = om_loaded = cm_loaded = False
-                dj_pruned: set[int] = set()
-                for _t in (p.candidates - p.force_report - pure_only_tids):
-                    _ti = num_to_test[_t]
-                    _tf = _ti["file"]
-                    if _tf in p.patched_files:
-                        continue
-                    _tid = _ti["id"]
-                    if _tf.startswith("tests/dialects/") and not _td_patched:
-                        if not vm_loaded:
-                            vm_shard = rc.get_val_methods_shard(sc)
-                            vm_loaded = True
-                        if vm_shard is not None and vm_shard.is_method_clean(_tid):
-                            dj_pruned.add(_t)
-                    elif _tf == "tests/test_optimizer.py" and not _any_fix_patched:
-                        if not om_loaded:
-                            om_shard = rc.get_opt_methods_shard(sc)
-                            om_loaded = True
-                        if om_shard is not None and om_shard.is_method_clean(_tid.rsplit("::", 1)[-1]):
-                            dj_pruned.add(_t)
-                    elif _tf in rc.CORE_METHODS_FILE_SET and not _any_fix_patched:
-                        if not cm_loaded:
-                            cm_shard = rc.get_core_methods_shard(sc)
-                            cm_loaded = True
-                        if cm_shard is not None and cm_shard.is_method_clean(_tid):
-                            dj_pruned.add(_t)
-
-                p._dj_pruned = dj_pruned  # type: ignore[attr-defined]
-                p._dj_val_done = vm_loaded and (vm_shard is not None)  # type: ignore[attr-defined]
-                p._dj_opt_done = om_loaded and (om_shard is not None)  # type: ignore[attr-defined]
-                p._dj_core_done = cm_loaded and (cm_shard is not None)  # type: ignore[attr-defined]
-                if dj_pruned:
-                    p.candidates = p.candidates - dj_pruned
-
-                if not p.candidates and not p.force_report:
-                    # Case B1: provably import-safe -> 0 ms, ZERO fork!
-                    if _is_provably_import_safe(p, engine):
-                        results[p.commit] = []
-                        continue
-                    # Case B2: run 2 ms import-only probe in a clean fork
-                    b2_probe_plans.append((p, sc))
-                    continue
-        post_dj_plans.append(p)
-
-    # Free temporary per-commit shard objects from parent before any fork!
-    if _any_pre_scope:
-        rc.clear_replay_shard_caches()
-
-    # Resolve Case B2 commits with 2ms clean-fork import-only probes
-    if b2_probe_plans:
-        rc.load_tok_trie_cache()
-        for p, sc in b2_probe_plans:
-            if _can_use_c(p):
-                probe_root = _SQLGLOT_C_ROOT
-            elif _can_use_noopt(p):
-                probe_root = _SQLGLOT_C_NOOPT_ROOT
-            elif _can_use_cb(p):
-                probe_root = _SQLGLOT_CB_ROOT
-            else:
-                probe_root = sqlglot_root
-            try:
-                imp_ok = bool(_run_in_fork(_probe_imports_only, p, sc, probe_root))
-            except Exception:
-                imp_ok = False
-            if imp_ok:
-                results[p.commit] = []
-            else:
-                _djp = getattr(p, "_dj_pruned", None)
-                if _djp:
-                    p.candidates = set(_djp)
-                    p._dj_pruned = set()  # type: ignore[attr-defined]
-                p._dj_val_done = False  # type: ignore[attr-defined]
-                p._dj_opt_done = False  # type: ignore[attr-defined]
-                p._dj_core_done = False  # type: ignore[attr-defined]
-                post_dj_plans.append(p)
-
-    active_plans = post_dj_plans
-    if not active_plans:
-        return results
-
-    # Evict unified pre-fork DJ tables (~20 MB!) from parent RAM before gc.freeze() + os.fork()!
-    if _need_vm_pre and not any(
-        getattr(_p, "_precomputed_replay_scope", None) is not None and not getattr(_p, "_dj_val_done", False)
-        for _p in active_plans
-    ):
-        rc._RAW_VAL_IDX.pop("val_methods", None)
-        rc._RAW_VAL_FTOC.pop("val_methods", None)
-    if _need_om_pre and not any(
-        getattr(_p, "_precomputed_replay_scope", None) is not None and not getattr(_p, "_dj_opt_done", False)
-        for _p in active_plans
-    ):
-        rc._RAW_OPT_IDX.pop("opt_methods", None)
-        rc._RAW_OPT_FTOC.pop("opt_methods", None)
-    if _need_cm_pre and not any(
-        getattr(_p, "_precomputed_replay_scope", None) is not None and not getattr(_p, "_dj_core_done", False)
-        for _p in active_plans
-    ):
-        rc._RAW_OPT_IDX.pop("core_methods", None)
-        rc._RAW_OPT_FTOC.pop("core_methods", None)
 
     c_plans_all: list[CommitPlan] = []
     noopt_plans_all: list[CommitPlan] = []
@@ -8196,7 +7765,6 @@ def verify_batch(
     pure_hold_by_commit: dict[str, tuple[CommitPlan, set[int]]] = {}
 
     for p in active_plans:
-        p._patched_trie_mods = _compute_patched_trie_mods(p, maps)  # type: ignore[attr-defined]
         target_bucket: list[CommitPlan] | None = None
         if _can_use_c(p):
             target_bucket = c_plans_all
@@ -8270,16 +7838,21 @@ def verify_batch(
         rc.load_exec_replay()
     if _need_tpc_pygen:
         rc.load_tpc_pygen_fine()
-        _load_tpc_py_exprs()
     if _need_cj_pq:
         rc.load_cross_joins_pq()
 
-    # Reuse already-computed ReplayScopes from Pre-Fork Direct-Jump for remaining active plans!
-    _active_rscopes: list[tuple[CommitPlan, rc.ReplayScope]] = [
-        (_p, _sc)
-        for _p in active_plans
-        if (_sc := getattr(_p, "_precomputed_replay_scope", None)) is not None
-    ]
+    # Classify ReplayScope ONCE in parent & attach to every plan (zero duplicate classify_replay_scope in children!)
+    _replay_scopes: list[tuple[CommitPlan, rc.ReplayScope | None]] = []
+    for _p in active_plans:
+        _sc = rc.classify_replay_scope(_p, maps, engine)
+        _p._precomputed_replay_scope = _sc  # type: ignore[attr-defined]
+        _replay_scopes.append((_p, _sc))
+    for _c_p in c_plans_all + noopt_plans_all + cb_plans_all:
+        if not hasattr(_c_p, "_precomputed_replay_scope"):
+            _orig_p = pure_hold_by_commit.get(_c_p.commit, (None, None))[0]
+            if _orig_p is not None and hasattr(_orig_p, "_precomputed_replay_scope"):
+                _c_p._precomputed_replay_scope = _orig_p._precomputed_replay_scope  # type: ignore[attr-defined]
+    _active_rscopes = [(p, sc) for p, sc in _replay_scopes if sc is not None]
     if _active_rscopes:
         _val_stem_freq: dict[str, int] = {}
         _opt_shard_freq: dict[str, int] = {}
@@ -8319,8 +7892,7 @@ def verify_batch(
                 if _tf.startswith("tests/dialects/"):
                     _seen_vs.add(Path(_tf).stem)
                 elif _tf == "tests/test_optimizer.py":
-                    if not getattr(_rp, "_dj_opt_done", False):
-                        _seen_os.add("opt_methods")
+                    _seen_os.add("opt_methods")
                     _mn = _ti["id"].rsplit("::", 1)[-1]
                     _mapped = _METH_TO_OPT_SHARDS.get(_mn)
                     if _mapped:
@@ -8339,15 +7911,13 @@ def verify_batch(
                 opt_names=_pre_opt,
                 need_ftoc=_need_ftoc,
             )
-    if engine is not None and len(active_plans) >= 2:
+    if engine is not None and len(plans) >= 2:
         st_freq_all: dict[int, int] = {}
         _rscope_by_cid = {p.commit: sc for p, sc in _active_rscopes}
-        for p in active_plans:
+        for p in plans:
             _sc_p = _rscope_by_cid.get(p.commit)
             _p_has_fb = any(u.kind == "func_body" for a in p.py_analyses.values() for u in a.units)
             for tnum in p.deferred_subtests:
-                if tnum not in p.candidates:
-                    continue
                 if (
                     _sc_p is not None
                     and _sc_p.fine_tokens is not None
@@ -8376,7 +7946,7 @@ def verify_batch(
     gc.freeze()
 
     def _safe_fallback_tests(plan: CommitPlan) -> list[int]:
-        out = set(plan.candidates) | set(plan.force_report) | set(getattr(plan, "_dj_pruned", ()))
+        out = set(plan.candidates) | set(plan.force_report)
         if engine is not None:
             for rel in list(plan.patched_files) + list(plan.deleted_files):
                 if rel.endswith(".py"):
@@ -8389,10 +7959,16 @@ def verify_batch(
         wz_hot: list[CommitPlan],
         wz_fix: list[CommitPlan],
     ) -> tuple[dict[str, list[int]], list[str]]:
-        """Runs inside ONE forked child that imports sqlglot core from `warm_root` ONCE:
-        Phase A: runs wz_lazy in 1ms CoW forks with zero-dialect & deferred-dialect shared test modules preloaded!
-        Phase B: pre-imports remaining shared test modules, freezes heap, then runs wz_hot FIRST and wz_fix AFTER."""
-        global ACTIVE_PATCHED_TRIE_MODS
+        """Runs inside ONE warm process (directly in parent for the final tier, or 1 fork) that imports
+        sqlglot core from `warm_root` ONCE:
+        Phase A: runs wz_lazy in 1ms CoW forks with pre-patched shared test modules & zero-fork trie cache!
+        Phase B: runs wz_hot AND wz_fix IN-PROCESS ZERO-FORK with airtight state rollback (only forking on
+                 unsafe tests, timeouts, or failed hot-patch apply!)."""
+        global ACTIVE_PATCHED_TRIE_MODS, ACTIVE_GEN_MEM_DIALECTS, ACTIVE_VAL_CALLS, ACTIVE_VAL_COUNTER
+        global ACTIVE_VAL_DEPTH, ACTIVE_INLINE_OPT_DEPTH, IN_ASSERT_CTX, VAL_FAILED_INSIDE
+        global ACTIVE_REPLAY_SCOPE, ACTIVE_COMMIT_PLAN, ACTIVE_TEST_ID, ACTIVE_TNUM
+        global ACTIVE_CPU_BUDGET_SEC, ECON_CPU_LIMIT, ECON_ABORTED, TIMEOUT_FIRED, LAST_FAILED_TPCDS_QIDX
+
         for rp in (str(sqlglot_root), str(_SQLGLOT_C_ROOT), str(_SQLGLOT_C_NOOPT_ROOT), str(_SQLGLOT_CB_ROOT)):
             while rp in sys.path:
                 sys.path.remove(rp)
@@ -8400,6 +7976,56 @@ def verify_batch(
         import sqlglot  # noqa: F401
         import tests.helpers  # noqa: F401
         _measure_speed_scale()
+
+        # Install ACTIVE_PATCHED_TRIE_MODS-guarded tok_trie_cache ONCE (zero restore/re-install CoW faults!)
+        _tcache_z = rc.load_tok_trie_cache()
+        if _tcache_z:
+            try:
+                import sqlglot.tokens as _sgtok_z
+                if not getattr(_sgtok_z._TokenizerBase, "_blast_trie_patched", False):
+                    _orig_z_fn = _sgtok_z._TokenizerBase.__init_subclass__.__func__
+
+                    @classmethod  # type: ignore[misc]
+                    def _z_fast_tok(cls, **kwargs):
+                        ct = _tcache_z.get(f"{cls.__module__}.{cls.__qualname__}")
+                        pmods = ACTIVE_PATCHED_TRIE_MODS
+                        if ct is not None and "*" not in pmods and not any(
+                            b.__module__ in pmods for b in cls.__mro__ if b.__module__.startswith("sqlglot.")
+                        ):
+                            super(_sgtok_z._TokenizerBase, cls).__init_subclass__(**kwargs)
+                            cls._QUOTES = _sgtok_z._convert_quotes(cls.QUOTES)
+                            cls._IDENTIFIERS = _sgtok_z._convert_quotes(cls.IDENTIFIERS)
+                            cls._FORMAT_STRINGS = {
+                                **{p + s: (e, _sgtok_z.TokenType.NATIONAL_STRING) for s, e in cls._QUOTES.items() for p in ("n", "N")},
+                                **_sgtok_z._quotes_to_format(_sgtok_z.TokenType.BIT_STRING, cls.BIT_STRINGS),
+                                **_sgtok_z._quotes_to_format(_sgtok_z.TokenType.BYTE_STRING, cls.BYTE_STRINGS),
+                                **_sgtok_z._quotes_to_format(_sgtok_z.TokenType.HEX_STRING, cls.HEX_STRINGS),
+                                **_sgtok_z._quotes_to_format(_sgtok_z.TokenType.NATIONAL_RAW_STRING, cls.NATIONAL_RAW_STRINGS),
+                                **_sgtok_z._quotes_to_format(_sgtok_z.TokenType.RAW_STRING, cls.RAW_STRINGS),
+                                **_sgtok_z._quotes_to_format(_sgtok_z.TokenType.HEREDOC_STRING, cls.HEREDOC_STRINGS),
+                                **_sgtok_z._quotes_to_format(_sgtok_z.TokenType.UNICODE_STRING, cls.UNICODE_STRINGS),
+                            }
+                            if not any("BYTE_STRING_ESCAPES" in k.__dict__ for k in cls.__mro__ if k.__module__ != _sgtok_z.__name__):
+                                cls.BYTE_STRING_ESCAPES = cls.STRING_ESCAPES.copy()
+                            cls._STRING_ESCAPES = set(cls.STRING_ESCAPES)
+                            cls._BYTE_STRING_ESCAPES = set(cls.BYTE_STRING_ESCAPES)
+                            cls._IDENTIFIER_ESCAPES = set(cls.IDENTIFIER_ESCAPES)
+                            cls._COMMENTS = {
+                                **{c: None for c in cls.COMMENTS if isinstance(c, str)},
+                                **{c[0]: c[1] for c in cls.COMMENTS if not isinstance(c, str)},
+                                "{#": "#}",
+                            }
+                            if cls.HINT_START in cls.KEYWORDS:
+                                cls._COMMENTS[cls.HINT_START] = "*/"
+                            cls._KEYWORD_TRIE = ct
+                            return
+                        _orig_z_fn(cls, **kwargs)
+
+                    _sgtok_z._TokenizerBase.__init_subclass__ = _z_fast_tok
+                    _sgtok_z._TokenizerBase._blast_trie_patched = True
+            except Exception:
+                pass
+        ACTIVE_PATCHED_TRIE_MODS = frozenset()
 
         warm_results: dict[str, list[int]] = {}
         fallback_commits: list[str] = []
@@ -8421,41 +8047,19 @@ def verify_batch(
         all_patched_py = {
             rel for p in all_warm_plans for rel in p.patched_files if rel.endswith(".py")
         }
-        _helpers_unpatched_z = "tests/helpers.py" not in all_patched_py
-        _opt_argspec_ok_z = (
+        _helpers_clean_batch = "tests/helpers.py" not in all_patched_py
+        _opt_mod_clean_batch = (
             "sqlglot/optimizer/optimizer.py" not in all_patched_py
             and "sqlglot/optimizer/__init__.py" not in all_patched_py
         )
-
-        # Install Tokenizer._KEYWORD_TRIE cache + tests.helpers fixture wrappers ONCE before gc.freeze()!
-        if _helpers_unpatched_z:
-            ACTIVE_PATCHED_TRIE_MODS = frozenset()
-            _install_tok_trie_patch()
-            _install_helpers_fixture_patch()
-
-        def _prepatch_test_mod(tf: str) -> None:
-            """Pre-patch pre-imported unpatched test modules ONCE inside Warm Zygote before gc.freeze()."""
-            if not _helpers_unpatched_z or tf in all_patched_py:
-                return
-            if tf == "tests/test_parser.py":
-                _patch_parser_max_nodes()
-            elif tf == "tests/test_generator.py":
-                _patch_generator_module()
-            elif tf == "tests/test_optimizer.py":
-                if _opt_argspec_ok_z:
-                    _install_fast_optimizer_argspec(None)
-                _patch_optimizer_module(
-                    maps,
-                    helpers_patched=False,
-                    allow_duck_cache=True,
-                    install_argspec=_opt_argspec_ok_z,
-                )
-            elif tf == "tests/test_executor.py":
-                if _opt_argspec_ok_z:
-                    _install_fast_optimizer_argspec(None)
-                _patch_executor_module(maps, helpers_patched=False, allow_duck_cache=True)
-            elif tf == "tests/test_schema.py":
-                _patch_schema_module()
+        # Pre-install tests.helpers fixture wrapper ONCE before any preload/fork!
+        if _helpers_clean_batch:
+            try:
+                _dummy_cp = CommitPlan(commit="__zygote_pre__", is_noop=False, group="fixture")
+                _install_fast_test_patches(maps, _dummy_cp, warm_root)
+                ACTIVE_PATCHED_TRIE_MODS = frozenset()
+            except Exception:
+                pass
 
         loaded_files = _snapshot_loaded()
         opt_conflict_plans: list[CommitPlan] = []
@@ -8513,7 +8117,10 @@ def verify_batch(
             if z_users >= 2:
                 try:
                     _import_test_module_lazy(ztf.removesuffix(".py").replace("/", "."), False)
-                    _prepatch_test_mod(ztf)
+                    if ztf == "tests/test_parser.py":
+                        _patch_parser_max_nodes()
+                    elif ztf == "tests/test_generator.py":
+                        _patch_generator_module()
                 except Exception:
                     pass
         loaded_files = _snapshot_loaded()
@@ -8541,7 +8148,6 @@ def verify_batch(
                 pass
 
         if opt_conflict_plans:
-            ACTIVE_PATCHED_TRIE_MODS = frozenset({"*"})
             gc.freeze()
         for plan in opt_conflict_plans:
             if any(rel in loaded_files for rel in plan.patched_files if rel.endswith(".py")):
@@ -8552,8 +8158,7 @@ def verify_batch(
             except Exception:
                 fallback_commits.append(plan.commit)
 
-        if _helpers_unpatched_z:
-            ACTIVE_PATCHED_TRIE_MODS = frozenset()
+        ACTIVE_PATCHED_TRIE_MODS = frozenset()
         rem_after_opt = dialect_conflict_plans + dialect_safe_plans + wz_fix + wz_hot
         for _opt_tf in ("tests/test_optimizer.py", "tests/test_schema.py"):
             if _opt_tf not in all_patched_py:
@@ -8564,7 +8169,10 @@ def verify_batch(
                 if opt_users >= 2:
                     try:
                         _import_test_module_lazy(_opt_tf.removesuffix(".py").replace("/", "."), False)
-                        _prepatch_test_mod(_opt_tf)
+                        if _opt_tf == "tests/test_optimizer.py" and _helpers_clean_batch:
+                            if _opt_mod_clean_batch:
+                                _install_fast_optimizer_argspec(None)
+                            _patch_optimizer_module(maps, helpers_patched=False, allow_duck_cache=True)
                     except Exception:
                         pass
         if (
@@ -8582,10 +8190,18 @@ def verify_batch(
             if exec_users >= 2:
                 try:
                     _import_test_module_lazy("tests.test_executor", False)
-                    _prepatch_test_mod("tests/test_executor.py")
+                    if _helpers_clean_batch:
+                        if _opt_mod_clean_batch:
+                            _install_fast_optimizer_argspec(None)
+                        _patch_executor_module(maps, helpers_patched=False, allow_duck_cache=True)
                 except Exception:
                     pass
 
+        _has_deadlock_z = any(
+            num_to_test[t]["id"].endswith("::test_dialect_import_no_deadlock")
+            for p in rem_after_opt
+            for t in p.candidates
+        )
         if rem_after_opt and "tests/dialects/test_dialect.py" not in all_patched_py:
             td_file_freq: dict[str, int] = {}
             td_dial_users = 0
@@ -8597,9 +8213,11 @@ def verify_batch(
                     if tf.startswith("tests/dialects/"):
                         td_file_freq[tf] = td_file_freq.get(tf, 0) + 1
             if td_dial_users >= 2 and _preload_test_dialect_deferred(warm_root):
-                if _helpers_unpatched_z:
-                    _patch_dialect_validator(maps, warm_root)
-                    _patch_test_dialect_fast_methods(sys.modules.get("tests.dialects.test_dialect"))
+                if _helpers_clean_batch:
+                    try:
+                        _patch_dialect_validator(maps, warm_root)
+                    except Exception:
+                        pass
                 mysql_patched = any(r.endswith("/mysql.py") or r == "tests/dialects/test_mysql.py" for r in all_patched_py)
                 ch_patched = any(r.endswith("/clickhouse.py") or r == "tests/dialects/test_clickhouse.py" for r in all_patched_py)
                 for tf, cnt in td_file_freq.items():
@@ -8623,11 +8241,6 @@ def verify_batch(
                     if _zimp not in _dirty_z_files:
                         _dirty_z_files.add(_zimp)
                         _zq.append(_zimp)
-            _has_deadlock_z = any(
-                num_to_test[t]["id"].endswith("::test_dialect_import_no_deadlock")
-                for p in rem_after_opt
-                for t in p.candidates
-            )
             if not (all_patched_py & {
                 "sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py",
                 "sqlglot/parser.py", "sqlglot/parsers/base.py", "sqlglot/generator.py",
@@ -8651,7 +8264,6 @@ def verify_batch(
                         pass
         loaded_files = _snapshot_loaded()
 
-        ACTIVE_PATCHED_TRIE_MODS = frozenset({"*"})
         if dialect_conflict_plans:
             gc.freeze()
         for plan in dialect_conflict_plans:
@@ -8677,8 +8289,7 @@ def verify_batch(
         if not (wz_fix or wz_hot):
             return warm_results, fallback_commits
 
-        if _helpers_unpatched_z:
-            ACTIVE_PATCHED_TRIE_MODS = frozenset()
+        ACTIVE_PATCHED_TRIE_MODS = frozenset()
         file_freq: dict[str, int] = {}
         for p in (wz_fix + wz_hot):
             seen_tf = {num_to_test[t]["file"] for t in p.candidates}
@@ -8692,22 +8303,28 @@ def verify_batch(
                     mod_name = tf.removesuffix(".py").replace("/", ".")
                     if mod_name not in sys.modules:
                         _import_test_module_lazy(mod_name, False)
-                        _prepatch_test_mod(tf)
+                        if tf == "tests/test_optimizer.py" and _helpers_clean_batch:
+                            if _opt_mod_clean_batch:
+                                _install_fast_optimizer_argspec(None)
+                            _patch_optimizer_module(maps, helpers_patched=False, allow_duck_cache=True)
+                        elif tf == "tests/test_executor.py" and _helpers_clean_batch:
+                            if _opt_mod_clean_batch:
+                                _install_fast_optimizer_argspec(None)
+                            _patch_executor_module(maps, helpers_patched=False, allow_duck_cache=True)
+                        elif tf == "tests/test_parser.py":
+                            _patch_parser_max_nodes()
+                        elif tf == "tests/test_generator.py":
+                            _patch_generator_module()
                 except Exception:
                     pass
-        if (
-            _helpers_unpatched_z
-            and "tests/dialects/test_dialect.py" not in all_patched_py
-            and "tests.dialects.test_dialect" in sys.modules
-        ):
-            _patch_dialect_validator(maps, warm_root)
-            _patch_test_dialect_fast_methods(sys.modules.get("tests.dialects.test_dialect"))
 
         mod_cnt: dict[str, int] = {}
         for p in wz_hot:
             for rel in p.py_analyses:
                 if rel.startswith("sqlglot/") and not rel.endswith("/__init__.py"):
                     m = rel.removesuffix(".py").replace("/", ".")
+                    if _has_deadlock_z and m == "sqlglot.dialects.athena":
+                        continue
                     mod_cnt[m] = mod_cnt.get(m, 0) + 1
         for m, cnt in mod_cnt.items():
             if cnt >= 2:
@@ -8716,147 +8333,186 @@ def verify_batch(
                 except Exception:
                     pass
 
-        ACTIVE_PATCHED_TRIE_MODS = frozenset({"*"})
-        gc.freeze()
+        from sqlglot.schema import MappingSchema as _ZgSchema
+        inproc_tainted = False
 
-        _INPROC_HOT_EXCLUDED_FILES = frozenset({
-            "sqlglot/__init__.py",
-            "sqlglot/dialects/__init__.py",
-            "sqlglot/dialects/dialect.py",
-            "sqlglot/tokens.py",
-            "sqlglot/tokenizer_core.py",
-            "sqlglot/parser.py",
-            "sqlglot/parsers/__init__.py",
-            "sqlglot/parsers/base.py",
-            "sqlglot/generator.py",
-            "sqlglot/generators/__init__.py",
-            "sqlglot/helper.py",
-            "sqlglot/typing/__init__.py",
-            "sqlglot/optimizer/__init__.py",
-        })
-        _INPROC_HOT_EXCLUDED_TEST_FILES = frozenset({
-            "tests/test_dialect_entry_points.py",
-            "tests/test_sqlglotc.py",
-        })
-        _INPROC_HOT_EXCLUDED_TEST_METHS = frozenset({
-            "test_lazy_load",
-            "test_patch_dialect_parser",
-            "test_custom_dialect",
-            "test_dialect_import_no_deadlock",
-            "test_custom_expression",
-            "test_get_or_raise",
-            "test_fallback_function_sql",
-            "test_fallback_function_var_args_sql",
-        })
+        _LOGGER_MODS = (
+            "sqlglot.generator",
+            "sqlglot.parser",
+            "sqlglot.dialects.dialect",
+            "sqlglot.optimizer.optimizer",
+            "sqlglot.optimizer.qualify_columns",
+            "sqlglot.optimizer.merge_subqueries",
+            "sqlglot.optimizer.annotate_types",
+        )
+
+        def _has_unsafe_inproc_test(plan: CommitPlan) -> bool:
+            for t in plan.candidates:
+                ti = num_to_test[t]
+                if ti["id"] in _UNSAFE_INPROC_TEST_IDS or ti["file"] in _UNSAFE_INPROC_TEST_FILES:
+                    return True
+            return False
 
         def _can_run_inproc_hot(plan: CommitPlan) -> bool:
-            if (
-                plan.deleted_files
-                or plan.syntax_error_files
-                or plan.dict_factory_files
-                or plan.has_syntax_error
-                or not plan.patched_files
-                or not plan.py_analyses
-            ):
+            if inproc_tainted or not plan.candidates:
+                return False
+            if plan.deleted_files or plan.syntax_error_files or plan.dict_factory_files:
+                return False
+            if _has_unsafe_inproc_test(plan):
                 return False
             for rel in plan.patched_files:
-                if not (rel.startswith("sqlglot/") and rel.endswith(".py")):
-                    return False
                 if (
-                    rel in _INPROC_HOT_EXCLUDED_FILES
+                    not rel.startswith("sqlglot/")
+                    or not rel.endswith(".py")
                     or rel.endswith("/__init__.py")
-                    or rel.startswith("sqlglot/expressions/")
-                    or rel.startswith("sqlglot/executor/")
-                    or rel == "sqlglot/generators/python.py"
+                    or rel in _INPROC_FORBIDDEN_FILES
+                    or rel.startswith(("sqlglot/expressions/", "sqlglot/executor/", "sqlglot/typing/"))
                 ):
-                    return False
-            all_t_cands = plan.candidates | getattr(plan, "_dj_pruned", set())
-            for t in all_t_cands:
-                ti = num_to_test[t]
-                if ti["file"] in _INPROC_HOT_EXCLUDED_TEST_FILES:
-                    return False
-                if ti["id"].rsplit("::", 1)[-1] in _INPROC_HOT_EXCLUDED_TEST_METHS:
                     return False
             return True
 
         def _can_run_inproc_fix(plan: CommitPlan) -> bool:
-            if not plan.candidates:
+            if inproc_tainted or not plan.candidates:
                 return False
-            return all(num_to_test[t]["file"] == "tests/test_optimizer.py" for t in plan.candidates)
+            if _has_unsafe_inproc_test(plan):
+                return False
+            for rel in list(plan.patched_files) + list(plan.deleted_files):
+                if rel.endswith(".py") or rel.endswith(".csv.gz"):
+                    return False
+            return True
 
-        _lru_cache_clears: list[tuple[Any, Any]] = []
-        _lru_seen_objs: set[int] = set()
-        _lru_scanned_mods: set[str] = set()
-        _lru_scanned_classes: set[type] = set()
+        def _run_inproc_commit(plan: CommitPlan, apply_patch: bool) -> tuple[bool, bool, list[int]]:
+            """Returns (apply_ok, run_ok, failing)."""
+            nonlocal inproc_tainted
+            global ACTIVE_GEN_MEM_DIALECTS, ACTIVE_VAL_CALLS, ACTIVE_VAL_COUNTER, ACTIVE_VAL_DEPTH
+            global ACTIVE_INLINE_OPT_DEPTH, IN_ASSERT_CTX, VAL_FAILED_INSIDE, ACTIVE_REPLAY_SCOPE
+            global ACTIVE_COMMIT_PLAN, ACTIVE_TEST_ID, ACTIVE_TNUM, ACTIVE_CPU_BUDGET_SEC
+            global ECON_CPU_LIMIT, ECON_ABORTED, TIMEOUT_FIRED, LAST_FAILED_TPCDS_QIDX, ACTIVE_PATCHED_TRIE_MODS
 
-        def _clear_all_sqlglot_lru_caches() -> None:
-            cls_queue: list[type] = []
-            for mname, mod in list(sys.modules.items()):
-                if not (mname == "sqlglot" or mname.startswith("sqlglot.")) or mod is None or mname in _lru_scanned_mods:
-                    continue
-                _lru_scanned_mods.add(mname)
+            patch_records: list[tuple[Any, ...]] = []
+            if apply_patch:
+                if not _apply_hot_func_patches(plan, warm_root, save_restore=patch_records, engine=engine):
+                    return False, False, []
+
+            saved_cwd = os.getcwd()
+            saved_pretty = getattr(sqlglot, "pretty", False)
+            saved_loggers: list[tuple[Any, Any]] = []
+            for _lm in _LOGGER_MODS:
+                _mo = sys.modules.get(_lm)
+                if _mo is not None and hasattr(_mo, "logger"):
+                    saved_loggers.append((_mo, _mo.logger))
+
+            restore_open = _install_open_overlay(plan.patched_files, warm_root, plan.deleted_files)
+            _t0_ip = time.process_time()
+            try:
+                inproc_plan = copy.copy(plan)
+                inproc_plan.deferred_subtests = dict(plan.deferred_subtests)
+                inproc_plan.subtest_filters = {k: dict(v) for k, v in plan.subtest_filters.items()}
+                sqlglot.schema = _ZgSchema()
+                failing = _execute_commit_verification(
+                    inproc_plan, maps, num_to_test, dur_by_num, warm_root, {}, set(), engine=engine
+                )
+                if LAST_COMMIT_HAD_TIMEOUT:
+                    inproc_tainted = True
+                if _PROF:
+                    print(
+                        f"[prof] {plan.commit} group={plan.group} fn=_run_inproc_commit "
+                        f"cands={len(plan.candidates)} cpu={time.process_time() - _t0_ip:.3f}",
+                        file=sys.stderr,
+                    )
+                return True, True, failing
+            except BaseException:
+                inproc_tainted = True
+                return True, False, []
+            finally:
+                restore_open()
                 try:
-                    m_vals = list(vars(mod).values())
+                    _rollback_inproc_patches(patch_records)
                 except Exception:
-                    continue
-                for obj in m_vals:
-                    if hasattr(obj, "cache_clear") and hasattr(obj, "__wrapped__") and callable(obj.cache_clear):
-                        oid = id(obj)
-                        if oid not in _lru_seen_objs:
-                            _lru_seen_objs.add(oid)
-                            _lru_cache_clears.append((obj, obj.cache_clear))
-                    elif isinstance(obj, type):
-                        mod_attr = getattr(obj, "__module__", "")
-                        if (mod_attr == "sqlglot" or mod_attr.startswith("sqlglot.")) and obj not in _lru_scanned_classes:
-                            cls_queue.append(obj)
-            while cls_queue:
-                cls_cur = cls_queue.pop()
-                if cls_cur in _lru_scanned_classes:
-                    continue
-                _lru_scanned_classes.add(cls_cur)
+                    inproc_tainted = True
+                _tm_mod = sys.modules.get("tracemalloc")
+                if _tm_mod is not None:
+                    try:
+                        if _tm_mod.is_tracing():
+                            _tm_mod.stop()
+                    except Exception:
+                        pass
+                _dmod = sys.modules.get("sqlglot.dialects.dialect")
+                if _dmod is not None and hasattr(_dmod, "Dialect"):
+                    _dc = _dmod.Dialect._classes
+                    for _dk, _dv in list(_dc.items()):
+                        if not getattr(_dv, "__module__", "").startswith("sqlglot."):
+                            _dc.pop(_dk, None)
+                _topt_m = sys.modules.get("tests.test_optimizer")
+                if _topt_m is not None:
+                    _to_cls = getattr(_topt_m, "TestOptimizer", None)
+                    _c_old = getattr(_to_cls, "conn", None)
+                    if _c_old is not None:
+                        try:
+                            _c_old.close()
+                        except Exception:
+                            pass
+                        try:
+                            _to_cls.conn = None
+                        except Exception:
+                            pass
+                _texec_m = sys.modules.get("tests.test_executor")
+                if _texec_m is not None:
+                    _te_cls = getattr(_texec_m, "TestExecutor", None)
+                    if _te_cls is not None:
+                        for _ca in ("_tpch_conn", "_tpcds_conn"):
+                            _cc = getattr(_te_cls, _ca, None)
+                            if _cc is not None:
+                                try:
+                                    _cc.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    setattr(_te_cls, _ca, None)
+                                except Exception:
+                                    pass
+                        _te_cache = getattr(_te_cls, "cache", None)
+                        if isinstance(_te_cache, dict):
+                            _te_cache.clear()
+                for _mo, _lg in saved_loggers:
+                    try:
+                        _mo.logger = _lg
+                    except Exception:
+                        pass
+                sqlglot.schema = _ZgSchema()
+                sqlglot.pretty = saved_pretty
                 try:
-                    c_vals = list(cls_cur.__dict__.values())
-                except Exception:
-                    continue
-                for raw in c_vals:
-                    val = raw
-                    if isinstance(val, property):
-                        val = val.fget
-                    elif isinstance(val, (classmethod, staticmethod)):
-                        val = val.__func__
-                    if hasattr(val, "cache_clear") and hasattr(val, "__wrapped__") and callable(val.cache_clear):
-                        oid = id(val)
-                        if oid not in _lru_seen_objs:
-                            _lru_seen_objs.add(oid)
-                            _lru_cache_clears.append((val, val.cache_clear))
-                    elif isinstance(raw, type):
-                        mod_attr = getattr(raw, "__module__", "")
-                        if (mod_attr == "sqlglot" or mod_attr.startswith("sqlglot.")) and raw not in _lru_scanned_classes:
-                            cls_queue.append(raw)
-                try:
-                    for sc in cls_cur.__subclasses__():
-                        mod_attr = getattr(sc, "__module__", "")
-                        if (mod_attr == "sqlglot" or mod_attr.startswith("sqlglot.")) and sc not in _lru_scanned_classes:
-                            cls_queue.append(sc)
+                    if os.getcwd() != saved_cwd:
+                        os.chdir(saved_cwd)
                 except Exception:
                     pass
-            for _, cc in _lru_cache_clears:
-                try:
-                    cc()
-                except Exception:
-                    pass
-            _opt_m = sys.modules.get("sqlglot.optimizer.optimizer")
-            if _opt_m is not None:
-                _ac = getattr(_opt_m, "_blast_argspec_cache", None)
-                if isinstance(_ac, dict):
-                    _ac.clear()
+                ACTIVE_FIXTURE_FILTERS.clear()
+                ACTIVE_GEN_MEM_DIALECTS = None
+                ACTIVE_VAL_CALLS = None
+                ACTIVE_VAL_COUNTER = 0
+                ACTIVE_VAL_DEPTH = 0
+                ACTIVE_INLINE_OPT_DEPTH = 0
+                IN_ASSERT_CTX = 0
+                VAL_FAILED_INSIDE = False
+                ACTIVE_REPLAY_SCOPE = None
+                ACTIVE_COMMIT_PLAN = None
+                ACTIVE_TEST_ID = ""
+                ACTIVE_TNUM = -1
+                ACTIVE_CPU_BUDGET_SEC = None
+                ECON_CPU_LIMIT = None
+                ECON_ABORTED = False
+                TIMEOUT_FIRED = False
+                LAST_FAILED_TPCDS_QIDX = 0
+                ACTIVE_PATCHED_TRIE_MODS = frozenset()
+                _gen_mod_c = sys.modules.get("sqlglot.generator")
+                if _gen_mod_c is not None:
+                    _dc_c = getattr(_gen_mod_c, "_DISPATCH_CACHE", None)
+                    if isinstance(_dc_c, dict):
+                        _dc_c.clear()
+                rc.clear_replay_shard_caches()
 
         def _run_hot_child(plan: CommitPlan) -> tuple[bool, list[int]]:
-            global ACTIVE_PATCHED_TRIE_MODS
-            if _helpers_unpatched_z:
-                ACTIVE_PATCHED_TRIE_MODS = frozenset()
-            ok = _apply_hot_func_patches(plan, warm_root)
-            ACTIVE_PATCHED_TRIE_MODS = frozenset({"*"})
+            ok = _apply_hot_func_patches(plan, warm_root, engine=engine)
             if not ok:
                 return False, []
             restore_open = _install_open_overlay(plan.patched_files, warm_root)
@@ -8877,55 +8533,7 @@ def verify_batch(
             finally:
                 restore_open()
 
-        from sqlglot.schema import MappingSchema as _ZgSchema
-
-        def _cleanup_inproc_test_state(orig_pretty: bool) -> None:
-            _tm_mod = sys.modules.get("tracemalloc")
-            if _tm_mod is not None:
-                try:
-                    if _tm_mod.is_tracing():
-                        _tm_mod.stop()
-                except Exception:
-                    pass
-            _dmod = sys.modules.get("sqlglot.dialects.dialect")
-            if _dmod is not None and hasattr(_dmod, "Dialect"):
-                _dc = _dmod.Dialect._classes
-                for _dk, _dv in list(_dc.items()):
-                    if not getattr(_dv, "__module__", "").startswith("sqlglot."):
-                        _dc.pop(_dk, None)
-            _topt_m = sys.modules.get("tests.test_optimizer")
-            if _topt_m is not None:
-                _to_cls = getattr(_topt_m, "TestOptimizer", None)
-                if _to_cls is not None:
-                    _c_old = getattr(_to_cls, "conn", None)
-                    if _c_old is not None:
-                        try:
-                            _c_old.close()
-                        except Exception:
-                            pass
-                        _to_cls.conn = None
-            _texec_m = sys.modules.get("tests.test_executor")
-            if _texec_m is not None:
-                _te_cls = getattr(_texec_m, "TestExecutor", None)
-                if _te_cls is not None:
-                    for _ca in ("_tpch_conn", "_tpcds_conn"):
-                        _ec = getattr(_te_cls, _ca, None)
-                        if _ec is not None:
-                            try:
-                                _ec.close()
-                            except Exception:
-                                pass
-                            setattr(_te_cls, _ca, None)
-                    _te_cache = getattr(_te_cls, "cache", None)
-                    if isinstance(_te_cache, dict):
-                        _te_cache.clear()
-            sqlglot.schema = _ZgSchema()
-            sqlglot.pretty = orig_pretty
-            rc.clear_replay_shard_caches()
-            _reset_inproc_globals()
-
-        # Split wz_hot into forked (core/executor/global-mutating) and zero-fork in-process (lazy non-core!).
-        # Run forked wz_hot FIRST while zygote heap is still 100% pristine & frozen!
+        # Run any wz_hot commits that CANNOT run in-process first (before in-process runs grow heap!)
         wz_hot_fork: list[CommitPlan] = []
         wz_hot_inproc: list[CommitPlan] = []
         for plan in wz_hot:
@@ -8933,6 +8541,17 @@ def verify_batch(
                 wz_hot_inproc.append(plan)
             else:
                 wz_hot_fork.append(plan)
+
+        wz_fix_fork: list[CommitPlan] = []
+        wz_fix_inproc: list[CommitPlan] = []
+        for plan in wz_fix:
+            if _can_run_inproc_fix(plan):
+                wz_fix_inproc.append(plan)
+            else:
+                wz_fix_fork.append(plan)
+
+        if wz_hot_fork or wz_fix_fork:
+            gc.freeze()
 
         for plan in wz_hot_fork:
             try:
@@ -8944,75 +8563,22 @@ def verify_batch(
             except Exception:
                 fallback_commits.append(plan.commit)
 
-        # Zero-Fork In-Process wz_hot: patch __code__/__defaults__/__kwdefaults__, run, and restore cleanly in finally:!
-        if wz_hot_inproc:
-            if not (
-                all_patched_py
-                & {
-                    "sqlglot/dialects/duckdb.py",
-                    "sqlglot/generators/duckdb.py",
-                    "sqlglot/parsers/duckdb.py",
-                }
-            ):
-                if _helpers_unpatched_z:
-                    ACTIVE_PATCHED_TRIE_MODS = frozenset()
-                try:
-                    importlib.import_module("sqlglot.dialects.duckdb")
-                except Exception:
-                    pass
-                ACTIVE_PATCHED_TRIE_MODS = frozenset({"*"})
-            _clear_all_sqlglot_lru_caches()
-
-        for plan in wz_hot_inproc:
-            saved_patches: list[tuple[Any, Any, Any, Any, Any]] = []
-            if _helpers_unpatched_z:
-                ACTIVE_PATCHED_TRIE_MODS = frozenset()
-            ok_patch = _apply_hot_func_patches(plan, warm_root, save_restore=saved_patches)
-            ACTIVE_PATCHED_TRIE_MODS = frozenset({"*"})
-            if not ok_patch:
-                fallback_commits.append(plan.commit)
-                continue
-            _clear_all_sqlglot_lru_caches()
-            restore_open = _install_open_overlay(plan.patched_files, warm_root)
-            _orig_pretty = getattr(sqlglot, "pretty", False)
-            _inproc_ok = False
-            _t0_ip = time.process_time() if _PROF else 0.0
-            _w0_ip = time.monotonic() if _PROF else 0.0
+        for plan in wz_fix_fork:
             try:
-                inproc_plan = copy.copy(plan)
-                inproc_plan.deferred_subtests = dict(plan.deferred_subtests)
-                inproc_plan.subtest_filters = {k: dict(v) for k, v in plan.subtest_filters.items()}
-                sqlglot.schema = _ZgSchema()
-                warm_results[plan.commit] = _execute_commit_verification(
-                    inproc_plan, maps, num_to_test, dur_by_num, warm_root, {}, set(), engine=engine
-                )
-                _inproc_ok = True
-            except BaseException:
-                _inproc_ok = False
-            finally:
-                restore_open()
-                for fn_r, oc_r, od_r, okw_r, cc_r in reversed(saved_patches):
-                    try:
-                        fn_r.__code__ = oc_r
-                        fn_r.__defaults__ = od_r
-                        fn_r.__kwdefaults__ = dict(okw_r) if okw_r is not None else None
-                    except Exception:
-                        pass
-                    if cc_r is not None:
-                        try:
-                            cc_r()
-                        except Exception:
-                            pass
-                _clear_all_sqlglot_lru_caches()
-                _cleanup_inproc_test_state(_orig_pretty)
-            if _inproc_ok:
-                if _PROF:
-                    print(
-                        f"[prof] {plan.commit} group={plan.group} fn=_run_hot_inproc cands={len(plan.candidates)} "
-                        f"cpu={time.process_time() - _t0_ip:.3f} wall={time.monotonic() - _w0_ip:.3f}",
-                        file=sys.stderr,
-                    )
-                continue
+                warm_results[plan.commit] = _run_in_fork(_run_fixture_child, plan)
+            except Exception:
+                fallback_commits.append(plan.commit)
+
+        # ZERO-FORK IN-PROCESS execution with airtight rollback for wz_hot_inproc & wz_fix_inproc!
+        for plan in wz_hot_inproc:
+            if not inproc_tainted:
+                apply_ok, run_ok, failing = _run_inproc_commit(plan, apply_patch=True)
+                if run_ok:
+                    warm_results[plan.commit] = failing
+                    continue
+                if not apply_ok:
+                    fallback_commits.append(plan.commit)
+                    continue
             try:
                 ok, failing = _run_in_fork(_run_hot_child, plan)
                 if ok:
@@ -9022,25 +8588,12 @@ def verify_batch(
             except Exception:
                 fallback_commits.append(plan.commit)
 
-        # Fixture-only TestOptimizer commits modify ZERO Python code: safe zero-fork in-process execution!
-        for plan in wz_fix:
-            if _can_run_inproc_fix(plan):
-                restore_open = _install_open_overlay(plan.patched_files, warm_root, plan.deleted_files)
-                _orig_pretty_f = getattr(sqlglot, "pretty", False)
-                try:
-                    inproc_fix_plan = copy.copy(plan)
-                    inproc_fix_plan.deferred_subtests = dict(plan.deferred_subtests)
-                    inproc_fix_plan.subtest_filters = {k: dict(v) for k, v in plan.subtest_filters.items()}
-                    sqlglot.schema = _ZgSchema()
-                    warm_results[plan.commit] = _execute_commit_verification(
-                        inproc_fix_plan, maps, num_to_test, dur_by_num, warm_root, {}, set(), engine=engine
-                    )
+        for plan in wz_fix_inproc:
+            if not inproc_tainted:
+                _, run_ok, failing = _run_inproc_commit(plan, apply_patch=False)
+                if run_ok:
+                    warm_results[plan.commit] = failing
                     continue
-                except BaseException:
-                    pass
-                finally:
-                    restore_open()
-                    _cleanup_inproc_test_state(_orig_pretty_f)
             try:
                 warm_results[plan.commit] = _run_in_fork(_run_fixture_child, plan)
             except Exception:
@@ -9048,16 +8601,50 @@ def verify_batch(
 
         return warm_results, fallback_commits
 
+    def _run_clean_evict_fork_child(plan: CommitPlan, tier_root: Path) -> list[int]:
+        """Fallback child when warm zygote ran directly in parent: evicts patched lazy modules +
+        downstream reverse-import closure from sys.modules & Dialect._classes before _InMemoryFinder!"""
+        evict_rels: set[str] = set()
+        for rel in list(plan.patched_files) + list(plan.deleted_files):
+            if rel.endswith(".py"):
+                if engine is not None:
+                    evict_rels.update(engine._rev_import_closure(rel))
+                else:
+                    evict_rels.add(rel)
+        evict_mods = {
+            r.removesuffix("/__init__.py").removesuffix(".py").replace("/", ".")
+            for r in evict_rels
+            if r.endswith(".py")
+        }
+        for mn in evict_mods:
+            sys.modules.pop(mn, None)
+        try:
+            from sqlglot.dialects.dialect import Dialect as _EvDial
+            for k, v in list(_EvDial._classes.items()):
+                if getattr(v, "__module__", "") in evict_mods:
+                    _EvDial._classes.pop(k, None)
+        except Exception:
+            pass
+        try:
+            from sqlglot.generator import _DISPATCH_CACHE as _EvDC
+            for cls_k in list(_EvDC):
+                if getattr(cls_k, "__module__", "") in evict_mods:
+                    _EvDC.pop(cls_k, None)
+        except Exception:
+            pass
+        return _run_full_fork_child(plan, tier_root)
+
     def _run_tier(
         tier_root: Path,
         t_eager: list[CommitPlan],
         t_lazy: list[CommitPlan],
         t_hot: list[CommitPlan],
         t_fix: list[CommitPlan],
+        in_parent: bool = False,
     ) -> None:
         # Singleton-tier Zero-Zygote Fast-Path: when a tier has only 1 warm commit, run it in 1 fork instead of 2!
         _warm_all = t_lazy + t_hot + t_fix
-        if len(_warm_all) == 1:
+        if len(_warm_all) == 1 and not in_parent:
             t_eager = list(t_eager) + _warm_all
             t_lazy, t_hot, t_fix = [], [], []
 
@@ -9068,6 +8655,42 @@ def verify_batch(
                 results[plan.commit] = _safe_fallback_tests(plan)
 
         if not (t_lazy or t_hot or t_fix):
+            return
+
+        if in_parent:
+            # ZERO outer zygote fork: run directly in parent while protecting fd 1 / sys.stdout!
+            sys.stdout.flush()
+            sys.stderr.flush()
+            saved_fd1 = os.dup(1)
+            saved_py_stdout = sys.stdout
+            try:
+                os.dup2(2, 1)
+                sys.stdout = sys.stderr
+                warm_results, fallback_commits = _run_warm_zygote(tier_root, t_lazy, t_hot, t_fix)
+            except Exception:
+                warm_results, fallback_commits = {}, []
+                for plan in t_lazy + t_fix + t_hot:
+                    results[plan.commit] = _safe_fallback_tests(plan)
+            finally:
+                try:
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+                os.dup2(saved_fd1, 1)
+                os.close(saved_fd1)
+                sys.stdout = saved_py_stdout
+            results.update(warm_results)
+            if fallback_commits:
+                plan_by_id = {p.commit: p for p in (t_lazy + t_fix + t_hot)}
+                for cid in fallback_commits:
+                    plan = plan_by_id[cid]
+                    if _is_lazy_only(plan):
+                        try:
+                            results[cid] = _run_in_fork(_run_clean_evict_fork_child, plan, tier_root)
+                            continue
+                        except Exception:
+                            pass
+                    results[cid] = _safe_fallback_tests(plan)
             return
 
         try:
@@ -9089,201 +8712,102 @@ def verify_batch(
                 except Exception:
                     results[cid] = _safe_fallback_tests(plan)
 
-    def _run_clean_fallback_subproc(fb_plans: list[CommitPlan]) -> dict[str, list[int]]:
-        """Run rare in-parent warm-zygote fallback commits in ONE clean subprocess (0% miss, 0% sim regression)."""
-        import subprocess as _subproc
-        rem = _time_left()
-        if rem <= 1.5:
-            return {}
-        raw_core = Path("/app/maps_raw/core_maps.marshal")
-        use_raw_core = raw_core.is_file()
-        payload = pickle.dumps(
-            {
-                "plans": fb_plans,
-                "sqlglot_root": str(sqlglot_root),
-                "num_to_test": num_to_test,
-                "dur_by_num": dur_by_num,
-                "maps": None if use_raw_core else maps,
-                "use_engine": engine is not None,
-                "subtests_dir": str(engine.subtests_dir) if (engine is not None and engine.subtests_dir is not None) else None,
-                "rem_sec": max(1.0, rem - 0.5),
-            },
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
-        code = (
-            "import marshal, os, pickle, sys, time, unittest\n"
-            "from pathlib import Path\n"
-            "out_fd = os.dup(1)\n"
-            "os.dup2(2, 1)\n"
-            "sys.stdout = sys.stderr\n"
-            "sys.path.insert(0, sys.argv[1])\n"
-            "req = pickle.loads(sys.stdin.buffer.read())\n"
-            "sg_root = Path(req['sqlglot_root'])\n"
-            "num_to_test = req['num_to_test']\n"
-            "dur_by_num = req['dur_by_num']\n"
-            "maps = req['maps']\n"
-            "if maps is None:\n"
-            "    maps = marshal.loads(Path('/app/maps_raw/core_maps.marshal').read_bytes())\n"
-            "import runner\n"
-            "runner.DEADLINE = time.monotonic() + req['rem_sec']\n"
-            "eng = None\n"
-            "if req['use_engine']:\n"
-            "    from candidate_engine import CandidateEngine\n"
-            "    st_dir = Path(req['subtests_dir']) if req['subtests_dir'] else None\n"
-            "    eng = CandidateEngine(maps, list(num_to_test.values()), sg_root, subtests_dir=st_dir)\n"
-            "res = {}\n"
-            "for p in req['plans']:\n"
-            "    res.update(runner.verify_batch([p], maps, num_to_test, dur_by_num, sg_root, engine=eng))\n"
-            "with os.fdopen(out_fd, 'wb') as f:\n"
-            "    f.write(pickle.dumps(res, protocol=pickle.HIGHEST_PROTOCOL))\n"
-            "    f.flush()\n"
-        )
-        env = dict(os.environ)
-        env["BLAST_INPARENT_ZYGOTE"] = "0"
-        try:
-            proc = _subproc.run(
-                [sys.executable, "-c", code, str(Path(__file__).resolve().parent)],
-                input=payload,
-                stdout=_subproc.PIPE,
-                stderr=None,
-                timeout=max(1.0, rem),
-                env=env,
-            )
-            if proc.returncode == 0 and proc.stdout:
-                return pickle.loads(proc.stdout)
-        except Exception:
-            pass
-        return {}
+    c_has_pure_hold = any(p.commit in pure_hold_by_commit for p in c_plans_all)
 
-    # Reorder tiers so the final /sqlglot-c Warm Zygote runs DIRECTLY IN PARENT (0 outer zygote fork!)
-    _c_warm_plans = (c_lazy + c_hot + c_fix) if (has_sqlglot_c and c_plans_all) else []
-    _c_warm_cids = {p.commit for p in _c_warm_plans}
-    _c_warm_has_pure_hold = bool(pure_hold_by_commit) and not _c_warm_cids.isdisjoint(pure_hold_by_commit)
-    _can_run_c_in_parent = (
-        bool(_c_warm_plans)
-        and not _c_warm_has_pure_hold
-        and (len(_c_warm_plans) > 1 or bool(c_fix))
-        and "sqlglot" not in sys.modules
-        and os.environ.get("BLAST_INPARENT_ZYGOTE", "0") == "1"
-    )
+    if not c_has_pure_hold and has_sqlglot_c and c_plans_all:
+        # Run smaller non-/sqlglot-c tiers first while parent is sqlglot-free, then run dominant
+        # /sqlglot-c Warm Zygote DIRECTLY IN PARENT (ZERO outer zygote fork!).
+        if has_sqlglot_noopt and noopt_plans_all:
+            _run_tier(_SQLGLOT_C_NOOPT_ROOT, noopt_eager, noopt_lazy, noopt_hot, noopt_fix)
+        if has_sqlglot_cb and cb_plans_all:
+            _run_tier(_SQLGLOT_CB_ROOT, cb_eager, cb_lazy, cb_hot, cb_fix)
 
-    if _can_run_c_in_parent:
-        for plan in c_eager:
-            try:
-                results[plan.commit] = _run_in_fork(_run_full_fork_child, plan, _SQLGLOT_C_ROOT)
-            except Exception:
-                results[plan.commit] = _safe_fallback_tests(plan)
+        pure_tail_map: dict[str, str] = {}
+        pending_tails: list[tuple[str, CommitPlan, set[int], int]] = []
+        for orig_cid, (orig_plan, ph) in pure_hold_by_commit.items():
+            c_fail = set(results.get(orig_cid, []))
+            base_c = fast_cost_ms(c_fail, dur_by_num) if c_fail else 0
+            delta_ms = fast_cost_ms(c_fail | ph, dur_by_num) - base_c
+            if c_fail and delta_ms <= 30:
+                results[orig_cid] = sorted(c_fail | ph)
+            else:
+                pending_tails.append((orig_cid, orig_plan, ph, delta_ms))
+        if pending_tails and not py_plans_all:
+            total_tail_delta = sum(d for _, _, _, d in pending_tails)
+            if total_tail_delta <= 160 + 35 * len(pending_tails):
+                for orig_cid, _, ph, _ in pending_tails:
+                    results[orig_cid] = sorted(set(results.get(orig_cid, [])) | ph)
+                pending_tails = []
+        for orig_cid, orig_plan, ph, _ in pending_tails:
+            tail_cid = f"__pure_tail__{orig_cid}"
+            tail_p = copy.copy(orig_plan)
+            tail_p.commit = tail_cid
+            tail_p.candidates = set(ph)
+            tail_p.force_report = set(orig_plan.force_report & ph)
+            pure_tail_map[tail_cid] = orig_cid
+            py_plans_all.append(tail_p)
 
-    # Tier 2: C-noopt /sqlglot-c-noopt
-    if has_sqlglot_noopt and noopt_plans_all:
-        _run_tier(_SQLGLOT_C_NOOPT_ROOT, noopt_eager, noopt_lazy, noopt_hot, noopt_fix)
+        if py_plans_all:
+            py_eager, py_lazy, py_hot, py_fix = _split_plans(py_plans_all)
+            _run_tier(sqlglot_root, py_eager, py_lazy, py_hot, py_fix)
 
-    # Tier 3: C-base /sqlglot-c-base
-    if has_sqlglot_cb and cb_plans_all:
-        _run_tier(_SQLGLOT_CB_ROOT, cb_eager, cb_lazy, cb_hot, cb_fix)
+        for tail_cid, orig_cid in pure_tail_map.items():
+            t_fail = results.pop(tail_cid, [])
+            if t_fail:
+                results[orig_cid] = sorted(set(results.get(orig_cid, [])) | set(t_fail))
 
-    if not _can_run_c_in_parent and has_sqlglot_c and c_plans_all:
-        _run_tier(_SQLGLOT_C_ROOT, c_eager, c_lazy, c_hot, c_fix)
+        # Final dominant tier: /sqlglot-c in clean forked Warm Zygote (os._exit(0) avoids Python teardown!)
+        _run_tier(_SQLGLOT_C_ROOT, c_eager, c_lazy, c_hot, c_fix, in_parent=False)
+    else:
+        # Tier 1: C-accelerated /sqlglot-c
+        if has_sqlglot_c and c_plans_all:
+            _run_tier(_SQLGLOT_C_ROOT, c_eager, c_lazy, c_hot, c_fix)
 
-    # P4: Resolve tiny _PURE_ONLY_TIDS held aside from C tiers economically
-    pure_tail_map: dict[str, str] = {}
-    pending_tails: list[tuple[str, CommitPlan, set[int], int]] = []
-    for orig_cid, (orig_plan, ph) in pure_hold_by_commit.items():
-        c_fail = set(results.get(orig_cid, []))
-        base_c = fast_cost_ms(c_fail, dur_by_num) if c_fail else 0
-        delta_ms = fast_cost_ms(c_fail | ph, dur_by_num) - base_c
-        if c_fail and delta_ms <= 30:
-            results[orig_cid] = sorted(c_fail | ph)
-        else:
-            pending_tails.append((orig_cid, orig_plan, ph, delta_ms))
+        # Tier 2: C-noopt /sqlglot-c-noopt
+        if has_sqlglot_noopt and noopt_plans_all:
+            _run_tier(_SQLGLOT_C_NOOPT_ROOT, noopt_eager, noopt_lazy, noopt_hot, noopt_fix)
 
-    if pending_tails and not py_plans_all:
-        total_tail_delta = sum(d for _, _, _, d in pending_tails)
-        if total_tail_delta <= 160 + 35 * len(pending_tails):
-            for orig_cid, _, ph, _ in pending_tails:
-                results[orig_cid] = sorted(set(results.get(orig_cid, [])) | ph)
-            pending_tails = []
+        # Tier 3: C-base /sqlglot-c-base
+        if has_sqlglot_cb and cb_plans_all:
+            _run_tier(_SQLGLOT_CB_ROOT, cb_eager, cb_lazy, cb_hot, cb_fix)
 
-    for orig_cid, orig_plan, ph, _ in pending_tails:
-        tail_cid = f"__pure_tail__{orig_cid}"
-        tail_p = copy.copy(orig_plan)
-        tail_p.commit = tail_cid
-        tail_p.candidates = set(ph)
-        tail_p.force_report = set(orig_plan.force_report & ph)
-        pure_tail_map[tail_cid] = orig_cid
-        py_plans_all.append(tail_p)
+        # P4: Resolve tiny _PURE_ONLY_TIDS held aside from C tiers economically
+        pure_tail_map = {}
+        pending_tails = []
+        for orig_cid, (orig_plan, ph) in pure_hold_by_commit.items():
+            c_fail = set(results.get(orig_cid, []))
+            base_c = fast_cost_ms(c_fail, dur_by_num) if c_fail else 0
+            delta_ms = fast_cost_ms(c_fail | ph, dur_by_num) - base_c
+            if c_fail and delta_ms <= 30:
+                results[orig_cid] = sorted(c_fail | ph)
+            else:
+                pending_tails.append((orig_cid, orig_plan, ph, delta_ms))
 
-    # Tier 4: Pure-Python /sqlglot (runs BEFORE in-parent /sqlglot-c so parent still has zero sqlglot imported!)
-    if py_plans_all:
-        py_eager, py_lazy, py_hot, py_fix = _split_plans(py_plans_all)
-        _run_tier(sqlglot_root, py_eager, py_lazy, py_hot, py_fix)
+        if pending_tails and not py_plans_all:
+            total_tail_delta = sum(d for _, _, _, d in pending_tails)
+            if total_tail_delta <= 160 + 35 * len(pending_tails):
+                for orig_cid, _, ph, _ in pending_tails:
+                    results[orig_cid] = sorted(set(results.get(orig_cid, [])) | ph)
+                pending_tails = []
 
-    for tail_cid, orig_cid in pure_tail_map.items():
-        t_fail = results.pop(tail_cid, [])
-        if t_fail:
-            results[orig_cid] = sorted(set(results.get(orig_cid, [])) | set(t_fail))
+        for orig_cid, orig_plan, ph, _ in pending_tails:
+            tail_cid = f"__pure_tail__{orig_cid}"
+            tail_p = copy.copy(orig_plan)
+            tail_p.commit = tail_cid
+            tail_p.candidates = set(ph)
+            tail_p.force_report = set(orig_plan.force_report & ph)
+            pure_tail_map[tail_cid] = orig_cid
+            py_plans_all.append(tail_p)
 
-    # Final Tier 1 (/sqlglot-c) Warm Zygote DIRECTLY IN PARENT PROCESS (0 outer zygote fork & 0 IPC!)
-    if _can_run_c_in_parent and (c_lazy or c_hot or c_fix):
-        sys.stdout.flush()
-        sys.stderr.flush()
-        _saved_fd1 = os.dup(1)
-        _saved_stdout = sys.stdout
-        _gc_was_enabled = gc.isenabled()
-        os.dup2(2, 1)
-        sys.stdout = sys.stderr
-        gc.disable()
-        _t_inparent0 = time.monotonic() if _PROF else 0.0
-        try:
-            warm_results, fallback_commits = _run_warm_zygote(_SQLGLOT_C_ROOT, c_lazy, c_hot, c_fix)
-        except Exception:
-            warm_results, fallback_commits = {}, [p.commit for p in _c_warm_plans]
-        finally:
-            try:
-                sys.stdout.flush()
-                sys.stderr.flush()
-            except Exception:
-                pass
-            os.dup2(_saved_fd1, 1)
-            os.close(_saved_fd1)
-            sys.stdout = _saved_stdout
-            if _gc_was_enabled:
-                gc.enable()
-        if _PROF:
-            print(
-                f"[prof] inparent_warm_zygote lazy={len(c_lazy)} hot={len(c_hot)} fix={len(c_fix)} "
-                f"fb={len(fallback_commits)} wall={time.monotonic() - _t_inparent0:.3f}",
-                file=sys.stderr,
-            )
-        results.update(warm_results)
-        if fallback_commits:
-            plan_by_id = {p.commit: p for p in _c_warm_plans}
-            subproc_plans: list[CommitPlan] = []
-            for cid in fallback_commits:
-                plan = plan_by_id[cid]
-                safe_fb = _safe_fallback_tests(plan)
-                if _time_left() <= 2.0 or fast_cost_ms(safe_fb, dur_by_num) <= 250:
-                    results[cid] = safe_fb
-                else:
-                    p_clean = copy.copy(plan)
-                    _djp = getattr(plan, "_dj_pruned", None)
-                    if _djp:
-                        p_clean.candidates = set(plan.candidates) | set(_djp)
-                    for _attr in (
-                        "_dj_pruned", "_dj_val_done", "_dj_opt_done", "_dj_core_done",
-                        "_precomputed_replay_scope", "_patched_trie_mods",
-                    ):
-                        if hasattr(p_clean, _attr):
-                            delattr(p_clean, _attr)
-                    p_clean.group = "full_fork"
-                    subproc_plans.append(p_clean)
-            if subproc_plans:
-                fb_res = _run_clean_fallback_subproc(subproc_plans)
-                for p_c in subproc_plans:
-                    if p_c.commit in fb_res:
-                        results[p_c.commit] = fb_res[p_c.commit]
-                    else:
-                        results[p_c.commit] = _safe_fallback_tests(plan_by_id[p_c.commit])
+        # Tier 4: Pure-Python /sqlglot
+        if py_plans_all:
+            py_eager, py_lazy, py_hot, py_fix = _split_plans(py_plans_all)
+            _run_tier(sqlglot_root, py_eager, py_lazy, py_hot, py_fix, in_parent=False)
+
+        for tail_cid, orig_cid in pure_tail_map.items():
+            t_fail = results.pop(tail_cid, [])
+            if t_fail:
+                results[orig_cid] = sorted(set(results.get(orig_cid, [])) | set(t_fail))
 
     for plan in plans:
         if plan.commit not in results:

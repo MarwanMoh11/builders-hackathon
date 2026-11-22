@@ -109,101 +109,46 @@ print(cnt)
     return int(res.stdout.strip().splitlines()[-1])
 
 
-def _build_tpc_pygen_fine(sg_root: Path, py_plan_dir: str) -> tuple[int, int, int, int, int]:
-    """Precompute exact PythonGenerator fine tokens (/app/tpc_pygen_fine.marshal) AND
-    pre-replaced post-_replace_subqueries Expr trees + py_gen_hash (/app/tpc_py_exprs.marshal)
-    per TPC-DS execute query in ONE pass (0s extra build wall time!).
+def _build_tpc_pygen_fine(sg_root: Path, py_plan_dir: str) -> tuple[int, int, int]:
+    """Precompute exact PythonGenerator fine tokens per TPC-DS execute query (/app/tpc_pygen_fine.marshal).
     MUST run on Pure-Python /sqlglot so _install_fine_spies intercepts PythonGenerator!"""
     code = f"""
-import hashlib, marshal, pickle, sys
+import marshal, pickle, sys
 from pathlib import Path
 sys.path.insert(0, {str(sg_root)!r})
 sys.path.insert(0, "/app")
 import replay_cache as rc, runner
-from sqlglot import exp
-from sqlglot.generators.python import PythonGenerator
 
 fine_stack = []
 restore_fine = rc._install_fine_spies(fine_stack)
 inv = {{}}
-py_exprs = {{}}
 cnt = 0
-
-_has_own_gen = "generate" in PythonGenerator.__dict__
-_orig_pg_gen = PythonGenerator.__dict__["generate"] if _has_own_gen else PythonGenerator.generate
-_gen_depth = [0]
-_cur_reps = [None]
-_cur_hash = [None]
-_cur_ok = [True]
-
-def _cap_pg_gen(self, expression, *args, **kwargs):
-    if _gen_depth[0] == 0 and _cur_reps[0] is not None:
-        if _cur_ok[0]:
-            if isinstance(expression, exp.Expr) and expression.parent is None:
-                pk = rc.pack_expr(expression, exp)
-                if pk is rc._UNPACKABLE:
-                    _cur_ok[0] = False
-                else:
-                    _cur_reps[0].append(pk)
-            else:
-                _cur_ok[0] = False
-        _gen_depth[0] += 1
-        try:
-            res = _orig_pg_gen(self, expression, *args, **kwargs)
-        finally:
-            _gen_depth[0] -= 1
-        if _cur_ok[0]:
-            b = res.encode("utf-8", "surrogatepass")
-            h = _cur_hash[0]
-            h.update(str(len(b)).encode())
-            h.update(b":")
-            h.update(b)
-            h.update(b";")
-        return res
-    return _orig_pg_gen(self, expression, *args, **kwargs)
-
-PythonGenerator.generate = _cap_pg_gen
 try:
     for p in sorted(Path({py_plan_dir!r}).glob("*.pkl"), key=lambda x: int(x.stem)):
         qi = int(p.stem)
         plan = pickle.loads(p.read_bytes())
         qf = set()
-        reps = []
-        h = hashlib.blake2b(digest_size=12)
-        _cur_reps[0] = reps
-        _cur_hash[0] = h
-        _cur_ok[0] = True
         fine_stack.append(qf)
         try:
             runner._hash_plan_py_code(plan)
         finally:
             fine_stack.pop()
-            _cur_reps[0] = None
-            _cur_hash[0] = None
         for tok in qf:
             inv.setdefault(tok, set()).add(qi)
-        if _cur_ok[0] and reps:
-            py_exprs[qi] = (tuple(reps), h.hexdigest())
         cnt += 1
 finally:
-    if _has_own_gen:
-        PythonGenerator.generate = _orig_pg_gen
-    else:
-        delattr(PythonGenerator, "generate")
     restore_fine()
 
 payload = {{tok: tuple(sorted(qs)) for tok, qs in inv.items()}}
 blob = marshal.dumps(payload)
 Path("/app/tpc_pygen_fine.marshal").write_bytes(blob)
-eblob = marshal.dumps(py_exprs)
-Path("/app/tpc_py_exprs.marshal").write_bytes(eblob)
-print(f"{{cnt}} {{len(payload)}} {{len(blob)}} {{len(py_exprs)}} {{len(eblob)}}")
+print(f"{{cnt}} {{len(payload)}} {{len(blob)}}")
 """
     res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     if res.returncode != 0:
         raise RuntimeError(f"_build_tpc_pygen_fine failed:\n{res.stderr}\n{res.stdout}")
     parts = res.stdout.strip().splitlines()[-1].split()
-    return int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
+    return int(parts[0]), int(parts[1]), int(parts[2])
 
 
 def _build_pq_cj_tok(sg_root: str) -> tuple[int, int, int, int, int]:
@@ -404,19 +349,16 @@ def _build_tpc_tables(sg_root: Path, th) -> tuple[int, int]:
 def _build_duckdb_files_subproc(sg_root: Path) -> None:
     """Build persistent read-only DuckDB databases in an isolated subprocess."""
     code = f"""
-import pickle, sys
+import sys
 from pathlib import Path
 sys.path.insert(0, {str(sg_root)!r})
 import duckdb
 import tests.helpers as th
-from sqlglot import transpile
 
 sg_root = Path({str(sg_root)!r})
-duck_res_dir = Path("/app/tpc_duck")
-duck_res_dir.mkdir(parents=True, exist_ok=True)
-for db_name, tag, sub, schema, fix_rel in [
-    ("/app/duckdb_tpcds.db", "tpcds", "tests/fixtures/optimizer/tpc-ds/", th.TPCDS_SCHEMA, "optimizer/tpc-ds/tpc-ds.sql"),
-    ("/app/duckdb_tpch.db", "tpch", "tests/fixtures/optimizer/tpc-h/", th.TPCH_SCHEMA, "optimizer/tpc-h/tpc-h.sql"),
+for db_name, sub, schema in [
+    ("/app/duckdb_tpcds.db", "tests/fixtures/optimizer/tpc-ds/", th.TPCDS_SCHEMA),
+    ("/app/duckdb_tpch.db", "tests/fixtures/optimizer/tpc-h/", th.TPCH_SCHEMA),
 ]:
     p = Path(db_name)
     if p.exists():
@@ -430,16 +372,6 @@ for db_name, tag, sub, schema, fix_rel in [
                     f"CREATE TABLE {{table}} AS SELECT * FROM READ_CSV('{{fn}}', delim='|', header=True, columns={{col_types}})"
                 )
         conn.execute("CHECKPOINT")
-        for qi, (qargs, qsql, _) in enumerate(th.load_sql_fixture_pairs(fix_rel), start=1):
-            if tag == "tpcds" and not qargs.get("execute"):
-                continue
-            dsql = transpile(qsql, write="duckdb")[0]
-            cur = conn.execute(dsql)
-            cols = [d[0] for d in cur.description]
-            rows = cur.fetchall()
-            (duck_res_dir / f"{{tag}}_{{qi}}.pkl").write_bytes(
-                pickle.dumps((cols, rows), protocol=pickle.HIGHEST_PROTOCOL)
-            )
     finally:
         conn.close()
 
@@ -673,7 +605,7 @@ def main() -> None:
             if Path(r_str, "sqlglot").is_dir():
                 other_roots.append((tag, r_str, f"/app/tpc_cache_{tag}_plan"))
 
-        def _build_other_plans_and_pygen() -> tuple[dict[str, int], tuple[int, int, int, int, int]]:
+        def _build_other_plans_and_pygen() -> tuple[dict[str, int], tuple[int, int, int]]:
             out_cnt: dict[str, int] = {master_tag: n_master}
             for tag, r_str, pdir in other_roots:
                 out_cnt[tag] = _build_tpc_plans_from_ast(r_str, pdir)
@@ -681,15 +613,13 @@ def main() -> None:
             return out_cnt, pygen_res
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as sub_pool:
-            # MUST run exec_replay & core_methods on Pure-Python sg_root so _install_fine_spies intercepts all Python classes!
+            # MUST run exec_replay on Pure-Python sg_root so _install_fine_spies intercepts PythonGenerator!
             f_exec = sub_pool.submit(rc.build_exec_and_sqlite_cache, sg_root)
             f_rows = sub_pool.submit(_build_tpc_rows, fast_root_str, master_plan_dir)
             f_plans = sub_pool.submit(_build_other_plans_and_pygen)
-            f_core = sub_pool.submit(rc.build_core_methods_shard, sg_root)
             exec_res = f_exec.result()
             n_rows_r = f_rows.result()
             plan_counts, pygen_res = f_plans.result()
-            core_res = f_core.result()
 
         # Step 2b: dep_index (n_cpus-1 while opt_replay runs, or n_cpus if opt_replay already finished)
         dep_w = n_cpus if opt_done.is_set() else max(1, n_cpus - 1)
@@ -697,18 +627,17 @@ def main() -> None:
 
         # Step 2c: val_replay (LPT-bucketed 1 spy install per worker, grabs all 4 cores seamlessly)
         val_res = _run_val_replay_subproc(sg_root, n_cpus)
-        return exec_res, n_rows_r, plan_counts, pygen_res, core_res, dep_res, val_res
+        return exec_res, n_rows_r, plan_counts, pygen_res, dep_res, val_res
 
     t_p2 = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as p2_pool:
         f_opt = p2_pool.submit(_run_opt_replay)
         f_sec = p2_pool.submit(_run_secondary_pipeline)
         orows, obytes, dq, dbytes = f_opt.result()
-        exec_res, n_rows, plan_counts, pygen_res, core_res, dep_res, val_res = f_sec.result()
+        exec_res, n_rows, plan_counts, pygen_res, dep_res, val_res = f_sec.result()
 
     erows, ebytes, sq, sbytes = exec_res
-    n_pyg_q, n_pyg_toks, pyg_bytes, n_pye_q, pye_bytes = pygen_res
-    cm_n, cm_bytes = core_res
+    n_pyg_q, n_pyg_toks, pyg_bytes = pygen_res
     d_seen, d_keep, d_attrs, d_dicts, d_bytes = dep_res
     vp, ve, vb = val_res
 
@@ -718,11 +647,9 @@ def main() -> None:
         f"fixtures={n_fix_p}p/{n_fix_s}s ({fix_bytes/1024:.1f} KB), "
         f"tpc_tables={n_tbl} ({tbl_bytes/1024:.1f} KB), "
         f"tpc_plans py={plan_counts.get('py',0)} c={plan_counts.get('c',0)} noopt={plan_counts.get('noopt',0)} cb={plan_counts.get('cb',0)} "
-        f"rows={n_rows} pq={n_pq} cj={n_cj} ({cj_bytes/1024:.0f} KB) pygen={n_pyg_q}q/{n_pyg_toks}t ({pyg_bytes/1024:.1f} KB) "
-        f"py_exprs={n_pye_q}q ({pye_bytes/1024:.1f} KB), "
+        f"rows={n_rows} pq={n_pq} cj={n_cj} ({cj_bytes/1024:.0f} KB) pygen={n_pyg_q}q/{n_pyg_toks}t ({pyg_bytes/1024:.1f} KB), "
         f"dep_index={d_seen}t/{d_keep}k ({d_bytes/1024:.0f} KB), "
         f"val_replay={vp}p/{ve}e ({vb/1024:.0f} KB), opt_replay={orows}r ({obytes/1024:.0f} KB), "
-        f"core_methods={cm_n}m ({cm_bytes/1024:.1f} KB), "
         f"duckdb={dq}q ({dbytes/1024:.1f} KB), exec_replay={erows}r ({ebytes/1024:.0f} KB), sqlite={sq}q ({sbytes/1024:.1f} KB) "
         f"[p1={t_p1:.1f}s p2={time.perf_counter()-t_p2:.1f}s] total={time.perf_counter() - t0:.1f}s",
         flush=True,

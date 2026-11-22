@@ -12,6 +12,14 @@ from __future__ import annotations
 import math
 from typing import Sequence
 
+try:
+    import _fast_join_c as _FJC
+    _FJC_LB_COST = getattr(_FJC, "lb_cost_ms", None)
+    _FJC_LPT_COST = getattr(_FJC, "lpt_best_cost", None)
+except Exception:
+    _FJC_LB_COST = None
+    _FJC_LPT_COST = None
+
 WORKER_COST_MS = 2000
 MAX_WORKERS = 8
 
@@ -414,6 +422,8 @@ def fast_cost_ms(test_nums: Sequence[int] | set[int], dur_by_num: dict[int, int]
         return cost
     durs = sorted((dur_by_num[t] for t in test_nums), reverse=True)
     total_ms = sum(durs)
+    if _FJC_LPT_COST is not None:
+        return _FJC_LPT_COST(durs, total_ms)
     max_d = durs[0]
     best_cost = total_ms + WORKER_COST_MS
     max_w = min(MAX_WORKERS, n)
@@ -441,7 +451,7 @@ def fast_cost_ms(test_nums: Sequence[int] | set[int], dur_by_num: dict[int, int]
     return best_cost
 
 
-def lb_cost_ms(total_ms: float, max_d: float) -> float:
+def _lb_cost_ms_py(total_ms: float, max_d: float) -> float:
     """O(8) lower-bound cost of a NON-EMPTY selection with the given total and longest duration:
     min over w of max(max_d, total / w) + 2000 * w."""
     best = total_ms + WORKER_COST_MS
@@ -457,3 +467,6 @@ def lb_cost_ms(total_ms: float, max_d: float) -> float:
         elif m <= max_d:
             break
     return best
+
+
+lb_cost_ms = _FJC_LB_COST if _FJC_LB_COST is not None else _lb_cost_ms_py

@@ -1552,6 +1552,89 @@ class CandidateEngine:
                             for tag in has_sub.get(mnum, ()):
                                 self._add_subtest_filter(subtest_filters, mnum, tag, None)
                         return
+                elif rel == "tests/helpers.py" and len(parts) == 1 and not unit.sig_changed:
+                    htree = self._parse_base_ast(rel)
+                    fn_h = parts[0]
+                    if htree is not None and fn_h:
+                        top_defs: dict[str, ast.AST] = {}
+                        top_level_safe = True
+                        for _st in htree.body:
+                            if isinstance(_st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                                top_defs[_st.name] = _st
+                                for _dec in _st.decorator_list:
+                                    if any(
+                                        (isinstance(_n, ast.Name) and _n.id == fn_h)
+                                        or (isinstance(_n, ast.Attribute) and _n.attr == fn_h)
+                                        for _n in ast.walk(_dec)
+                                    ):
+                                        top_level_safe = False
+                                if isinstance(_st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                    for _df in list(_st.args.defaults) + [d for d in _st.args.kw_defaults if d is not None]:
+                                        if any(
+                                            (isinstance(_n, ast.Name) and _n.id == fn_h)
+                                            or (isinstance(_n, ast.Attribute) and _n.attr == fn_h)
+                                            for _n in ast.walk(_df)
+                                        ):
+                                            top_level_safe = False
+                            elif not isinstance(_st, (ast.Import, ast.ImportFrom)):
+                                if any(
+                                    (isinstance(_n, ast.Name) and _n.id == fn_h)
+                                    or (isinstance(_n, ast.Attribute) and _n.attr == fn_h)
+                                    for _n in ast.walk(_st)
+                                ):
+                                    top_level_safe = False
+                        if top_level_safe and fn_h in top_defs:
+                            reach_h: set[str] = {fn_h}
+                            changed_r = True
+                            while changed_r:
+                                changed_r = False
+                                for _dn, _dnode in top_defs.items():
+                                    if _dn in reach_h:
+                                        continue
+                                    for _n in ast.walk(_dnode):
+                                        if (isinstance(_n, ast.Name) and _n.id in reach_h) or (
+                                            isinstance(_n, ast.Attribute) and _n.attr in reach_h
+                                        ):
+                                            reach_h.add(_dn)
+                                            changed_r = True
+                                            break
+                            # Ensure no module-level non-def statement references any reachable helper
+                            for _st in htree.body:
+                                if not isinstance(_st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom)):
+                                    if any(
+                                        (isinstance(_n, ast.Name) and _n.id in reach_h)
+                                        or (isinstance(_n, ast.Attribute) and _n.attr in reach_h)
+                                        for _n in ast.walk(_st)
+                                    ):
+                                        top_level_safe = False
+                                        break
+                            if top_level_safe:
+                                line_h = self._tests_covering_lines(rel, unit.old_lines or unit.enclosing_lines)
+                                seed_tfs: set[str] = {self.num_to_test[r]["file"] for r in line_h}
+                                for imp_tf in self.maps["import_file_to_test_files"].get(rel, []):
+                                    txt_tf = self._read_base_file(imp_tf)
+                                    if (
+                                        any(nm in txt_tf for nm in reach_h)
+                                        or "import *" in txt_tf
+                                        or ("getattr(" in txt_tf and "helpers" in txt_tf)
+                                    ):
+                                        seed_tfs.add(imp_tf)
+                                if seed_tfs:
+                                    q_tf = list(seed_tfs)
+                                    while q_tf:
+                                        cur_tf = q_tf.pop()
+                                        for nxt_tf in self.maps["import_file_to_test_files"].get(cur_tf, []):
+                                            if nxt_tf not in seed_tfs:
+                                                seed_tfs.add(nxt_tf)
+                                                q_tf.append(nxt_tf)
+                                    affected_h = set(line_h)
+                                    for tf_h in seed_tfs:
+                                        affected_h.update(self.file_to_test_nums.get(tf_h, []))
+                                    candidates.update(affected_h)
+                                    for rnum in affected_h:
+                                        for tag in has_sub.get(rnum, ()):
+                                            self._add_subtest_filter(subtest_filters, rnum, tag, None)
+                                    return
             affected = set(self.file_to_test_nums.get(rel, []))
             for tf in self.maps["import_file_to_test_files"].get(rel, []):
                 affected.update(self.file_to_test_nums.get(tf, []))
@@ -2594,9 +2677,37 @@ class CandidateEngine:
                 ):
                     exec_engine_touched = True
 
+                _tokens_needs_max_nodes = False
+                if rel == "sqlglot/tokens.py":
+                    if ana.syntax_error or fp.is_deleted or not ana.units:
+                        _tokens_needs_max_nodes = True
+                    else:
+                        _MAX_NODES_TOK_KEYS = frozenset({"SELECT", "FROM", "X", "T", "=", ","})
+                        for _u in ana.units:
+                            if not (
+                                _u.kind in ("dict_key", "dict_lambda_body")
+                                and _u.class_name == "Tokenizer"
+                                and _u.symbol_name == "KEYWORDS"
+                                and _u.dict_keys is not None
+                            ):
+                                _tokens_needs_max_nodes = True
+                                break
+                            for _kr in _u.dict_keys:
+                                _s = _kr.strip()
+                                if len(_s) < 2 or _s[0] != _s[-1] or _s[0] not in ("'", '"'):
+                                    _tokens_needs_max_nodes = True
+                                    break
+                                _ku = _s[1:-1].upper()
+                                if _ku in _MAX_NODES_TOK_KEYS or _ku.startswith("COL") or not _ku.isidentifier():
+                                    _tokens_needs_max_nodes = True
+                                    break
+                            if _tokens_needs_max_nodes:
+                                break
+
                 if (
                     (rel == "tests/test_parser.py" and any("test_max_nodes" in fn for fn in ana.changed_funcs))
-                    or rel in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py")
+                    or rel == "sqlglot/tokenizer_core.py"
+                    or _tokens_needs_max_nodes
                     or (
                         rel == "sqlglot/parser.py"
                         and (
@@ -2632,12 +2743,11 @@ class CandidateEngine:
 
                 file_has_non_hot = False
                 for unit in ana.units:
-                    sym = unit.symbol_name or ""
-                    meth_name = sym.rsplit(".", 1)[-1]
+                    meth_name = (unit.symbol_name or "").rsplit(".", 1)[-1]
                     if (
                         rel in _COMPILED_C_FILES
                         or unit.kind != "func_body"
-                        or "." not in sym
+                        or unit.sig_changed
                         or meth_name in (
                             "__new__", "__init_subclass__", "__set_name__", "__class_getitem__",
                             "_generate_next_value_", "_build_dispatch", "sql_names",
@@ -2704,12 +2814,14 @@ class CandidateEngine:
                         if rel == "tests/fixtures/optimizer/tpc-h/tpc-h.sql":
                             f_hits = {
                                 r for r in f_hits
-                                if not self.num_to_test[r]["id"].endswith("::test_execute_tpcds")
+                                if self.num_to_test[r]["file"] != "tests/test_executor.py"
+                                or self.num_to_test[r]["id"].endswith(("::test_execute_tpch", "::test_optimized_tpch"))
                             }
                         elif rel == "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql":
                             f_hits = {
                                 r for r in f_hits
-                                if not self.num_to_test[r]["id"].endswith(("::test_execute_tpch", "::test_optimized_tpch"))
+                                if self.num_to_test[r]["file"] != "tests/test_executor.py"
+                                or self.num_to_test[r]["id"].endswith("::test_execute_tpcds")
                             }
 
                     candidates.update(f_hits)
