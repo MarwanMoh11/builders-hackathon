@@ -311,6 +311,7 @@ class ChangeUnit:
     has_nested_func: bool = False
     edit_outside_nested_func: bool = False
     is_cached_func: bool = False
+    sig_changed: bool = False
 
 
 @dataclass
@@ -796,6 +797,89 @@ def _func_signature_dump(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
     return ast.dump(clone, include_attributes=False)
 
 
+def _is_pure_const_default(node: ast.AST | None) -> bool:
+    if node is None:
+        return True
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Not)):
+        return _is_pure_const_default(node.operand)
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_is_pure_const_default(e) for e in node.elts)
+    return False
+
+
+def _is_safe_func_sig_change(
+    os_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ns_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    file: str,
+    has_future_ann: bool,
+) -> bool:
+    """True iff a signature change preserves decorators, parameter names/arity/defaults-structure,
+    only edits pure compile-time constant defaults (zero import-time side effects), and only edits
+    annotations when deferred by `from __future__ import annotations` outside typing/tests."""
+    if type(os_node) is not type(ns_node) or os_node.name != ns_node.name:
+        return False
+    if [ast.dump(d, include_attributes=False) for d in os_node.decorator_list] != [
+        ast.dump(d, include_attributes=False) for d in ns_node.decorator_list
+    ]:
+        return False
+    if [ast.dump(tp, include_attributes=False) for tp in getattr(os_node, "type_params", ())] != [
+        ast.dump(tp, include_attributes=False) for tp in getattr(ns_node, "type_params", ())
+    ]:
+        return False
+    oa, na = os_node.args, ns_node.args
+    if (
+        [a.arg for a in oa.posonlyargs] != [a.arg for a in na.posonlyargs]
+        or [a.arg for a in oa.args] != [a.arg for a in na.args]
+        or [a.arg for a in oa.kwonlyargs] != [a.arg for a in na.kwonlyargs]
+        or (oa.vararg.arg if oa.vararg else None) != (na.vararg.arg if na.vararg else None)
+        or (oa.kwarg.arg if oa.kwarg else None) != (na.kwarg.arg if na.kwarg else None)
+        or len(oa.defaults) != len(na.defaults)
+        or len(oa.kw_defaults) != len(na.kw_defaults)
+        or [d is None for d in oa.kw_defaults] != [d is None for d in na.kw_defaults]
+    ):
+        return False
+    for od, nd in zip(oa.defaults, na.defaults):
+        if ast.dump(od, include_attributes=False) != ast.dump(nd, include_attributes=False):
+            if not (_is_pure_const_default(od) and _is_pure_const_default(nd)):
+                return False
+    for od, nd in zip(oa.kw_defaults, na.kw_defaults):
+        if od is not None and nd is not None:
+            if ast.dump(od, include_attributes=False) != ast.dump(nd, include_attributes=False):
+                if not (_is_pure_const_default(od) and _is_pure_const_default(nd)):
+                    return False
+    # Check if any annotation changed
+    ann_changed = (
+        (ast.dump(os_node.returns, include_attributes=False) if os_node.returns else None)
+        != (ast.dump(ns_node.returns, include_attributes=False) if ns_node.returns else None)
+    )
+    if not ann_changed:
+        all_oa = [*oa.posonlyargs, *oa.args, *oa.kwonlyargs, *([oa.vararg] if oa.vararg else []), *([oa.kwarg] if oa.kwarg else [])]
+        all_na = [*na.posonlyargs, *na.args, *na.kwonlyargs, *([na.vararg] if na.vararg else []), *([na.kwarg] if na.kwarg else [])]
+        for x, y in zip(all_oa, all_na):
+            if (ast.dump(x.annotation, include_attributes=False) if x.annotation else None) != (
+                ast.dump(y.annotation, include_attributes=False) if y.annotation else None
+            ):
+                ann_changed = True
+                break
+    if ann_changed and (not has_future_ann or file.startswith(("sqlglot/typing/", "tests/", "sqlglotc/"))):
+        return False
+    return True
+
+
+def _has_future_annotations(tree: ast.Module) -> bool:
+    for s in tree.body:
+        if isinstance(s, ast.ImportFrom) and s.module == "__future__":
+            if any(a.name == "annotations" for a in s.names):
+                return True
+        elif isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str):
+            continue
+        else:
+            break
+    return False
+
+
 _CACHE_DECORATORS = frozenset({"cache", "lru_cache", "cached_property"})
 
 
@@ -869,6 +953,7 @@ def _compare_block(
     units: list[ChangeUnit],
     changed_funcs: list[str],
     ignore_docstrings: bool = False,
+    has_future_ann: bool = False,
 ) -> None:
     """Compare statements in a module or class body and emit precise ChangeUnits."""
     if ignore_docstrings:
@@ -1046,6 +1131,7 @@ def _compare_block(
                 units,
                 changed_funcs,
                 ignore_docstrings,
+                has_future_ann,
             )
 
         elif kind_tag == "func":
@@ -1128,21 +1214,41 @@ def _compare_block(
                                 block_end = getattr(sub, "end_lineno", s_end)
                                 if any(s_end <= al <= block_end + 1 for al in anchor_old_lines):
                                     stmt_lines |= _stmt_entry_lines(s_item)
-            if not stmt_lines or sig_changed:
-                stmt_lines = set(fn_span)
-            units.append(
-                ChangeUnit(
-                    kind="class_attr" if (sig_changed and class_qual) else ("module_other" if sig_changed else "func_body"),
-                    file=file,
-                    class_name=class_qual,
-                    symbol_name="*" if sig_changed else qname,
-                    old_lines=hit_lines | stmt_lines,
-                    enclosing_lines=fn_span,
-                    has_nested_func=has_nested_func,
-                    edit_outside_nested_func=edit_outside_nested,
-                    is_cached_func=is_cached,
+            safe_sig = sig_changed and _is_safe_func_sig_change(os_node, ns_node, file, has_future_ann)
+            if safe_sig:
+                exec_body = _strip_leading_docstring(os_node.body)
+                entry_lines = _stmt_entry_lines(exec_body[0]) if exec_body else set(fn_span)
+                units.append(
+                    ChangeUnit(
+                        kind="func_body",
+                        file=file,
+                        class_name=class_qual,
+                        symbol_name=qname,
+                        old_lines=entry_lines | stmt_lines,
+                        enclosing_lines=fn_span,
+                        has_nested_func=has_nested_func,
+                        edit_outside_nested_func=True,
+                        is_cached_func=is_cached,
+                        sig_changed=True,
+                    )
                 )
-            )
+            else:
+                if not stmt_lines or sig_changed:
+                    stmt_lines = set(fn_span)
+                units.append(
+                    ChangeUnit(
+                        kind="class_attr" if (sig_changed and class_qual) else ("module_other" if sig_changed else "func_body"),
+                        file=file,
+                        class_name=class_qual,
+                        symbol_name="*" if sig_changed else qname,
+                        old_lines=hit_lines | stmt_lines,
+                        enclosing_lines=fn_span,
+                        has_nested_func=has_nested_func,
+                        edit_outside_nested_func=edit_outside_nested,
+                        is_cached_func=is_cached,
+                        sig_changed=sig_changed,
+                    )
+                )
 
         elif kind_tag == "assign":
             _, o_val = _extract_assign_target_and_value(os_node)
@@ -1256,6 +1362,7 @@ def analyze_python_change(
 
     units: list[ChangeUnit] = []
     changed_funcs: list[str] = []
+    has_future_ann = _has_future_annotations(old_ast) and _has_future_annotations(new_ast)
     _compare_block(
         file,
         old_ast.body,
@@ -1269,6 +1376,7 @@ def analyze_python_change(
         units,
         changed_funcs,
         ignore_docstrings,
+        has_future_ann,
     )
 
     # Only treat empty `units` as no-op if the ENTIRE difference was strictly inside `if TYPE_CHECKING:`

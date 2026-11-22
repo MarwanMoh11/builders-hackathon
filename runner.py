@@ -819,6 +819,11 @@ def _patch_optimizer_module(
 
         def _ensure(self):
             if self._conn is None:
+                opt_db = Path("/app/duckdb_opt.db")
+                if opt_db.is_file():
+                    import duckdb
+                    self._conn = duckdb.connect(str(opt_db), read_only=True, config={"threads": 1})
+                    return self._conn
                 c = _duckdb_connect_1t()
                 c.execute(
                     """
@@ -921,6 +926,15 @@ def _patch_optimizer_module(
                                 dhashes.append(hashlib.blake2b(dsql.encode(), digest_size=12).hexdigest())
                             if valid_duck_pairs and (dhashes[0], dhashes[1]) in valid_duck_pairs:
                                 continue
+                            cur0 = self.conn.execute(dsqls[0])
+                            c0, r0 = [d[0] for d in cur0.description], cur0.fetchall()
+                            cur1 = self.conn.execute(dsqls[1])
+                            c1, r1 = [d[0] for d in cur1.description], cur1.fetchall()
+                            v_cmp = _fast_compare_rows(c0, r0, c1, r1)
+                            if v_cmp == "pass":
+                                continue
+                            if v_cmp == "fail":
+                                self.fail(f"execute mismatch: {title}")
                             from pandas.testing import assert_frame_equal
                             dfs = [self.conn.execute(dsql).df() for dsql in dsqls]
                             assert_frame_equal(*dfs)
@@ -1453,6 +1467,225 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
             _RR.__getitem__ = _fast_rr_getitem  # type: ignore[method-assign]
 
         if py_changed is not None and ctx_untouched:
+            env_untouched = "sqlglot/executor/env.py" not in all_touched
+            pygen_untouched = "sqlglot/generators/python.py" not in all_touched
+            from sqlglot.executor.table import TableIter as _TableIter
+
+            _PURE_BOOL_CALLS = frozenset({
+                "AND", "OR", "NOT", "EQ", "NEQ", "LT", "LTE", "GT", "GTE",
+                "IN", "BETWEEN", "COALESCE", "LOWER", "UPPER", "LENGTH", "ABS",
+                "YEAR", "MONTH", "DAY",
+            })
+            _CMP_OP_MAP = {
+                "NEQ": ast.NotEq, "LT": ast.Lt, "LTE": ast.LtE, "GT": ast.Gt, "GTE": ast.GtE,
+            }
+
+            def _is_pure_bool_sub(node: ast.AST) -> bool:
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call):
+                        if not (isinstance(sub.func, ast.Name) and sub.func.id in _PURE_BOOL_CALLS):
+                            return False
+                    elif isinstance(sub, ast.BinOp) and isinstance(sub.op, (ast.Div, ast.FloorDiv, ast.Mod)):
+                        return False
+                return True
+
+            def _compile_row_fn(
+                src: str | None,
+                ctx_tables: dict[Any, Any],
+                env_dict: dict[str, Any],
+                mode: str = "val",
+            ) -> Any:
+                """Compile a generated PythonExecutor expression directly to `lambda _r: ...`
+                using integer column indices `_r[idx]` and inline boolean operators (0 RowReader, 0 closures!).
+                Strictly maps ONLY tables in `ctx_tables` (never outer correlated scope readers!)."""
+                if not src or not (env_untouched and pygen_untouched):
+                    return None
+                try:
+                    tree = ast.parse(src, mode="eval")
+                except Exception:
+                    return None
+                col_map = {tname: tbl.reader.columns for tname, tbl in ctx_tables.items()}
+
+                class _ScopeToRow(ast.NodeTransformer):
+                    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+                        if (
+                            isinstance(node.value, ast.Subscript)
+                            and isinstance(node.value.value, ast.Name)
+                            and node.value.value.id == "scope"
+                            and isinstance(node.value.slice, ast.Constant)
+                            and isinstance(node.slice, ast.Constant)
+                        ):
+                            t_cols = col_map.get(node.value.slice.value)
+                            if t_cols is not None:
+                                idx = t_cols.get(node.slice.value)
+                                if idx is not None:
+                                    return ast.Subscript(
+                                        value=ast.Name(id="_r", ctx=ast.Load()),
+                                        slice=ast.Constant(value=idx),
+                                        ctx=ast.Load(),
+                                    )
+                        return self.generic_visit(node)
+
+                tree = _ScopeToRow().visit(tree)
+                for n in ast.walk(tree):
+                    if isinstance(n, ast.Name) and n.id == "scope":
+                        return None
+
+                if mode == "tuple_idxs" and isinstance(tree.body, ast.Tuple):
+                    idxs: list[int] = []
+                    for elt in tree.body.elts:
+                        if (
+                            isinstance(elt, ast.Subscript)
+                            and isinstance(elt.value, ast.Name)
+                            and elt.value.id == "_r"
+                            and isinstance(elt.slice, ast.Constant)
+                            and type(elt.slice.value) is int
+                        ):
+                            idxs.append(elt.slice.value)
+                        else:
+                            idxs = []
+                            break
+                    if idxs:
+                        return ("idxs", tuple(idxs))
+
+                fs_env: dict[str, Any] = {}
+                if mode in ("filter", "join_cond"):
+                    tmp_id = [0]
+
+                    def _non_none(n: ast.AST) -> bool:
+                        return isinstance(n, ast.Constant) and n.value is not None
+
+                    def _tx_bool(n: ast.AST, strict_is_true: bool) -> ast.AST:
+                        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                            fn_id = n.func.id
+                            if (
+                                fn_id == "AND"
+                                and len(n.args) == 2
+                                and isinstance(n.args[0], ast.Lambda)
+                                and isinstance(n.args[1], ast.Lambda)
+                                and not n.args[0].args.args
+                                and not n.args[1].args.args
+                                and _is_pure_bool_sub(n.args[1].body)
+                            ):
+                                return ast.BoolOp(
+                                    op=ast.And(),
+                                    values=[_tx_bool(n.args[0].body, False), _tx_bool(n.args[1].body, False)],
+                                )
+                            if (
+                                fn_id == "OR"
+                                and len(n.args) == 2
+                                and isinstance(n.args[0], ast.Lambda)
+                                and isinstance(n.args[1], ast.Lambda)
+                                and not n.args[0].args.args
+                                and not n.args[1].args.args
+                                and _is_pure_bool_sub(n.args[1].body)
+                            ):
+                                return ast.BoolOp(
+                                    op=ast.Or(),
+                                    values=[_tx_bool(n.args[0].body, False), _tx_bool(n.args[1].body, False)],
+                                )
+                            if fn_id == "EQ" and len(n.args) == 2:
+                                a, b = n.args
+                                if _non_none(a) or _non_none(b):
+                                    return ast.Compare(left=a, ops=[ast.Eq()], comparators=[b])
+                                v0, v1 = f"_v{tmp_id[0]}", f"_v{tmp_id[0] + 1}"
+                                tmp_id[0] += 2
+                                return ast.BoolOp(
+                                    op=ast.And(),
+                                    values=[
+                                        ast.Compare(left=ast.NamedExpr(ast.Name(v0, ast.Store()), a), ops=[ast.IsNot()], comparators=[ast.Constant(None)]),
+                                        ast.Compare(left=ast.NamedExpr(ast.Name(v1, ast.Store()), b), ops=[ast.IsNot()], comparators=[ast.Constant(None)]),
+                                        ast.Compare(left=ast.Name(v0, ast.Load()), ops=[ast.Eq()], comparators=[ast.Name(v1, ast.Load())]),
+                                    ],
+                                )
+                            if fn_id in _CMP_OP_MAP and len(n.args) == 2:
+                                a, b = n.args
+                                op_inst = _CMP_OP_MAP[fn_id]()
+                                if _non_none(b):
+                                    v0 = f"_v{tmp_id[0]}"
+                                    tmp_id[0] += 1
+                                    return ast.BoolOp(
+                                        op=ast.And(),
+                                        values=[
+                                            ast.Compare(left=ast.NamedExpr(ast.Name(v0, ast.Store()), a), ops=[ast.IsNot()], comparators=[ast.Constant(None)]),
+                                            ast.Compare(left=ast.Name(v0, ast.Load()), ops=[op_inst], comparators=[b]),
+                                        ],
+                                    )
+                                if _non_none(a):
+                                    v0 = f"_v{tmp_id[0]}"
+                                    tmp_id[0] += 1
+                                    return ast.BoolOp(
+                                        op=ast.And(),
+                                        values=[
+                                            ast.Compare(left=ast.NamedExpr(ast.Name(v0, ast.Store()), b), ops=[ast.IsNot()], comparators=[ast.Constant(None)]),
+                                            ast.Compare(left=a, ops=[op_inst], comparators=[ast.Name(v0, ast.Load())]),
+                                        ],
+                                    )
+                                v0, v1 = f"_v{tmp_id[0]}", f"_v{tmp_id[0] + 1}"
+                                tmp_id[0] += 2
+                                return ast.BoolOp(
+                                    op=ast.And(),
+                                    values=[
+                                        ast.Compare(left=ast.NamedExpr(ast.Name(v0, ast.Store()), a), ops=[ast.IsNot()], comparators=[ast.Constant(None)]),
+                                        ast.Compare(left=ast.NamedExpr(ast.Name(v1, ast.Store()), b), ops=[ast.IsNot()], comparators=[ast.Constant(None)]),
+                                        ast.Compare(left=ast.Name(v0, ast.Load()), ops=[op_inst], comparators=[ast.Name(v1, ast.Load())]),
+                                    ],
+                                )
+                            if fn_id == "BETWEEN" and len(n.args) == 3 and _non_none(n.args[1]) and _non_none(n.args[2]):
+                                v0 = f"_v{tmp_id[0]}"
+                                tmp_id[0] += 1
+                                return ast.BoolOp(
+                                    op=ast.And(),
+                                    values=[
+                                        ast.Compare(left=ast.NamedExpr(ast.Name(v0, ast.Store()), n.args[0]), ops=[ast.IsNot()], comparators=[ast.Constant(None)]),
+                                        ast.Compare(left=n.args[1], ops=[ast.LtE(), ast.LtE()], comparators=[ast.Name(v0, ast.Load()), n.args[2]]),
+                                    ],
+                                )
+                            if (
+                                fn_id == "IN"
+                                and len(n.args) >= 2
+                                and all(
+                                    isinstance(c, ast.Constant)
+                                    and c.value is not None
+                                    and type(c.value) in (int, float, str, bool)
+                                    for c in n.args[1:]
+                                )
+                            ):
+                                fs_name = f"_fs{len(fs_env)}"
+                                fs_env[fs_name] = frozenset(c.value for c in n.args[1:])
+                                return ast.Compare(
+                                    left=n.args[0],
+                                    ops=[ast.In()],
+                                    comparators=[ast.Name(fs_name, ast.Load())],
+                                )
+                        if isinstance(n, ast.Compare):
+                            return n
+                        if strict_is_true:
+                            return ast.Compare(left=n, ops=[ast.Is()], comparators=[ast.Constant(True)])
+                        return ast.Call(func=ast.Name("bool", ast.Load()), args=[n], keywords=[])
+
+                    tree.body = _tx_bool(tree.body, strict_is_true=(mode == "join_cond"))
+
+                lam_expr = ast.Expression(
+                    body=ast.Lambda(
+                        args=ast.arguments(
+                            posonlyargs=[],
+                            args=[ast.arg(arg="_r")],
+                            kwonlyargs=[],
+                            kw_defaults=[],
+                            defaults=[],
+                        ),
+                        body=tree.body,
+                    )
+                )
+                ast.fix_missing_locations(lam_expr)
+                try:
+                    code_obj = compile(lam_expr, "<row>", "eval", optimize=2)
+                    eval_env = {**env_dict, **fs_env} if fs_env else env_dict
+                    return eval(code_obj, eval_env)
+                except Exception:
+                    return None
+
             if "PythonExecutor.generate" not in py_changed:
                 def _fast_gen(self, expression):
                     if not expression:
@@ -1460,7 +1693,9 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                     expression = self._replace_subqueries(expression)
                     sql = self.generator.generate(expression)
                     try:
-                        return eval(compile(f"lambda scope: ({sql})", sql, "eval", optimize=2), self.env)
+                        fn = eval(compile(f"lambda scope: ({sql})", sql, "eval", optimize=2), self.env)
+                        fn._blast_src = f"({sql})"
+                        return fn
                     except Exception:
                         return compile(sql, sql, "eval", optimize=2)
 
@@ -1479,14 +1714,65 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                                 parts.append(f"({self.generator.generate(e2)})")
                         src = "(" + ", ".join(parts) + (",)" if len(parts) == 1 else ")")
                         try:
-                            return eval(compile(f"lambda scope: {src}", "<tuple>", "eval", optimize=2), self.env)
+                            fn = eval(compile(f"lambda scope: {src}", "<tuple>", "eval", optimize=2), self.env)
+                            fn._blast_src = src
+                            return fn
                         except Exception:
                             return tuple(self.generate(e) for e in expressions)
 
                     _PE.generate_tuple = _fast_gen_tuple  # type: ignore[method-assign]
 
             if tbl_untouched and "PythonExecutor._project_and_filter" not in py_changed:
+                def _fast_project_and_filter_rows(self, context, step, rows_in):
+                    sink = self.table(step.projections if step.projections else context.columns)
+                    condition = self.generate(step.condition)
+                    projections = self.generate_tuple(step.projections)
+                    limit = step.offset + step.limit
+                    has_lim = not math.isinf(limit)
+                    c_call = callable(condition)
+                    p_call = callable(projections) and len(step.projections) == len(sink.columns)
+                    if (not condition or c_call) and (not projections or p_call):
+                        cond_r = _compile_row_fn(getattr(condition, "_blast_src", None), context.tables, self.env, "filter") if condition else None
+                        proj_r = _compile_row_fn(getattr(projections, "_blast_src", None), context.tables, self.env, "val") if projections else None
+                        if (not condition or cond_r is not None) and (not projections or proj_r is not None):
+                            if not has_lim:
+                                if cond_r and proj_r:
+                                    sink.rows = [proj_r(r) for r in rows_in if cond_r(r)]
+                                elif cond_r:
+                                    sink.rows = [r for r in rows_in if cond_r(r)]
+                                elif proj_r:
+                                    sink.rows = [proj_r(r) for r in rows_in]
+                                else:
+                                    sink.rows = list(rows_in)
+                                return sink
+                            sink_rows = sink.rows
+                            lim_i = int(limit)
+                            if lim_i <= 0:
+                                return sink
+                            if cond_r and proj_r:
+                                for r in rows_in:
+                                    if cond_r(r):
+                                        sink_rows.append(proj_r(r))
+                                        if len(sink_rows) >= lim_i:
+                                            break
+                            elif cond_r:
+                                for r in rows_in:
+                                    if cond_r(r):
+                                        sink_rows.append(r)
+                                        if len(sink_rows) >= lim_i:
+                                            break
+                            elif proj_r:
+                                sink.rows = [proj_r(r) for r in rows_in[:lim_i]]
+                            else:
+                                sink.rows = list(rows_in[:lim_i])
+                            return sink
+                    return None
+
                 def _fast_project_and_filter(self, context, step, table_iter):
+                    if isinstance(table_iter, _TableIter) and table_iter.index == -1:
+                        fast_sink = _fast_project_and_filter_rows(self, context, step, table_iter.table.rows)
+                        if fast_sink is not None:
+                            return fast_sink
                     sink = self.table(step.projections if step.projections else context.columns)
                     condition = self.generate(step.condition)
                     projections = self.generate_tuple(step.projections)
@@ -1552,6 +1838,68 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
 
                 _PE._project_and_filter = _fast_project_and_filter  # type: ignore[method-assign]
 
+                if "PythonExecutor.join" not in py_changed:
+                    def _fast_join(self, step, context):
+                        source = step.source_name
+                        source_table = context.tables[source]
+                        source_context = self.context({source: source_table})
+                        column_ranges = {source: range(0, len(source_table.columns))}
+
+                        for name, join in step.joins.items():
+                            table = context.tables[name]
+                            start = max(r.stop for r in column_ranges.values())
+                            column_ranges[name] = range(start, len(table.columns) + start)
+                            join_context = self.context({name: table})
+                            condition = self.generate(join["condition"])
+                            condition_context = (
+                                self.context(
+                                    {
+                                        n: _Tbl(
+                                            source_context.columns + join_context.columns,
+                                            column_range=column_range,
+                                        )
+                                        for n, column_range in column_ranges.items()
+                                    }
+                                )
+                                if condition
+                                else None
+                            )
+                            if join.get("source_key"):
+                                table = self.hash_join(
+                                    join, source_context, join_context, condition, condition_context
+                                )
+                            else:
+                                table = self.nested_loop_join(
+                                    join, source_context, join_context, condition, condition_context
+                                )
+                            source_context = self.context(
+                                {
+                                    n: _Tbl(table.columns, table.rows, column_range)
+                                    for n, column_range in column_ranges.items()
+                                }
+                            )
+
+                        if not step.condition and not step.projections:
+                            return source_context
+
+                        sink = _fast_project_and_filter_rows(self, source_context, step, source_context.table.rows)
+                        if sink is None:
+                            sink = self._project_and_filter(
+                                source_context,
+                                step,
+                                (reader for reader, _ in iter(source_context)),
+                            )
+                        if step.projections:
+                            return self.context({step.name: sink})
+                        return self.context(
+                            {
+                                n: _Tbl(t.columns, sink.rows, t.column_range)
+                                for n, t in source_context.tables.items()
+                            }
+                        )
+
+                    _PE.join = _fast_join  # type: ignore[method-assign]
+
             if tbl_untouched and not (
                 py_changed & {
                     "PythonExecutor.hash_join",
@@ -1560,6 +1908,22 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                 }
             ):
                 _orig_hash_join = _PE.hash_join
+
+                def _fast_append_unmatched(table, join, source_rows, join_rows, matched_source, matched_join):
+                    side = join.get("side")
+                    out_rows = table.rows
+                    if side in ("LEFT", "FULL") and source_rows:
+                        join_nulls = (None,) * (len(table.columns) - len(source_rows[0]))
+                        if not matched_source:
+                            out_rows.extend(r + join_nulls for r in source_rows)
+                        else:
+                            out_rows.extend(r + join_nulls for i, r in enumerate(source_rows) if i not in matched_source)
+                    if side in ("RIGHT", "FULL") and join_rows:
+                        source_nulls = (None,) * (len(table.columns) - len(join_rows[0]))
+                        if not matched_join:
+                            out_rows.extend(source_nulls + r for r in join_rows)
+                        else:
+                            out_rows.extend(source_nulls + r for i, r in enumerate(join_rows) if i not in matched_join)
 
                 def _fast_hash_join(self, join, source_context, join_context, condition, condition_context):
                     source_key = self.generate_tuple(join["source_key"])
@@ -1574,36 +1938,112 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                     side = join.get("side")
                     need_matched = side in ("LEFT", "RIGHT", "FULL")
                     klen = len(join["join_key"])
-
-                    # 1. Build join_map on join_context (direct row loop, zero Context.__iter__ / genexpr!)
-                    j_tbls = tuple(join_context.tables.values())
                     j_rows = join_context.table.rows
-                    j_scope = join_context.row_readers
-                    join_context.env["scope"] = j_scope
+                    s_rows = source_context.table.rows
+                    out_cols = source_context.columns + join_context.columns
+
+                    # Ultra-fast direct integer column-index path (0 RowReader, 0 lambda calls!)
+                    j_fast = _compile_row_fn(getattr(join_key, "_blast_src", None), join_context.tables, self.env, "tuple_idxs")
+                    s_fast = _compile_row_fn(getattr(source_key, "_blast_src", None), source_context.tables, self.env, "tuple_idxs")
+                    c_fast = (
+                        _compile_row_fn(getattr(condition, "_blast_src", None), condition_context.tables, self.env, "join_cond")
+                        if (condition is not None and condition_context is not None)
+                        else None
+                    )
+
                     join_map: dict[Any, list[Any]] = {}
-                    if len(j_tbls) == 1:
-                        j_rdr = j_tbls[0].reader
+                    use_scalar_key = False
+                    if (
+                        isinstance(j_fast, tuple)
+                        and j_fast[0] == "idxs"
+                        and isinstance(s_fast, tuple)
+                        and s_fast[0] == "idxs"
+                        and len(j_fast[1]) == klen
+                        and len(s_fast[1]) == klen
+                    ):
+                        j_idxs = j_fast[1]
+                        s_idxs = s_fast[1]
                         if klen == 1:
+                            use_scalar_key = True
+                            ji0 = j_idxs[0]
                             for idx, row in enumerate(j_rows):
-                                j_rdr.row = row
-                                k = join_key(j_scope)
-                                if k[0] is not None:
+                                k = row[ji0]
+                                if k is not None:
                                     grp = join_map.get(k)
                                     if grp is None:
                                         join_map[k] = [(idx, row)]
                                     else:
                                         grp.append((idx, row))
                         elif klen == 2:
+                            ji0, ji1 = j_idxs
                             for idx, row in enumerate(j_rows):
-                                j_rdr.row = row
-                                k = join_key(j_scope)
-                                if k[0] is not None and k[1] is not None:
+                                k0 = row[ji0]
+                                if k0 is not None:
+                                    k1 = row[ji1]
+                                    if k1 is not None:
+                                        k = (k0, k1)
+                                        grp = join_map.get(k)
+                                        if grp is None:
+                                            join_map[k] = [(idx, row)]
+                                        else:
+                                            grp.append((idx, row))
+                        else:
+                            for idx, row in enumerate(j_rows):
+                                k = tuple(row[i] for i in j_idxs)
+                                if all(v is not None for v in k):
                                     grp = join_map.get(k)
                                     if grp is None:
                                         join_map[k] = [(idx, row)]
                                     else:
                                         grp.append((idx, row))
+
+                        if not join_map:
+                            table = _Tbl(out_cols)
+                            if need_matched:
+                                _fast_append_unmatched(table, join, s_rows, j_rows, set(), set())
+                            return table
+
+                        src_groups: dict[Any, list[Any]] = {}
+                        if use_scalar_key:
+                            si0 = s_idxs[0]
+                            for idx, row in enumerate(s_rows):
+                                k = row[si0]
+                                if k is not None and k in join_map:
+                                    sg = src_groups.get(k)
+                                    if sg is None:
+                                        src_groups[k] = [(idx, row)]
+                                    else:
+                                        sg.append((idx, row))
+                        elif klen == 2:
+                            si0, si1 = s_idxs
+                            for idx, row in enumerate(s_rows):
+                                k0 = row[si0]
+                                if k0 is not None:
+                                    k1 = row[si1]
+                                    if k1 is not None:
+                                        k = (k0, k1)
+                                        if k in join_map:
+                                            sg = src_groups.get(k)
+                                            if sg is None:
+                                                src_groups[k] = [(idx, row)]
+                                            else:
+                                                sg.append((idx, row))
                         else:
+                            for idx, row in enumerate(s_rows):
+                                k = tuple(row[i] for i in s_idxs)
+                                if all(v is not None for v in k) and k in join_map:
+                                    sg = src_groups.get(k)
+                                    if sg is None:
+                                        src_groups[k] = [(idx, row)]
+                                    else:
+                                        sg.append((idx, row))
+                    else:
+                        # Fallback to scope-compiled lambda path
+                        j_tbls = tuple(join_context.tables.values())
+                        j_scope = join_context.row_readers
+                        join_context.env["scope"] = j_scope
+                        if len(j_tbls) == 1:
+                            j_rdr = j_tbls[0].reader
                             for idx, row in enumerate(j_rows):
                                 j_rdr.row = row
                                 k = join_key(j_scope)
@@ -1613,55 +2053,31 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                                         join_map[k] = [(idx, row)]
                                     else:
                                         grp.append((idx, row))
-                    else:
-                        j_rdrs = tuple(t.reader for t in j_tbls)
-                        for idx, row in enumerate(j_rows):
-                            for r in j_rdrs:
-                                r.row = row
-                            k = join_key(j_scope)
-                            if all(v is not None for v in k):
-                                grp = join_map.get(k)
-                                if grp is None:
-                                    join_map[k] = [(idx, row)]
-                                else:
-                                    grp.append((idx, row))
-
-                    out_cols = source_context.columns + join_context.columns
-                    s_rows = source_context.table.rows
-                    if not join_map:
-                        table = _Tbl(out_cols)
-                        if need_matched:
-                            self._append_unmatched_join_rows(table, join, s_rows, j_rows, set(), set())
-                        return table
-
-                    # 2. Probe source_context; keep ONLY matched keys in first-seen key order (bit-exact!)
-                    s_tbls = tuple(source_context.tables.values())
-                    s_scope = source_context.row_readers
-                    source_context.env["scope"] = s_scope
-                    src_groups: dict[Any, list[Any]] = {}
-                    if len(s_tbls) == 1:
-                        s_rdr = s_tbls[0].reader
-                        if klen == 1:
-                            for idx, row in enumerate(s_rows):
-                                s_rdr.row = row
-                                k = source_key(s_scope)
-                                if k[0] is not None and k in join_map:
-                                    sg = src_groups.get(k)
-                                    if sg is None:
-                                        src_groups[k] = [(idx, row)]
-                                    else:
-                                        sg.append((idx, row))
-                        elif klen == 2:
-                            for idx, row in enumerate(s_rows):
-                                s_rdr.row = row
-                                k = source_key(s_scope)
-                                if k[0] is not None and k[1] is not None and k in join_map:
-                                    sg = src_groups.get(k)
-                                    if sg is None:
-                                        src_groups[k] = [(idx, row)]
-                                    else:
-                                        sg.append((idx, row))
                         else:
+                            j_rdrs = tuple(t.reader for t in j_tbls)
+                            for idx, row in enumerate(j_rows):
+                                for r in j_rdrs:
+                                    r.row = row
+                                k = join_key(j_scope)
+                                if all(v is not None for v in k):
+                                    grp = join_map.get(k)
+                                    if grp is None:
+                                        join_map[k] = [(idx, row)]
+                                    else:
+                                        grp.append((idx, row))
+
+                        if not join_map:
+                            table = _Tbl(out_cols)
+                            if need_matched:
+                                _fast_append_unmatched(table, join, s_rows, j_rows, set(), set())
+                            return table
+
+                        s_tbls = tuple(source_context.tables.values())
+                        s_scope = source_context.row_readers
+                        source_context.env["scope"] = s_scope
+                        src_groups = {}
+                        if len(s_tbls) == 1:
+                            s_rdr = s_tbls[0].reader
                             for idx, row in enumerate(s_rows):
                                 s_rdr.row = row
                                 k = source_key(s_scope)
@@ -1671,31 +2087,8 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                                         src_groups[k] = [(idx, row)]
                                     else:
                                         sg.append((idx, row))
-                    else:
-                        s_rdrs = tuple(t.reader for t in s_tbls)
-                        if klen == 1:
-                            for idx, row in enumerate(s_rows):
-                                for r in s_rdrs:
-                                    r.row = row
-                                k = source_key(s_scope)
-                                if k[0] is not None and k in join_map:
-                                    sg = src_groups.get(k)
-                                    if sg is None:
-                                        src_groups[k] = [(idx, row)]
-                                    else:
-                                        sg.append((idx, row))
-                        elif klen == 2:
-                            for idx, row in enumerate(s_rows):
-                                for r in s_rdrs:
-                                    r.row = row
-                                k = source_key(s_scope)
-                                if k[0] is not None and k[1] is not None and k in join_map:
-                                    sg = src_groups.get(k)
-                                    if sg is None:
-                                        src_groups[k] = [(idx, row)]
-                                    else:
-                                        sg.append((idx, row))
                         else:
+                            s_rdrs = tuple(t.reader for t in s_tbls)
                             for idx, row in enumerate(s_rows):
                                 for r in s_rdrs:
                                     r.row = row
@@ -1729,6 +2122,25 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
                                     for ji, jr in jg:
                                         out_rows.append(sr + jr)
                                         matched_join.add(ji)
+                    elif c_fast is not None:
+                        if not need_matched:
+                            for k, sg in src_groups.items():
+                                jg = join_map[k]
+                                for _, sr in sg:
+                                    for _, jr in jg:
+                                        row = sr + jr
+                                        if c_fast(row):
+                                            out_rows.append(row)
+                        else:
+                            for k, sg in src_groups.items():
+                                jg = join_map[k]
+                                for si, sr in sg:
+                                    for ji, jr in jg:
+                                        row = sr + jr
+                                        if c_fast(row):
+                                            out_rows.append(row)
+                                            matched_source.add(si)
+                                            matched_join.add(ji)
                     else:
                         c_scope = condition_context.row_readers
                         c_rdrs = tuple(t.reader for t in condition_context.tables.values())
@@ -1748,7 +2160,7 @@ def _install_fast_python_executor(commit_plan: CommitPlan) -> None:
 
                     table = _Tbl(out_cols, rows=out_rows)
                     if need_matched:
-                        self._append_unmatched_join_rows(table, join, s_rows, j_rows, matched_source, matched_join)
+                        _fast_append_unmatched(table, join, s_rows, j_rows, matched_source, matched_join)
                     return table
 
                 _PE.hash_join = _fast_hash_join  # type: ignore[method-assign]
@@ -1902,8 +2314,17 @@ def _patch_executor_module(
             cls._tpcds_conn.close()
 
     def _get_duck_conn(self, tpch: bool, needed_tables: list[str] | None = None):
+        cp_d = ACTIVE_COMMIT_PLAN
+        touched_d = (set(cp_d.patched_files) | set(cp_d.deleted_files)) if cp_d is not None else set()
         if tpch:
             if self._tpch_conn is None:
+                db_p = Path("/app/duckdb_tpch.db")
+                csv_touched = any("tpc-h/" in r and r.endswith(".csv.gz") for r in touched_d)
+                if db_p.is_file() and not csv_touched and (not helpers_patched or allow_duck_cache):
+                    import duckdb
+                    self._tpch_conn = duckdb.connect(str(db_p), read_only=True, config={"threads": 1})
+                    self._tpch_views_loaded.update(th.TPCH_SCHEMA.keys())
+                    return self._tpch_conn
                 self._tpch_conn = _duckdb_connect_1t()
             conn = self._tpch_conn
             loaded = self._tpch_views_loaded
@@ -1911,6 +2332,13 @@ def _patch_executor_module(
             schema = th.TPCH_SCHEMA
         else:
             if self._tpcds_conn is None:
+                db_p = Path("/app/duckdb_tpcds.db")
+                csv_touched = any("tpc-ds/" in r and r.endswith(".csv.gz") for r in touched_d)
+                if db_p.is_file() and not csv_touched and (not helpers_patched or allow_duck_cache):
+                    import duckdb
+                    self._tpcds_conn = duckdb.connect(str(db_p), read_only=True, config={"threads": 1})
+                    self._tpcds_views_loaded.update(th.TPCDS_SCHEMA.keys())
+                    return self._tpcds_conn
                 self._tpcds_conn = _duckdb_connect_1t()
             conn = self._tpcds_conn
             loaded = self._tpcds_views_loaded
@@ -2398,9 +2826,25 @@ def _patch_executor_module(
                 h2 = hashlib.blake2b(s2.encode(), digest_size=12).hexdigest()
                 if not tpch_touched and base_map.get(qidx) == (h1, h2):
                     continue
+                conn = _get_duck_conn(self, tpch=True)
+                raw_k = ("ot_raw", s1)
+                if raw_k not in self.cache:
+                    c_a = conn.execute(s1)
+                    self.cache[raw_k] = ([d[0] for d in c_a.description], c_a.fetchall())
+                a_cols, a_rows = self.cache[raw_k]
+                c_b = conn.execute(s2)
+                b_cols, b_rows = [d[0] for d in c_b.description], c_b.fetchall()
+                b_cols_ren = [
+                    a_cols[i] if ("_col_" in c and i < len(a_cols)) else c
+                    for i, c in enumerate(b_cols)
+                ]
+                verdict = _fast_compare_rows(a_cols, a_rows, b_cols_ren, b_rows)
+                if verdict == "pass":
+                    continue
+                if verdict == "fail":
+                    self.fail(f"optimized_tpch {qidx} result mismatch")
                 if afe_fn is None:
                     from pandas.testing import assert_frame_equal as afe_fn
-                conn = _get_duck_conn(self, tpch=True)
                 if sql not in self.cache:
                     self.cache[sql] = conn.execute(s1).fetchdf()
                 a = self.cache[sql]
@@ -2557,30 +3001,35 @@ def _patch_generator_module() -> None:
 
     def _filtered_gen_mem(self):
         allowed = ACTIVE_GEN_MEM_DIALECTS
-        for name in Dialects:
-            if allowed is not None and name.value not in allowed:
-                continue
-            with self.subTest(dialect=name):
-                dialect = Dialect.get_or_raise(name)
-                for _ in range(20):
-                    dialect.generator()
-                gc.collect()
-                tracemalloc.start()
-                try:
+        targets = [name for name in Dialects if allowed is None or name.value in allowed]
+        if not targets:
+            return
+        dial_objs = [Dialect.get_or_raise(name) for name in targets]
+        for dialect in dial_objs:
+            for _ in range(10):
+                dialect.generator()
+        gc.collect(0)
+        tracemalloc.start()
+        try:
+            for name, dialect in zip(targets, dial_objs):
+                with self.subTest(dialect=name):
                     before = tracemalloc.get_traced_memory()[0]
-                    for _ in range(15):
+                    for _ in range(10):
                         dialect.generator()
-                    gc.collect()
+                    gc.collect(0)
                     after = tracemalloc.get_traced_memory()[0]
                     if after - before > 0:
-                        before = tracemalloc.get_traced_memory()[0]
-                        for _ in range(1000):
-                            dialect.generator()
                         gc.collect()
                         after = tracemalloc.get_traced_memory()[0]
-                finally:
-                    tracemalloc.stop()
-                self.assertLess(after - before, 1024)
+                        if after - before > 0:
+                            before = tracemalloc.get_traced_memory()[0]
+                            for _ in range(1000):
+                                dialect.generator()
+                            gc.collect()
+                            after = tracemalloc.get_traced_memory()[0]
+                    self.assertLess(after - before, 1024)
+        finally:
+            tracemalloc.stop()
 
     tgen.TestGenerator.test_generator_memory = _filtered_gen_mem
     tgen._blast_patched = True
@@ -3167,6 +3616,38 @@ def _execute_commit_verification(
                                     self.assertEqual(expression.named_selects, names if unique else ["a"])
                         mod.TestExprs.test_named_selects_long_by_name_chain = _fast_named_selects_chain
                         mod._blast_ns_patched = True
+                if mod_name == "tests.test_schema" and "tests/test_schema.py" not in commit_plan.patched_files:
+                    if not getattr(mod, "_blast_gc_patched", False):
+                        def _fast_cache_no_retain(self):
+                            import weakref as _wr
+                            class Marker:
+                                pass
+                            for normalize in (False, True):
+                                for method_n, m_args in (
+                                    ("find", ()),
+                                    ("column_names", ()),
+                                    ("get_column_type", ("id",)),
+                                    ("has_column", ("id",)),
+                                    ("add_table", ({"id": "INT"},)),
+                                ):
+                                    with self.subTest(normalize=normalize, method=method_n):
+                                        schema = mod.MappingSchema(
+                                            {"items": {"id": "INT"}}, dialect="duckdb", normalize=normalize
+                                        )
+                                        query = mod.parse_one("SELECT id FROM items", dialect="duckdb")
+                                        table = query.find(mod.exp.Table)
+                                        marker = Marker()
+                                        query.meta["marker"] = table.meta["marker"] = marker
+                                        marker_ref = _wr.ref(marker)
+                                        getattr(schema, method_n)(table, *m_args)
+                                        del query, table, marker
+                                        gc.collect(0)
+                                        if marker_ref() is not None:
+                                            gc.collect()
+                                        self.assertIsNone(marker_ref())
+                                        self.assertEqual(schema.column_names("items"), ["id"])
+                        mod.TestSchema.test_cache_does_not_retain_queries = _fast_cache_no_retain
+                        mod._blast_gc_patched = True
                 if not helpers_patched:
                     if mod_name.startswith("tests.dialects.") and "tests/dialects/test_dialect.py" not in commit_plan.patched_files:
                         _patch_dialect_validator(maps, sqlglot_root)

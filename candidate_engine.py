@@ -445,8 +445,8 @@ class CandidateEngine:
         if self._import_time_called is not None and self._import_time_ref_map is not None:
             cf = self._import_time_called.get(meth_name)
             rf = self._import_time_ref_map.get(meth_name)
-            cf_hit = (cf & rev_cl) if cf else set()
-            rf_hit = (rf & rev_cl) if rf else set()
+            cf_hit = ((cf & rev_cl) - {"sqlglot/__main__.py"}) if cf else set()
+            rf_hit = ((rf & rev_cl) - {"sqlglot/__main__.py"}) if rf else set()
             if cf_hit:
                 return True, True, cf_hit
             if rf_hit:
@@ -1193,15 +1193,16 @@ class CandidateEngine:
                 is_meta_hook
                 or (is_import_called and (unit.edit_outside_nested_func or not hits))
             ):
-                extra = self._tests_for_broken_import(rel)
+                extra = self._tests_for_broken_import(rel) if is_meta_hook else set()
                 for rf in import_ref_files:
                     extra.update(self._tests_for_broken_import(rf))
-                all_hits = hits | extra
-                candidates.update(all_hits)
-                for rnum in all_hits:
-                    for tag in has_sub.get(rnum, ()):
-                        self._add_subtest_filter(subtest_filters, rnum, tag, None)
-                return
+                if is_meta_hook or extra:
+                    all_hits = hits | extra
+                    candidates.update(all_hits)
+                    for rnum in all_hits:
+                        for tag in has_sub.get(rnum, ()):
+                            self._add_subtest_filter(subtest_filters, rnum, tag, None)
+                    return
 
             candidates.update(hits)
             spec = ("lines", (rel, target_lines))
@@ -1895,6 +1896,7 @@ class CandidateEngine:
                     if (
                         rel in _COMPILED_C_FILES
                         or unit.kind != "func_body"
+                        or unit.sig_changed
                         or meth_name in (
                             "__new__", "__init_subclass__", "__set_name__", "__class_getitem__",
                             "_generate_next_value_", "_build_dispatch", "sql_names",

@@ -108,6 +108,61 @@ def _build_tpc_tables(sg_root: Path) -> tuple[int, int]:
     return total_files, total_bytes
 
 
+def _build_duckdb_files(sg_root: Path) -> None:
+    """Build persistent read-only DuckDB databases for TPC-DS, TPC-H, and TestOptimizer
+    so tests connect in ~1ms with ZERO gzip CSV parsing at runtime!"""
+    import duckdb
+    import tests.helpers as th
+
+    for db_name, sub, schema in [
+        ("/app/duckdb_tpcds.db", "tests/fixtures/optimizer/tpc-ds/", th.TPCDS_SCHEMA),
+        ("/app/duckdb_tpch.db", "tests/fixtures/optimizer/tpc-h/", th.TPCH_SCHEMA),
+    ]:
+        p = Path(db_name)
+        if p.exists():
+            p.unlink()
+        conn = duckdb.connect(str(p), config={"threads": 1})
+        try:
+            for table, col_types in schema.items():
+                fn = sg_root / f"{sub}{table}.csv.gz"
+                if fn.exists():
+                    conn.execute(
+                        f"CREATE TABLE {table} AS SELECT * FROM READ_CSV('{fn}', delim='|', header=True, columns={col_types})"
+                    )
+            conn.execute("CHECKPOINT")
+        finally:
+            conn.close()
+
+    opt_p = Path("/app/duckdb_opt.db")
+    if opt_p.exists():
+        opt_p.unlink()
+    conn = duckdb.connect(str(opt_p), config={"threads": 1})
+    try:
+        conn.execute(
+            """
+            CREATE TABLE x (a INT, b INT);
+            CREATE TABLE y (b INT, c INT);
+            CREATE TABLE z (b INT, c INT);
+            CREATE TABLE w (d TEXT, e TEXT);
+            INSERT INTO x VALUES (1, 1), (2, 2), (2, 2), (3, 3), (null, null);
+            INSERT INTO y VALUES (2, 2), (2, 2), (3, 3), (4, 4), (null, null);
+            INSERT INTO y VALUES (3, 3), (3, 3), (4, 4), (5, 5), (null, null);
+            INSERT INTO w VALUES ('a', 'b');
+            CREATE TABLE unpivotable (id INT, jan INT, feb INT, north INT, south INT);
+            INSERT INTO unpivotable VALUES (1, 100, 200, 7, 8), (2, 300, 400, 9, 10);
+            CREATE TABLE pivotable (id INT, cat TEXT, val INT, kind TEXT, amt INT);
+            INSERT INTO pivotable VALUES (1, 'a', 10, 'x', 5), (1, 'b', 20, 'x', 5);
+            CREATE TABLE comparisons AS
+            SELECT * FROM (VALUES (1), (2), (NULL)) AS x(a)
+            CROSS JOIN (VALUES (1), (2), (NULL)) AS y(b)
+            CROSS JOIN (VALUES (TRUE), (FALSE), (NULL)) AS z(c);
+            CHECKPOINT;
+            """
+        )
+    finally:
+        conn.close()
+
+
 def main() -> None:
     t0 = time.perf_counter()
     sg_root = Path("/sqlglot")
@@ -154,7 +209,10 @@ def main() -> None:
     if Path("/sqlglot-c-base/sqlglot").is_dir():
         n_cb = _build_tpc_cache_for_root("/sqlglot-c-base", "/app/tpc_cache_cb")
 
-    # 4. Precompute exact baseline PythonExecutor result (columns, rows) for all 57 TPC-DS queries
+    # 4. Pre-built read-only DuckDB databases (~1ms connect, 0 CSV parsing at runtime!)
+    _build_duckdb_files(sg_root)
+
+    # 5. Precompute exact baseline PythonExecutor result (columns, rows) for all 57 TPC-DS queries
     #    so duckdb-only commits skip PythonExecutor completely (~300x faster)!
     rows_code = """
 import pickle, sys
