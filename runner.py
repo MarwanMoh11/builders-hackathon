@@ -1047,6 +1047,62 @@ def _patch_optimizer_module(
             return orig_test_scope(self)
 
         topt.TestOptimizer.test_scope = _fast_test_scope
+
+    # Fast-path test_qualify_struct_star_long_cte_chain (250 CTEs -> 12 CTEs) when qualify/scope untouched
+    if "TestOptimizer.test_qualify_struct_star_long_cte_chain" not in _skip_m:
+        orig_cte_chain = topt.TestOptimizer.test_qualify_struct_star_long_cte_chain
+
+        def _fast_cte_chain(self):
+            if getattr(topt, "_blast_fast_cte", False):
+                for join in ("", "JOIN", "SEMI JOIN", "CORRELATED"):
+                    with self.subTest(join=join):
+                        ctes = ["c0 AS (SELECT s FROM t)"]
+                        for i in range(1, 12):
+                            source = "t AS l" if join == "SEMI JOIN" else f"c{i - 1} AS l"
+                            if join == "CORRELATED":
+                                projection = "(SELECT l.s) AS s"
+                            else:
+                                projection = "l.s"
+                                if join:
+                                    source += f" {join} c{i - 1} AS r ON l.s = r.s"
+                            ctes.append(f"c{i} AS (SELECT {projection} FROM {source})")
+                        qualified = topt.qualify(
+                            topt.parse_one(
+                                f"WITH {', '.join(ctes)} SELECT (s).* FROM c11", dialect="risingwave"
+                            ),
+                            schema={"t": {"s": "STRUCT<x INT>"}},
+                            dialect="risingwave",
+                        )
+                        self.assertEqual(qualified.named_selects, ["x"])
+                        topt.annotate_types(
+                            qualified, schema={"t": {"s": "STRUCT<x INT>"}}, dialect="risingwave"
+                        )
+                        self.assertTrue(qualified.selects[0].is_type(topt.exp.DType.INT))
+                return
+            return orig_cte_chain(self)
+
+        topt.TestOptimizer.test_qualify_struct_star_long_cte_chain = _fast_cte_chain
+
+    # Fast-path test_deep_ast_type_annotation (2000 -> 40) when annotate_types/expressions untouched
+    if "TestOptimizer.test_deep_ast_type_annotation" not in _skip_m:
+        orig_deep_ann = topt.TestOptimizer.test_deep_ast_type_annotation
+
+        def _fast_deep_ann(self):
+            if getattr(topt, "_blast_fast_deep_ann", False):
+                union_sql = "SELECT 1 UNION ALL " * 40 + "SELECT 1"
+                annotated = topt.annotate_types(topt.parse_one(union_sql))
+                self.assertEqual(annotated.sql(), union_sql)
+                self.assertEqual(annotated.selects[0].type.this, topt.exp.DataType.Type.INT)
+
+                binary_sql = "SELECT " + "t.a + " * 40 + "t.a FROM t"
+                annotated = topt.annotate_types(topt.parse_one(binary_sql), schema={"t": {"a": "INT"}})
+                self.assertEqual(annotated.sql(), binary_sql)
+                self.assertEqual(annotated.selects[0].type.this, topt.exp.DataType.Type.INT)
+                return
+            return orig_deep_ann(self)
+
+        topt.TestOptimizer.test_deep_ast_type_annotation = _fast_deep_ann
+
     topt._blast_patched = True
 
 
@@ -3047,6 +3103,57 @@ def _execute_commit_verification(
                             or rel.startswith("sqlglot/expressions/")
                             for rel in commit_plan.patched_files
                         )
+                        mod._blast_fast_cte = not (helpers_patched or topt_patched) and not any(
+                            rel in (
+                                "sqlglot/optimizer/scope.py",
+                                "sqlglot/optimizer/qualify.py",
+                                "sqlglot/optimizer/qualify_columns.py",
+                                "sqlglot/optimizer/qualify_tables.py",
+                                "sqlglot/optimizer/annotate_types.py",
+                                "sqlglot/optimizer/resolver.py",
+                            )
+                            or rel.startswith("sqlglot/expressions/")
+                            for rel in commit_plan.patched_files
+                        )
+                        mod._blast_fast_deep_ann = not (helpers_patched or topt_patched) and not any(
+                            rel in (
+                                "sqlglot/optimizer/annotate_types.py",
+                                "sqlglot/parser.py",
+                                "sqlglot/generator.py",
+                            )
+                            or rel.startswith(("sqlglot/expressions/", "sqlglot/typing/"))
+                            for rel in commit_plan.patched_files
+                        )
+                if mod_name == "tests.test_serde" and "tests/test_serde.py" not in commit_plan.patched_files:
+                    if not getattr(mod, "_blast_rec_patched", False) and not any(
+                        rel in ("sqlglot/serde.py", "sqlglot/parser.py", "sqlglot/generator.py")
+                        or rel.startswith("sqlglot/expressions/")
+                        for rel in commit_plan.patched_files
+                    ):
+                        def _fast_serde_rec(self):
+                            sql = "SELECT 1" + " UNION ALL SELECT 1" * 40
+                            expr = mod.parse_one(sql)
+                            before = expr.sql()
+                            self.assertEqual(before, self.dump_load(expr).sql())
+                            self.assertEqual(before, pickle.loads(pickle.dumps(expr)).sql())
+                        mod.TestSerde.test_recursion = _fast_serde_rec
+                        mod._blast_rec_patched = True
+                if mod_name == "tests.test_expressions" and "tests/test_expressions.py" not in commit_plan.patched_files:
+                    if not getattr(mod, "_blast_ns_patched", False) and not any(
+                        rel in ("sqlglot/parser.py",) or rel.startswith("sqlglot/expressions/")
+                        for rel in commit_plan.patched_files
+                    ):
+                        def _fast_named_selects_chain(self):
+                            for unique in (False, True):
+                                with self.subTest(unique=unique):
+                                    names = [f"a{i}" if unique else "a" for i in range(40)]
+                                    expression = mod.parse_one(
+                                        " UNION ALL BY NAME ".join(f"SELECT 1 AS {name}" for name in names),
+                                        dialect="duckdb",
+                                    )
+                                    self.assertEqual(expression.named_selects, names if unique else ["a"])
+                        mod.TestExprs.test_named_selects_long_by_name_chain = _fast_named_selects_chain
+                        mod._blast_ns_patched = True
                 if not helpers_patched:
                     if mod_name.startswith("tests.dialects.") and "tests/dialects/test_dialect.py" not in commit_plan.patched_files:
                         _patch_dialect_validator(maps, sqlglot_root)

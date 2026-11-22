@@ -939,13 +939,20 @@ def _compare_block(
             if kind_tag == "func":
                 qname = f"{class_qual}.{name}" if class_qual else name
                 changed_funcs.append(qname)
+                is_dyn_sql_meth = (
+                    bool(class_qual)
+                    and name.endswith("_sql")
+                    and not name.startswith("_")
+                    and name != "sql"
+                )
                 units.append(
                     ChangeUnit(
                         kind="class_attr" if class_qual else "module_other",
                         file=file,
                         class_name=class_qual,
-                        # Added/deleted methods or top-level functions use wildcard symbol "*"
-                        symbol_name="*",
+                        # Preserve dynamic <expr_key>_sql method names for exact expr_to_tests pruning;
+                        # other added/deleted methods or top-level functions use wildcard symbol "*"
+                        symbol_name=name if is_dyn_sql_meth else "*",
                         old_lines=span & (changed_old_lines | anchor_old_lines),
                         enclosing_lines=span,
                     )

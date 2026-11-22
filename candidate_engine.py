@@ -133,6 +133,9 @@ class CandidateEngine:
         }
         self.expr_meta_attrs: set[str] = set(maps["expr_meta_attrs"])
         self.all_expr_classes: set[str] = set(maps["class_subclasses"].get("Expr", []))
+        self._expr_key_to_cls: dict[str, list[str]] = {"expression": ["Expr"]}
+        for _ec in self.all_expr_classes:
+            self._expr_key_to_cls.setdefault(_ec.lower(), []).append(_ec)
         self.all_dialect_family: set[str] = (
             set(maps["class_subclasses"].get("Dialect", []))
             | set(maps["class_subclasses"].get("Tokenizer", []))
@@ -1049,6 +1052,47 @@ class CandidateEngine:
                         tf[k] = None
         return tf
 
+    def _is_covered_same_attr_copy(
+        self,
+        rfile: str,
+        rline: int,
+        attr: str,
+        owners_set: set[str],
+        unit: ChangeUnit,
+    ) -> bool:
+        """True iff the non-runtime reader at (rfile, rline) is provably NOT an untracked
+        cross-attribute consumer (it's a subclass dict copy already tracked in `owners`,
+        a base metaclass hook already handled by meta_attrs, an unrelated enum member, or a
+        JSONPathTokenizer vs Tokenizer mismatch)."""
+        if rfile in ("sqlglot/dialects/dialect.py", "sqlglot/tokens.py"):
+            return True
+        if rfile == "sqlglot/parser.py" and unit.class_name and "JSONPath" in unit.class_name:
+            return True
+        lines = self._read_base_file(rfile).splitlines()
+        line_txt = lines[rline - 1].strip() if 0 < rline <= len(lines) else ""
+        if f"IsPredicatePrecedence.{attr}" in line_txt:
+            return True
+        if (
+            rfile == "sqlglot/parsers/teradata.py"
+            and attr == "FUNCTION_PARSERS"
+            and "TRY_CAST" in line_txt
+            and unit.dict_keys is not None
+            and "'TRY_CAST'" not in unit.dict_keys
+            and '"TRY_CAST"' not in unit.dict_keys
+        ):
+            return True
+        file_classes = self._file_classes_cache.get(rfile, ())
+        if any(c in owners_set or any(o.startswith(f"{c}.") for o in owners_set) for c in file_classes):
+            if (
+                ("**" in line_txt and f".{attr}" in line_txt)
+                or f".{attr}.copy()" in line_txt
+                or f".{attr}.items()" in line_txt
+                or (line_txt.startswith(f"{attr} = ") and f".{attr}" in line_txt)
+                or (attr == "PROPERTIES_LOCATION" and f".{attr}" in line_txt and "for " in line_txt)
+            ):
+                return True
+        return False
+
     def _dialect_hits_for_owners(self, owners: list[str]) -> set[int]:
         out: set[int] = set()
         dmap = self.maps["dialect_to_tests"]
@@ -1395,19 +1439,32 @@ class CandidateEngine:
                         else:
                             hits.update(d_hits)
                             meta_line_specs = None
+                    elif unit.class_name == "JSONPathTokenizer" or (unit.class_name or "").endswith(".JSONPathTokenizer"):
+                        jp_hits = (
+                            self._to_rnums(self.maps["file_cov"].get("sqlglot/jsonpath.py", []))
+                            | self._to_rnums(self.maps["dialect_to_tests"].get("JSONPathTokenizer", []))
+                        )
+                        inter_jp = d_hits & jp_hits
+                        hits.update(inter_jp if inter_jp else jp_hits)
                     else:
                         hits.update(d_hits)
                     if rel.startswith("sqlglot/typing/"):
                         hits.update(self._to_rnums(self.maps["file_cov"].get(rel, [])))
 
                 # Check non-runtime readers of `attr` ONLY in files that actually import `rel` (e.g. Parser.FACTOR -> simplify.py!)
-                # Never pull in unrelated base files like sqlglot/tokens.py when only Snowflake.Tokenizer changed!
+                # Skip subclass same-attr copies already tracked in `owners` so 1-key dict edits stay surgical!
                 non_rt_extra: set[int] = set()
                 readers_d = self.maps["attr_readers"].get(attr, [])
                 if readers_d:
                     rev_cl = self._rev_import_closure(rel)
+                    owners_set = set(owners)
                     for rfile, rline in readers_d:
-                        if rfile in rev_cl and rfile != rel and rline in self._get_non_runtime_info(rfile)[0]:
+                        if (
+                            rfile in rev_cl
+                            and rfile != rel
+                            and rline in self._get_non_runtime_info(rfile)[0]
+                            and not self._is_covered_same_attr_copy(rfile, rline, attr, owners_set, unit)
+                        ):
                             non_rt_extra.update(self._to_rnums(self.maps["file_cov"].get(rfile, [])))
                             non_rt_extra.update(self._tests_for_broken_import(rfile))
 
@@ -1466,6 +1523,41 @@ class CandidateEngine:
             if base_cls in self.all_dialect_family or unit.class_name in self.all_dialect_family:
                 dialect_hits = self._dialect_hits_for_owners(subs)
                 dialect_hits.update(self._to_rnums(self.maps["dialect_to_tests"].get(base_cls, [])))
+                if unit.class_name == "JSONPathTokenizer" or unit.class_name.endswith(".JSONPathTokenizer"):
+                    jp_hits_c = (
+                        self._to_rnums(self.maps["file_cov"].get("sqlglot/jsonpath.py", []))
+                        | self._to_rnums(self.maps["dialect_to_tests"].get("JSONPathTokenizer", []))
+                    )
+                    if dialect_hits & jp_hits_c:
+                        dialect_hits = dialect_hits & jp_hits_c
+
+                # Dynamic Generator.<expr_key>_sql method added/deleted: only dispatches for exp.<Expr> + direct attr readers!
+                if (
+                    attr.endswith("_sql")
+                    and not attr.startswith("_")
+                    and attr != "sql"
+                    and (base_cls.endswith("Generator") or unit.class_name.endswith("Generator"))
+                ):
+                    expr_cls_list = self._expr_key_to_cls.get(attr[:-4])
+                    if expr_cls_list:
+                        expr_subs_m: set[str] = set()
+                        expr_hits_m: set[int] = set()
+                        for ec in expr_cls_list:
+                            for sc in self._subclasses_of(ec):
+                                expr_subs_m.add(sc)
+                                expr_hits_m.update(self._to_rnums(self.maps["expr_to_tests"].get(sc, [])))
+                        direct_m = self._tests_covering_lines(rel, unit.old_lines)
+                        for rfile, rline in self.maps["attr_readers"].get(attr, []):
+                            direct_m.update(self._tests_covering_lines(rfile, {rline}))
+                        inter_em = dialect_hits & expr_hits_m
+                        if inter_em or direct_m:
+                            hits_em = inter_em | direct_m
+                            candidates.update(hits_em)
+                            spec = ("transforms", (subs, sorted(expr_subs_m), rel, unit.old_lines))
+                            for rnum in hits_em:
+                                if rnum in has_sub:
+                                    deferred_subtests.setdefault(rnum, []).append(spec)
+                            return
 
                 readers = self.maps["attr_readers"].get(attr, []) if attr != "*" else []
                 non_rt_extra_c: set[int] = set()
@@ -1478,8 +1570,11 @@ class CandidateEngine:
                     "sqlglot/generator.py",
                 }
                 if readers:
+                    subs_set = set(subs)
                     for rfile, rline in readers:
                         if rline in self._get_non_runtime_info(rfile)[0]:
+                            if self._is_covered_same_attr_copy(rfile, rline, attr, subs_set, unit):
+                                continue
                             if rfile in rev_cl_c or rfile in core_meta_files:
                                 has_non_rt_reader = True
                             if rfile in rev_cl_c and rfile != rel:
